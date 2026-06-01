@@ -1,0 +1,38 @@
+client_token: fixture-client-token
+admin_token: fixture-admin-token
+restricted_client_token: fixture-restricted-client-token
+disabled_client_token: fixture-disabled-client-token
+created_client_token: fixture-created-client-token
+temporary_client_token: fixture-temporary-client-token
+scoped_client_token: fixture-scoped-client-token
+persisted_client_token: fixture-persisted-client-token
+persisted_scope_client_token: fixture-persisted-scope-client-token
+db_only_client_token: fixture-db-only-client-token
+scoped_runtime_token: fixture-scoped-runtime-token
+
+upstream_credentials:
+  a: fixture-upstream-credential-a
+  b: fixture-upstream-credential-b
+  c: fixture-upstream-credential-c
+  manual: fixture-upstream-credential-manual
+  legacy: fixture-upstream-credential-legacy
+  test_upstream: fixture-upstream-credential-test
+  hash_sample: fixture-upstream-credential-hash-sample
+  one: fixture-upstream-credential-one
+  two: fixture-upstream-credential-two
+  same: fixture-upstream-credential-same
+  debug_client: fixture-upstream-credential-debug-client
+  debug_admin: fixture-upstream-credential-debug-admin
+  local_router: fixture-upstream-credential-local-router
+  local_admin: fixture-upstream-credential-local-admin
+
+redaction_samples:
+  sensitive_token: fixture-sensitive-token
+  spaced_secret: "fixture spaced secret"
+  colon_secret: "fixture:colon:secret"
+  whitespace_secret: "fixture\twhitespace\nsecret"
+  local_path: /nonexistent/fixture/workspace/config.yaml
+  github_token: github-fixture-token-unusable
+  compact_token: fixture-compact-token
+  basic_secret: fixture-basic-secret
+  cloud_secret: fixture-cloud-secret

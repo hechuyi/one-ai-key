@@ -1,0 +1,34 @@
+# Build outputs.
+/target/
+/rust_out
+
+# Runtime state and local databases.
+/data/
+/postgres_data/
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+
+# Local deployment/configuration with real credentials.
+/.env
+/.env.*
+/config.yaml
+/docker-compose.override.yml
+/key-pool-router/
+/config/*.yaml
+
+# Secret material.
+*.pem
+*.key
+*key*.txt
+*keys*.txt
+*secret*
+*secrets*
+AGENTS.md
+
+# Logs and transient files.
+*.log
+*.pid
+*.tmp
+.DS_Store
