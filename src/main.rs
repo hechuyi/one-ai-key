@@ -1639,6 +1639,85 @@ pools:
     }
 
     #[test]
+    fn config_unknown_fields_rejects_app_config_top_level_key() {
+        let path = temp_config_file(
+            r#"
+listen: 127.0.0.1:4101
+management:
+  admin_token: fixture-management-admin-token
+unknown_top_level: true
+pools: {}
+"#,
+        );
+
+        let err = AppConfig::from_path(path).expect_err("unknown top-level key must fail");
+        assert!(
+            err.to_string().contains("unknown top-level config field"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn config_unknown_fields_rejects_registry_top_level_key_after_template_expansion() {
+        let path = temp_config_file(
+            r#"
+listen: 127.0.0.1:4101
+management:
+  admin_token: fixture-management-admin-token
+unknown_top_level: true
+pools: {}
+"#,
+        );
+
+        let err = YamlRegistryRepository::new(path)
+            .load_registry()
+            .expect_err("unknown registry top-level key must fail");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("unknown top-level config field"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn config_unknown_fields_rejects_management_and_principal_keys() {
+        let cases = [
+            (
+                "management typo",
+                r#"
+management:
+  admin_token: fixture-management-admin-token
+  event_log_pat: /tmp/events.jsonl
+pools: {}
+"#,
+            ),
+            (
+                "management principal typo",
+                r#"
+management:
+  admin_token: fixture-management-admin-token
+  principals:
+    - name: operator
+      token: fixture-management-operator-token
+      role: operator
+      role_typo: admin
+pools: {}
+"#,
+            ),
+        ];
+
+        for (name, yaml) in cases {
+            let path = temp_config_file(yaml);
+            let err = match YamlRegistryRepository::new(path).load_registry() {
+                Ok(_) => panic!("{name} should reject an unknown field"),
+                Err(err) => err,
+            };
+            let message = format!("{err:#}");
+            assert!(message.contains("unknown field"), "{name}: {message}");
+        }
+    }
+
+    #[test]
     fn registry_document_debug_redacts_client_and_management_tokens() {
         let debug_client_token = fixtures().upstream_credentials.debug_client.as_str();
         let debug_admin_token = fixtures().upstream_credentials.debug_admin.as_str();
@@ -8144,6 +8223,38 @@ pools:
                         r#"{
                             "provider_kind":"not_a_provider",
                             "enabled":true
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let stored = SqliteRegistryStore::open(&registry_store_path)
+            .unwrap()
+            .load_registry_for_validation()
+            .unwrap();
+        assert!(!stored.providers.contains_key("bad-provider"));
+    }
+
+    #[tokio::test]
+    async fn config_unknown_fields_rejects_management_registry_provider_upsert_json() {
+        let (app, registry_store_path) = registry_provider_fixture();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/management/registry/providers/bad-provider")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "provider_kind":"openai_compatible",
+                            "enabled":true,
+                            "unexpected":true
                         }"#,
                     ))
                     .unwrap(),

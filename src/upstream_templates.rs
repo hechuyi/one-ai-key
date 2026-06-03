@@ -15,6 +15,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpstreamShortcutConfig {
     template: String,
     keys_file: PathBuf,
@@ -48,11 +49,15 @@ struct UpstreamShortcutDocument {
 #[serde(untagged)]
 enum UpstreamShortcutModelConfig {
     Name(String),
-    Route {
-        public_model: String,
-        #[serde(default)]
-        upstream_model: Option<String>,
-    },
+    Route(UpstreamShortcutModelRouteConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamShortcutModelRouteConfig {
+    public_model: String,
+    #[serde(default)]
+    upstream_model: Option<String>,
 }
 
 struct UpstreamShortcutModelRoute {
@@ -315,10 +320,10 @@ impl UpstreamShortcutModelConfig {
     fn into_route(self) -> anyhow::Result<UpstreamShortcutModelRoute> {
         let (public_model, upstream_model) = match self {
             Self::Name(public_model) => (public_model, None),
-            Self::Route {
+            Self::Route(UpstreamShortcutModelRouteConfig {
                 public_model,
                 upstream_model,
-            } => (public_model, upstream_model),
+            }) => (public_model, upstream_model),
         };
         let public_model = public_model.trim().to_string();
         let upstream_model = upstream_model
@@ -969,5 +974,48 @@ upstreams:
 
         let err = expand_raw_yaml(&raw).unwrap_err();
         assert!(err.to_string().contains("unsupported upstream template"));
+    }
+
+    #[test]
+    fn upstream_template_rejects_unknown_shortcut_field() {
+        let raw = local_fixture_config_yaml(
+            r#"
+upstreams:
+  relay:
+    template: openai_compatible_bearer
+    api_base: https://relay.example.test/v1
+    keys_file: /tmp/relay.keys
+    auth_prefx: "Bearer "
+"#,
+        );
+
+        let err = expand_raw_yaml(&raw).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn upstream_template_rejects_unknown_model_route_field() {
+        let raw = local_fixture_config_yaml(
+            r#"
+upstreams:
+  relay:
+    template: openai_compatible_bearer
+    api_base: https://relay.example.test/v1
+    keys_file: /tmp/relay.keys
+    models:
+      - public_model: gpt-public
+        upstream: gpt-upstream
+"#,
+        );
+
+        let err = expand_raw_yaml(&raw).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown field") || message.contains("did not match any variant"),
+            "unexpected error: {message}"
+        );
     }
 }

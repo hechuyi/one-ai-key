@@ -66,6 +66,7 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientTokenConfig {
     pub name: String,
     pub token: String,
@@ -78,6 +79,7 @@ pub struct ClientTokenConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManagementConfig {
     pub admin_token: String,
     #[serde(default)]
@@ -91,6 +93,7 @@ pub struct ManagementConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManagementPrincipalConfig {
     pub name: String,
     pub token: String,
@@ -100,6 +103,7 @@ pub struct ManagementPrincipalConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeoutConfig {
     pub connect_seconds: Option<u64>,
     pub non_streaming_total_seconds: Option<u64>,
@@ -114,6 +118,7 @@ pub struct ResolvedTimeoutProfile {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
     pub max_route_candidates: Option<usize>,
     pub max_model_catalog_channels: Option<usize>,
@@ -128,6 +133,7 @@ pub struct ResolvedRoutingConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseFilterConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -138,6 +144,7 @@ pub struct ResponseFilterConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseFilterRuleConfig {
     pub id: String,
     #[serde(default = "default_enabled")]
@@ -171,6 +178,7 @@ pub enum ResponseFilterActionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     pub provider_kind: ProviderKind,
     #[serde(default = "default_enabled")]
@@ -178,6 +186,7 @@ pub struct ProviderConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AccountConfig {
     pub provider: String,
     pub api_base: String,
@@ -190,6 +199,7 @@ pub struct AccountConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PoolConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -212,17 +222,20 @@ pub struct PoolConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialSetConfig {
     pub keys_file: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ModelGroupConfig {
     #[serde(default)]
     pub models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyProfileConfig {
     #[serde(default)]
     pub error_rules: ErrorRulesConfig,
@@ -231,6 +244,7 @@ pub struct PolicyProfileConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeResultActionConfig {
     pub success: Option<ProbeResultActionKindConfig>,
     pub invalid: Option<ProbeResultActionKindConfig>,
@@ -274,6 +288,7 @@ pub struct ProbeResultPolicy {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RoutingProfileConfig {
     pub key_selection: KeySelectionStrategyConfig,
     pub default_credential_cooldown_seconds: u64,
@@ -293,17 +308,20 @@ pub enum KeySelectionStrategy {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SameRequestCredentialRetryConfig {
     pub enabled: bool,
     pub max_retries: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RouteTargetRetryConfig {
     pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorRulesConfig {
     pub keep_codes: Option<Vec<String>>,
     pub switch_codes: Option<Vec<String>>,
@@ -324,6 +342,7 @@ where
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorAdaptationRuleConfig {
     pub id: String,
     #[serde(default = "default_enabled")]
@@ -335,6 +354,7 @@ pub struct ErrorAdaptationRuleConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorAdaptationMatcherConfig {
     #[serde(default)]
     pub codes: Vec<String>,
@@ -345,6 +365,7 @@ pub struct ErrorAdaptationMatcherConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorAdaptationActionConfig {
     pub kind: Option<FailureKind>,
     pub primary_scope: Option<FailureScope>,
@@ -353,6 +374,7 @@ pub struct ErrorAdaptationActionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ModelRouteConfig {
     #[serde(default)]
     pub strategy: Option<String>,
@@ -361,6 +383,7 @@ pub struct ModelRouteConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ModelRouteTargetConfig {
     pub channel: String,
     #[serde(default)]
@@ -766,6 +789,7 @@ impl AppConfig {
         let path = path.into();
         let raw = fs::read_to_string(&path)?;
         let raw = crate::upstream_templates::expand_raw_yaml(&raw)?;
+        reject_unknown_top_level_config_fields(&raw, &[])?;
         let mut cfg: AppConfig = serde_yaml::from_str(&raw)?;
         cfg.apply_compatibility_defaults();
         Ok(cfg)
@@ -1211,6 +1235,45 @@ impl AppConfig {
         })
     }
 }
+
+pub(crate) fn reject_unknown_top_level_config_fields(
+    raw: &str,
+    extra_allowed_fields: &[&str],
+) -> anyhow::Result<()> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(raw)?;
+    let serde_yaml::Value::Mapping(mapping) = yaml else {
+        return Ok(());
+    };
+    for key in mapping.keys() {
+        let Some(field) = key.as_str() else {
+            continue;
+        };
+        if !APP_CONFIG_TOP_LEVEL_FIELDS.contains(&field) && !extra_allowed_fields.contains(&field) {
+            anyhow::bail!("unknown top-level config field `{field}`");
+        }
+    }
+    Ok(())
+}
+
+const APP_CONFIG_TOP_LEVEL_FIELDS: &[&str] = &[
+    "listen",
+    "client_tokens",
+    "management",
+    "max_request_body_bytes",
+    "max_model_catalog_body_bytes",
+    "max_error_body_bytes",
+    "timeouts",
+    "routing",
+    "default_pool",
+    "providers",
+    "accounts",
+    "policy_profiles",
+    "default_routing_profile",
+    "routing_profiles",
+    "credential_sets",
+    "model_routes",
+    "pools",
+];
 
 pub(crate) fn resolve_registry_document_with_credential_repository_and_store_path(
     document: crate::registry::RegistryDocument,
