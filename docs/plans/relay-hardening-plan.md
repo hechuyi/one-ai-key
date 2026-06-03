@@ -37,6 +37,8 @@ Kubernetes and Consul contribute the health-semantics lesson: liveness, serving 
 
 LiteLLM, OpenRouter-style routers, and comparable key/channel routers contribute the client-abstraction lesson: the client configures one base URL, one client token, and public model ids while the router chooses backend targets. one-ai-key keeps that abstraction, but avoids platform features such as teams, billing, price catalogs, and live provider catalog fan-out.
 
+LiteLLM and New API also contribute the retry/fallback reliability lesson: a relay should consume eligible backend, key, and channel failures before writing anything to the client whenever the request can be replayed safely. one-ai-key adopts only the lightweight pre-output form of that principle: same-request credential retry, frozen route-target fallback, typed cooldown, and explainable key/channel selection before returning a client-visible error. It explicitly does not adopt mid-stream continuation fallback, free-text keyword disablement, live model aggregation, complex multi-tenant billing/UI surfaces, or an active probe daemon.
+
 OpenTelemetry contributes the event-contract lesson: events need stable names, bounded fields, redaction rules, and explicit cardinality limits. one-ai-key uses structured event fields such as request id, channel id, credential id/hash, failure source, failure kind, action, and reason code. Events must not include raw keys, client tokens, request bodies, response bodies, matched filter text, absolute key paths, or token-like URL components.
 
 ## Non-Negotiable Constraints
@@ -275,6 +277,33 @@ Guard outcomes: `pass`, `classified`, `cap_exhausted`, `deadline_exhausted`, `pa
 
 **Phase 3 stop card:** red tests cover JSON error classification, code-less request-only behavior, body-bearing non-200 2xx responses, no-body status skip, first SSE error split across chunks, CRLF/comment/multiple-data-line SSE parsing, `[DONE]` pass-through, byte-exact prefix replay, no stale content length when filtered, cap and deadline pass-through, no fallback for streaming/non-replayable/partial-output paths, duplicate-charge-risk telemetry, and no false rejection of valid OpenAI Responses-style SSE. Complete only when local CI and x86_64 build pass.
 
+## Phase 3B: Pre-Output Retry/Fallback Reliability Tightening
+
+**Purpose:** tighten same-request retry and route-target fallback so LiteLLM/New API-style backend failures are exhausted internally before client-visible output, while preserving one-ai-key's lightweight, no-surprise, high-performance boundary.
+
+This stop node may be implemented before or after Phase 4. It refines the retry/fallback reliability contract but must not retroactively block a completed Phase 3. It stops immediately if acceptance requires live model aggregation, request-path storage joins, full buffering of successful responses, or post-output transparent fallback.
+
+Scope:
+
+- [ ] For non-streaming requests with replayable bodies, before returning an upstream-derived client error, exhaust all allowed same-request credential retries and frozen route-target fallback attempts within the unified attempt-state gates.
+- [ ] Same-request credential retry must exclude credentials already failed in the current request and must not switch back to the same key.
+- [ ] Route-target retry uses frozen candidates from the original route planning result. It skips targets that are already cooling down, disabled, or without an eligible credential, and its inclusion/skip reasons are explainable in telemetry and routing preview.
+- [ ] Streaming, non-replayable, and partial-output paths never fallback or retry. They return stable denial reasons instead of attempting continuation.
+- [ ] `Retry-After` and typed channel-failure evidence may influence transient cooldown. They never override manual disablement or configured disablement.
+- [ ] Retry/fallback decisions do not parse free-form upstream text and do not record raw response bodies, request bodies, upstream keys, client tokens, or token-like values.
+
+Stop-card tests:
+
+- Bad selected key retries to a good credential in the same request without reusing the failed credential.
+- Candidate exhaustion returns stable `no_frozen_candidate`, `attempt_limit_reached`, or `no_route_candidate` denial/error codes as appropriate.
+- Primary target `5xx`, `429`, and typed guarded-`2xx` failures fallback to the next eligible frozen target when replayability, deadline, and policy gates allow it.
+- Streaming, non-replayable, and partial-output paths produce no fallback and expose the stable denial reason.
+- Telemetry records retry directive, denial reason, and duplicate-charge-risk classification without raw body/key/token material.
+- Retry pressure remains bounded under repeated failures.
+- Routing preview explains skipped frozen candidates without leaking secrets or raw upstream payloads.
+
+**Phase 3B stop card:** complete only when the tests above pass under the normal local CI/build gates. Stop as blocked if the implementation needs mid-stream continuation fallback, free-text keyword disablement, live model aggregation, complex multi-tenant billing/UI behavior, active probe daemons, request-path storage joins, full successful-response buffering, or post-output transparent fallback.
+
 ## Phase 4: Response Filter Events And Protocol Framing
 
 **Purpose:** make contaminated successful responses visible without mutating routing health, and make response-filter body mutation protocol-correct.
@@ -380,6 +409,7 @@ This roadmap has hard stopping points. Do not continue into the next phase when 
 | Phase 1B | Channel balance suppression transition table, reset scope, all-target fail-closed behavior, and schemas pass | Account/provider/credential-set suppression becomes necessary. |
 | Phase 2 | Retry denial, duplicate-charge risk, retry pressure, and effective deadline schemas pass | Guarded fallback needs behavior not representable by the unified retry path. |
 | Phase 3 | 2xx guard passes byte/time/SSE/prefix/retry tests without full buffering | Guard requires broad schema validation, full buffering, or fallback after output. |
+| Phase 3B | Pre-output credential retry and frozen route-target fallback exhaust eligible candidates for replayable non-streaming requests before client errors | Reliability acceptance requires mid-stream continuation fallback, free-text keyword disablement, live model aggregation, active probe daemons, request-path storage joins, full successful-response buffering, or post-output transparent fallback. |
 | Phase 4 | Response-filter events, alerts, framing, and no-lifecycle-mutation tests pass | Filter hits need automatic channel mutation to satisfy acceptance. |
 | Phase 5 | Explain, docs, health truth table, and final release hygiene pass | New product surfaces such as UI, billing, or persistent model trust are required. |
 
