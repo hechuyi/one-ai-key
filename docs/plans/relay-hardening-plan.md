@@ -322,6 +322,12 @@ Reopen this boundary only if a new user goal explicitly asks for durable model t
 | Persistent model verification states | Requires durable catalog and product policy | New explicit model trust goal | Product/architecture follow-up |
 | UI, billing, price sync, PostgreSQL, plugin ecosystems | Outside lightweight router boundary | New product goal | Out of scope |
 
+## Production Bug Backlog
+
+| Bug | Observed behavior | Required behavior | Planned owner phase |
+| --- | --- | --- | --- |
+| Contaminated 2xx completion does not isolate the selected credential or fallback to a clean credential | A real relay completion returned HTTP 200 with a normal-looking chat completion envelope but contaminated assistant content. The selected credential stayed available, so importing a replacement key did not automatically move traffic away from the contaminated credential; manual credential expiration was required. | A configured high-confidence response-filter rejection must occur before body commit when possible, record redacted evidence, mark the selected credential or channel according to an explicit operator policy, and retry only through the unified Phase 2 retry gates. If no clean candidate exists, return a local sanitized error instead of forwarding contaminated content. | Post-Phase 4 follow-up, after response-filter events and framing are implemented. |
+
 ## Global Verification Commands
 
 Every phase must run:
