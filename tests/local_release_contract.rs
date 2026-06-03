@@ -52,7 +52,7 @@ fn local_ci_script_exists_is_executable_and_runs_required_cargo_commands_in_orde
 }
 
 #[test]
-fn release_script_is_local_x86_64_linux_nixos_musl_packaging_contract() {
+fn release_script_is_local_x86_64_linux_nix_command_gnu_packaging_contract() {
     let path = "scripts/build-release-x86_64-linux.sh";
     assert!(Path::new(path).is_file(), "{path} must exist");
     assert_executable(path);
@@ -75,12 +75,28 @@ fn release_script_is_local_x86_64_linux_nixos_musl_packaging_contract() {
         "{path} must require x86_64 execution"
     );
     assert!(
-        script.contains("/etc/os-release") && script.contains("nixos"),
-        "{path} must bind execution to a local NixOS-style container environment"
+        script.contains("nix --version"),
+        "{path} must require the Nix command to be available in the container"
     );
     assert!(
-        script.contains("x86_64-unknown-linux-musl"),
-        "{path} must default to the x86_64-unknown-linux-musl target"
+        script.contains("cargo --version"),
+        "{path} must require cargo to be available in the active toolchain"
+    );
+    assert!(
+        script.contains("rustc --version"),
+        "{path} must require rustc to be available in the active toolchain"
+    );
+    assert!(
+        !script.contains("/etc/os-release") && !script.to_ascii_lowercase().contains("nixos"),
+        "{path} must not require /etc/os-release to identify as NixOS"
+    );
+    assert!(
+        script.contains("x86_64-unknown-linux-gnu"),
+        "{path} must default to the x86_64-unknown-linux-gnu target"
+    );
+    assert!(
+        !script.contains("x86_64-unknown-linux-musl"),
+        "{path} must not default to the musl target because plain nixpkgs rustc does not include musl std"
     );
     assert!(
         script.contains("cargo build --release --locked --target"),
@@ -117,6 +133,59 @@ fn release_script_is_local_x86_64_linux_nixos_musl_packaging_contract() {
         assert!(
             !script.to_ascii_lowercase().contains(forbidden),
             "{path} must not contain remote operation token `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn docker_release_wrapper_runs_local_amd64_nix_container_with_cached_nix_store() {
+    let path = "scripts/build-release-x86_64-linux-docker.sh";
+    assert!(Path::new(path).is_file(), "{path} must exist");
+    assert_executable(path);
+
+    let script = read_repo_file(path);
+    assert!(
+        script.contains("docker run") && script.contains("--rm"),
+        "{path} must run an ephemeral local Docker container"
+    );
+    assert!(
+        script.contains("--platform linux/amd64"),
+        "{path} must force the x86_64 Linux Docker platform"
+    );
+    assert!(
+        script.contains("nixos/nix:latest"),
+        "{path} must use the official Nix Docker image"
+    );
+    assert!(
+        script.contains(r#""${REPO_ROOT}:/work""#) || script.contains(r#""${REPO_ROOT}:/work:"#),
+        "{path} must mount the repository at /work"
+    );
+    assert!(
+        script.contains("rtoc-monitor-nix-amd64:/nix"),
+        "{path} must mount the named Nix cache volume at /nix"
+    );
+    assert!(
+        script.contains("nix-command flakes"),
+        "{path} must enable nix-command and flakes"
+    );
+    for package in ["cargo", "rustc", "gcc", "pkg-config", "openssl"] {
+        assert!(
+            script.contains(package),
+            "{path} must make `{package}` available in the Nix shell"
+        );
+    }
+    assert!(
+        !script.contains("nixpkgs#musl"),
+        "{path} must not imply nixpkgs rustc can directly build the musl target"
+    );
+    assert!(
+        script.contains("/work/scripts/build-release-x86_64-linux.sh"),
+        "{path} must call the in-container release script"
+    );
+    for forbidden in ["ssh", "scp", "rsync", "remote", "token", "secret"] {
+        assert!(
+            !script.to_ascii_lowercase().contains(forbidden),
+            "{path} must not contain remote operation or credential token `{forbidden}`"
         );
     }
 }

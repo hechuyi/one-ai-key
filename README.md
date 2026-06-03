@@ -29,6 +29,35 @@ CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
 cargo run -- --config config/local.yaml
 ```
 
+## Local x86_64 Linux Release Build
+
+The only supported local release gate for the Linux x86_64 artifact is to run
+the Docker wrapper from the macOS host at the repository root:
+
+```bash
+scripts/build-release-x86_64-linux-docker.sh
+```
+
+The wrapper runs Docker with `--platform linux/amd64`, starts
+`nixos/nix:latest`, mounts this repository at `/work`, mounts the named Nix
+store volume `rtoc-monitor-nix-amd64:/nix`, and then runs
+`scripts/build-release-x86_64-linux.sh` inside the Nix shell.
+
+Do not build the release artifact on `rtoc-gateway` or any other remote server.
+Do not use Debian or Ubuntu Rust images as the release gate. Do not upload or
+commit `dist/`, runtime config, SQLite databases, keys, tokens, JSONL logs, or
+`AGENTS.md`.
+
+The build writes `dist/one-ai-key-<version>-<target>.tar.gz` and a matching
+`dist/one-ai-key-<version>-<target>.tar.gz.sha256`. The sha256 sidecar must
+record only the archive basename, not an absolute path or `dist/`-prefixed
+path.
+
+Troubleshooting: a slow first Nix download is expected while Docker populates
+the `rtoc-monitor-nix-amd64` volume; it is not a reason to switch to a server
+build. If the wrapper fails, first check that Docker is available, the named
+volume is mounted, and the command is being run from the repository root.
+
 Runtime configuration is intentionally local. Keep operator config, key files,
 SQLite databases, and other mutable state in ignored paths such as
 `config/local.yaml` and `data/`. Do not commit deploy or runtime secrets.

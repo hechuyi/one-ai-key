@@ -8,7 +8,7 @@ OS_NAME=$(uname -s)
 ARCH_NAME=$(uname -m)
 
 if [[ "${OS_NAME}" != "Linux" ]]; then
-  printf 'error: release builds must run inside the local x86_64 NixOS container; got OS %s\n' "${OS_NAME}" >&2
+  printf 'error: release builds must run inside the local x86_64 Linux Nix container; got OS %s\n' "${OS_NAME}" >&2
   exit 1
 fi
 
@@ -17,8 +17,18 @@ if [[ "${ARCH_NAME}" != "x86_64" ]]; then
   exit 1
 fi
 
-if [[ ! -r /etc/os-release ]] || ! grep -qi 'nixos' /etc/os-release; then
-  printf 'error: release builds must run inside the local x86_64 NixOS container\n' >&2
+if ! command -v nix >/dev/null 2>&1 || ! nix --version >/dev/null 2>&1; then
+  printf 'error: release builds must run in a local x86_64 Linux container with Nix available\n' >&2
+  exit 1
+fi
+
+if ! command -v cargo >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
+  printf 'error: release builds require cargo from the active Nix toolchain\n' >&2
+  exit 1
+fi
+
+if ! command -v rustc >/dev/null 2>&1 || ! rustc --version >/dev/null 2>&1; then
+  printf 'error: release builds require rustc from the active Nix toolchain\n' >&2
   exit 1
 fi
 
@@ -36,7 +46,7 @@ if [[ -z "${PACKAGE_NAME}" || -z "${VERSION}" ]]; then
   printf 'error: could not parse package name/version from cargo package id: %s\n' "${PACKAGE_ID}" >&2
   exit 1
 fi
-TARGET=${TARGET:-x86_64-unknown-linux-musl}
+TARGET=${TARGET:-x86_64-unknown-linux-gnu}
 DIST_DIR="${REPO_ROOT}/dist"
 BUILD_BIN="${REPO_ROOT}/target/${TARGET}/release/${PACKAGE_NAME}"
 ARCHIVE_NAME="${PACKAGE_NAME}-${VERSION}-${TARGET}.tar.gz"
