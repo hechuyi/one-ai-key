@@ -81,9 +81,20 @@ pub struct ClientTokenConfig {
 pub struct ManagementConfig {
     pub admin_token: String,
     #[serde(default)]
+    pub principals: Vec<ManagementPrincipalConfig>,
+    #[serde(default)]
     pub event_log_path: Option<PathBuf>,
     #[serde(default)]
     pub event_window_capacity: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManagementPrincipalConfig {
+    pub name: String,
+    pub token: String,
+    pub role: ManagementRole,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -364,7 +375,7 @@ pub struct ModelRouteTargetConfig {
 pub struct ResolvedConfig {
     pub listen: SocketAddr,
     pub client_tokens: Vec<ResolvedClientToken>,
-    pub management_principal: ResolvedManagementPrincipal,
+    pub management_principals: Vec<ResolvedManagementPrincipal>,
     pub max_request_body_bytes: usize,
     pub max_model_catalog_body_bytes: usize,
     pub max_error_body_bytes: usize,
@@ -424,9 +435,26 @@ pub struct ResolvedManagementPrincipal {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ManagementRole {
+    Readonly,
+    Operator,
     Admin,
+}
+
+impl ManagementRole {
+    pub fn allows(self, minimum: Self) -> bool {
+        self.rank() >= minimum.rank()
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Readonly => 0,
+            Self::Operator => 1,
+            Self::Admin => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1092,16 +1120,58 @@ impl AppConfig {
             );
         }
 
+        let admin_token_hash = hash_token(admin_token);
+        let mut management_principal_names = HashSet::from(["local-admin".to_string()]);
+        let mut management_principal_hashes = HashSet::from([admin_token_hash.clone()]);
+        let bootstrap_management_principal_id = stable_id("management", "admin");
+        let mut management_principal_ids =
+            HashSet::from([bootstrap_management_principal_id.clone()]);
+        let management_principal = ResolvedManagementPrincipal {
+            id: bootstrap_management_principal_id,
+            name: "local-admin".to_string(),
+            role: ManagementRole::Admin,
+            token_hash: admin_token_hash,
+            enabled: true,
+        };
+        let mut management_principals = vec![management_principal.clone()];
+        for principal in management.principals {
+            let name = principal.name.trim().to_string();
+            anyhow::ensure!(
+                !name.is_empty(),
+                "management.principals name must not be empty"
+            );
+            anyhow::ensure!(
+                management_principal_names.insert(name.clone()),
+                "duplicate management principal name {name}"
+            );
+            let token = principal.token.trim();
+            anyhow::ensure!(
+                !token.is_empty(),
+                "management.principals token must not be empty"
+            );
+            let token_hash = hash_token(token);
+            anyhow::ensure!(
+                management_principal_hashes.insert(token_hash.clone()),
+                "duplicate management principal secret for {name}"
+            );
+            let id = stable_id("management", &name);
+            anyhow::ensure!(
+                management_principal_ids.insert(id.clone()),
+                "duplicate management principal id for {name}"
+            );
+            management_principals.push(ResolvedManagementPrincipal {
+                id,
+                name,
+                role: principal.role,
+                token_hash,
+                enabled: principal.enabled,
+            });
+        }
+
         Ok(ResolvedConfig {
             listen: self.listen,
             client_tokens,
-            management_principal: ResolvedManagementPrincipal {
-                id: stable_id("management", "admin"),
-                name: "local-admin".to_string(),
-                role: ManagementRole::Admin,
-                token_hash: hash_token(admin_token),
-                enabled: true,
-            },
+            management_principals,
             max_request_body_bytes: self.max_request_body_bytes,
             max_model_catalog_body_bytes: self.max_model_catalog_body_bytes,
             max_error_body_bytes: self.max_error_body_bytes,

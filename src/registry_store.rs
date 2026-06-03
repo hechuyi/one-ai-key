@@ -1536,6 +1536,7 @@ mod tests {
         }];
         bootstrap.management = Some(crate::config::ManagementConfig {
             admin_token: "bootstrap-admin".to_string(),
+            principals: Vec::new(),
             event_log_path: Some(PathBuf::from("/tmp/bootstrap-events.jsonl")),
             event_window_capacity: Some(17),
         });
@@ -1561,6 +1562,7 @@ mod tests {
         }];
         resources_source.management = Some(crate::config::ManagementConfig {
             admin_token: "resource-admin".to_string(),
+            principals: Vec::new(),
             event_log_path: Some(PathBuf::from("/tmp/resource-events.jsonl")),
             event_window_capacity: Some(29),
         });
@@ -1616,6 +1618,7 @@ mod tests {
         }];
         bootstrap.management = Some(crate::config::ManagementConfig {
             admin_token: "bootstrap-admin".to_string(),
+            principals: Vec::new(),
             event_log_path: Some(PathBuf::from("/tmp/bootstrap-events.jsonl")),
             event_window_capacity: Some(17),
         });
@@ -1682,6 +1685,7 @@ mod tests {
         }];
         resources.management = Some(crate::config::ManagementConfig {
             admin_token: "resource-admin".to_string(),
+            principals: Vec::new(),
             event_log_path: Some(PathBuf::from("/tmp/resource-events.jsonl")),
             event_window_capacity: Some(29),
         });

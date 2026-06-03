@@ -1411,6 +1411,8 @@ fn management_actor(principal: &AuthorizedManagementPrincipal) -> ManagementEven
         id: principal.id.clone(),
         name: principal.name.clone(),
         role: match principal.role {
+            ManagementRole::Readonly => "readonly".to_string(),
+            ManagementRole::Operator => "operator".to_string(),
             ManagementRole::Admin => "admin".to_string(),
         },
     }

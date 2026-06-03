@@ -64,12 +64,16 @@ pub fn authorize_management(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     if let Some(token) = got {
-        let principal = &state.management_principal;
-        if principal.enabled && principal.token_hash == hash_token(token) {
+        let token_hash = hash_token(token);
+        if let Some(principal) = state
+            .management_principals
+            .iter()
+            .find(|principal| principal.enabled && principal.token_hash == token_hash)
+        {
             return Ok(AuthorizedManagementPrincipal {
                 id: principal.id.clone(),
                 name: principal.name.clone(),
-                role: principal.role.clone(),
+                role: principal.role,
             });
         }
     }

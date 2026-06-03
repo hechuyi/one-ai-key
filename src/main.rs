@@ -42,6 +42,10 @@ mod upstream_response;
 mod upstream_templates;
 
 use axum::{
+    extract::{MatchedPath, Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::Response,
     routing::{any, get, patch, post, put},
     Router,
 };
@@ -53,6 +57,8 @@ use registry_store::{RegistryStoreHandle, SqliteRegistryStore};
 use state::AppState;
 use tracing_subscriber::EnvFilter;
 
+use crate::{auth::authorize_management, config::ManagementRole};
+
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(
@@ -61,6 +67,392 @@ struct Args {
         default_value = "config/router.yaml"
     )]
     config: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagementRouteSpec {
+    method: &'static str,
+    path: &'static str,
+    minimum_role: ManagementRole,
+}
+
+const MANAGEMENT_ROUTE_SPECS: &[ManagementRouteSpec] = &[
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/pools",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/channels",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/client-tokens",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/client-tokens",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "PATCH",
+        path: "/management/client-tokens/:id",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/client-tokens/:id/disable",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/client-tokens/:id/enable",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/providers",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "PUT",
+        path: "/management/registry/providers/:id",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/registry/providers/:id/disable",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/registry/providers/:id/enable",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/accounts",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "PUT",
+        path: "/management/registry/accounts/:id",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/registry/accounts/:id/disable",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/registry/accounts/:id/enable",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "PUT",
+        path: "/management/registry/channels/:id",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/registry/channels/:id/disable",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/registry/channels/:id/enable",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/credential-sets",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/credential-sets/:id/operations",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/credential-sets/:id/credentials",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/credential-sets/:id/imports",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/credential-sets/:id/imports/:batch_id",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/credential-sets/:id/credentials/:credential_id",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "PUT",
+        path: "/management/credential-sets/:id/credentials/:credential_id/metadata",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/credential-sets/:id/credentials/:credential_id/history",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/credential-sets/:id/credentials/:credential_id/probe",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/credential-sets/:id/credentials/:credential_id/probes",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/credential-sets/:id/credentials/:credential_id/apply-latest-probe",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/credential-sets/:id/credentials/apply-latest-probe",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/credential-sets/:id/credentials/import",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/credential-sets/:id/credentials/:credential_id/expire",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/credential-sets/:id/credentials/:credential_id/restore",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/credential-sets/:id/credentials/:credential_id/quota-exhaust",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/credential-sets/:id/credentials/:credential_id/disable",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/credential-sets/:id/credentials/:credential_id/enable",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/credential-sets/:id/credentials/:credential_id/reset-cooldown",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/model-routes",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "PUT",
+        path: "/management/registry/model-routes/*model",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/model-discovery/sync-plan",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/model-discovery/sync-apply",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/policy-profiles",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "PUT",
+        path: "/management/registry/policy-profiles/:id",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/policy-profiles/:id",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/routing-profiles",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "PUT",
+        path: "/management/registry/routing-profiles/:id",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/routing-profiles/:id",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/routing/preview",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/runtime",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/runtime/reload",
+        minimum_role: ManagementRole::Admin,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/alerts",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/channels/:id",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/channels/:id/model-discovery",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/channels/:id/reset-health",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/channels/:id/disable",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/channels/:id/enable",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/channels/:id/error-rules",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/channels/:id/credentials",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/channels/:id/credentials/:credential_id/expire",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/channels/:id/credentials/:credential_id/restore",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/channels/:id/credentials/:credential_id/quota-exhaust",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/channels/:id/credentials/:credential_id/disable",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/channels/:id/credentials/:credential_id/enable",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "POST",
+        path: "/management/channels/:id/credentials/:credential_id/reset-cooldown",
+        minimum_role: ManagementRole::Operator,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/events",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/routing-telemetry",
+        minimum_role: ManagementRole::Readonly,
+    },
+];
+
+#[cfg(test)]
+fn management_route_specs() -> &'static [ManagementRouteSpec] {
+    MANAGEMENT_ROUTE_SPECS
+}
+
+fn management_route_spec(method: &str, path: &str) -> Option<&'static ManagementRouteSpec> {
+    MANAGEMENT_ROUTE_SPECS
+        .iter()
+        .find(|spec| spec.method == method && spec.path == path)
+}
+
+async fn management_role_gate(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !request.uri().path().starts_with("/management/") {
+        return next.run(request).await;
+    }
+
+    let principal = match authorize_management(&state, request.headers()) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    let matched_path = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or_else(|| request.uri().path());
+    let Some(spec) = management_route_spec(request.method().as_str(), matched_path) else {
+        return auth::json_error(StatusCode::FORBIDDEN, "management route is not registered");
+    };
+    if !principal.role.allows(spec.minimum_role) {
+        return auth::json_error(
+            StatusCode::FORBIDDEN,
+            "management principal role is not allowed for this route",
+        );
+    }
+
+    next.run(request).await
+}
+
+async fn unregistered_management_route() -> Response {
+    auth::json_error(StatusCode::FORBIDDEN, "management route is not registered")
 }
 
 #[tokio::main]
@@ -335,8 +727,13 @@ fn app(state: AppState) -> Router {
             "/management/routing-telemetry",
             get(management::routing_telemetry),
         )
+        .route("/management/*path", any(unregistered_management_route))
         .route("/v1/*path", any(proxy::proxy_openai_compatible))
         .route("/pools/:pool/*path", any(proxy::proxy_named_pool))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            management_role_gate,
+        ))
         .with_state(state)
 }
 
@@ -379,8 +776,8 @@ mod tests {
         config::{
             hash_token, AccountConfig, ClientTokenConfig, CredentialSetConfig,
             ErrorAdaptationActionConfig, ErrorAdaptationMatcherConfig, ErrorAdaptationRuleConfig,
-            ErrorRulesConfig, ManagementConfig, PolicyProfileConfig, PoolConfig, ProviderConfig,
-            TimeoutConfig,
+            ErrorRulesConfig, ManagementConfig, ManagementPrincipalConfig, ManagementRole,
+            PolicyProfileConfig, PoolConfig, ProviderConfig, TimeoutConfig,
         },
         credential_repository::{
             CredentialLifecycleState, CredentialRepository, CredentialSetId,
@@ -411,6 +808,14 @@ mod tests {
 
     fn fixture_admin_token() -> String {
         fixtures().admin_token.to_string()
+    }
+
+    fn fixture_readonly_management_token() -> String {
+        "fixture-readonly-management-token".to_string()
+    }
+
+    fn fixture_operator_management_token() -> String {
+        "fixture-operator-management-token".to_string()
     }
 
     fn fixture_restricted_client_token() -> String {
@@ -573,6 +978,155 @@ pools:
                 .to_string();
             assert!(err.contains(field), "{err}");
         }
+    }
+
+    #[test]
+    fn config_rejects_ambiguous_management_principals() {
+        let admin_token = fixture_admin_token();
+        let keys_file = temp_keys_file(&credential_lines(&[fixtures()
+            .upstream_credentials
+            .test_upstream
+            .as_str()]));
+        let cases = [
+            (
+                "duplicate management principal name operator",
+                r#"
+    - name: operator
+      token: fixture-management-operator-token
+      role: operator
+    - name: " operator "
+      token: fixture-management-readonly-token
+      role: readonly
+"#,
+            ),
+            (
+                "duplicate management principal secret for readonly",
+                r#"
+    - name: operator
+      token: fixture-shared-management-token
+      role: operator
+    - name: readonly
+      token: fixture-shared-management-token
+      role: readonly
+      enabled: false
+"#,
+            ),
+            (
+                "duplicate management principal secret for operator",
+                r#"
+    - name: operator
+      token: {admin_token}
+      role: operator
+"#,
+            ),
+            (
+                "duplicate management principal id for admin",
+                r#"
+    - name: admin
+      token: fixture-management-operator-token
+      role: operator
+"#,
+            ),
+        ];
+
+        for (expected, principals) in cases {
+            let principals = principals.replace("{admin_token}", &format!(" {admin_token} "));
+            let config_path = temp_config_file(&format!(
+                r#"
+client_tokens:
+  - name: test-client
+    token: {}
+management:
+  admin_token: {admin_token}
+  principals:{principals}
+default_pool: test
+credential_sets:
+  test-credentials:
+    keys_file: {}
+default_routing_profile: default-routing
+routing_profiles:
+  default-routing:
+    key_selection: sticky_until_failure
+    default_credential_cooldown_seconds: 20
+    same_request_credential_retry:
+      enabled: false
+      max_retries: 0
+    route_target_retry:
+      enabled: true
+pools:
+  test:
+    provider_kind: openai_compatible
+    api_base: https://example.com/v1
+    credential_set: test-credentials
+"#,
+                fixture_client_token(),
+                keys_file.display()
+            ));
+
+            let err = AppConfig::from_path(config_path)
+                .unwrap()
+                .resolve()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn config_trims_management_principal_tokens_before_hashing() {
+        let keys_file = temp_keys_file(&credential_lines(&[fixtures()
+            .upstream_credentials
+            .test_upstream
+            .as_str()]));
+        let config_path = temp_config_file(&format!(
+            r#"
+client_tokens:
+  - name: test-client
+    token: {}
+management:
+  admin_token: {}
+  principals:
+    - name: operator
+      token: " fixture-management-operator-token "
+      role: operator
+default_pool: test
+credential_sets:
+  test-credentials:
+    keys_file: {}
+default_routing_profile: default-routing
+routing_profiles:
+  default-routing:
+    key_selection: sticky_until_failure
+    default_credential_cooldown_seconds: 20
+    same_request_credential_retry:
+      enabled: false
+      max_retries: 0
+    route_target_retry:
+      enabled: true
+pools:
+  test:
+    provider_kind: openai_compatible
+    api_base: https://example.com/v1
+    credential_set: test-credentials
+"#,
+            fixture_client_token(),
+            fixture_admin_token(),
+            keys_file.display()
+        ));
+
+        let resolved = AppConfig::from_path(config_path)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let operator = resolved
+            .management_principals
+            .iter()
+            .find(|principal| principal.name == "operator")
+            .unwrap();
+        assert_eq!(
+            operator.token_hash,
+            hash_token("fixture-management-operator-token")
+        );
     }
 
     fn source_file(path: &str) -> String {
@@ -1063,25 +1617,28 @@ model_routes:
             );
             assert_eq!(registry_token.allowed_channels, app_token.allowed_channels);
         }
+        let registry_management_principal =
+            registry_resolved.management_principals.first().unwrap();
+        let app_management_principal = app_resolved.management_principals.first().unwrap();
         assert_eq!(
-            registry_resolved.management_principal.id,
-            app_resolved.management_principal.id
+            registry_management_principal.id,
+            app_management_principal.id
         );
         assert_eq!(
-            registry_resolved.management_principal.name,
-            app_resolved.management_principal.name
+            registry_management_principal.name,
+            app_management_principal.name
         );
         assert_eq!(
-            registry_resolved.management_principal.role,
-            app_resolved.management_principal.role
+            registry_management_principal.role,
+            app_management_principal.role
         );
         assert_eq!(
-            registry_resolved.management_principal.token_hash,
-            app_resolved.management_principal.token_hash
+            registry_management_principal.token_hash,
+            app_management_principal.token_hash
         );
         assert_eq!(
-            registry_resolved.management_principal.enabled,
-            app_resolved.management_principal.enabled
+            registry_management_principal.enabled,
+            app_management_principal.enabled
         );
         assert_eq!(
             registry_resolved.management_event_log_path,
@@ -6296,6 +6853,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -6397,6 +6955,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path,
                 event_window_capacity: None,
             }),
@@ -6453,6 +7012,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -6506,6 +7066,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -6558,6 +7119,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -6677,6 +7239,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -6853,6 +7416,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -8071,6 +8635,513 @@ pools:
         (status, String::from_utf8(body.to_vec()).unwrap())
     }
 
+    fn management_role_matrix_state() -> AppState {
+        let mut config = test_config_with_api_base("https://example.com/v1");
+        let management = config.management.as_mut().unwrap();
+        management.principals = vec![
+            ManagementPrincipalConfig {
+                name: "readonly-fixture".to_string(),
+                token: fixture_readonly_management_token(),
+                role: ManagementRole::Readonly,
+                enabled: true,
+            },
+            ManagementPrincipalConfig {
+                name: "operator-fixture".to_string(),
+                token: fixture_operator_management_token(),
+                role: ManagementRole::Operator,
+                enabled: true,
+            },
+        ];
+        let store_path = temp_sqlite_path("management-role-matrix");
+        let repository = SqliteCredentialRepository::open(&store_path).unwrap();
+        AppState::new(
+            config
+                .resolve_with_credential_repository_and_store_path(&repository, Some(store_path))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn management_role_matrix_response(
+        method: &str,
+        uri: &str,
+        token: Option<String>,
+        body: Body,
+    ) -> StatusCode {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, bearer_for(&token));
+        }
+        if method != "GET" {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        let response = app(management_role_matrix_state())
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap();
+        response.status()
+    }
+
+    fn sample_management_route_path(path: &str) -> String {
+        path.replace(":id", "test")
+            .replace(":credential_id", "test-credential")
+            .replace(":batch_id", "test-batch")
+            .replace("*model", "gpt-test")
+    }
+
+    #[test]
+    fn management_route_registry_enumerates_current_management_routes_once() {
+        let actual: Vec<_> = management_route_specs()
+            .iter()
+            .map(|spec| (spec.method, spec.path, spec.minimum_role))
+            .collect();
+        let expected = vec![
+            ("GET", "/management/pools", ManagementRole::Readonly),
+            ("GET", "/management/channels", ManagementRole::Readonly),
+            ("GET", "/management/client-tokens", ManagementRole::Readonly),
+            ("POST", "/management/client-tokens", ManagementRole::Admin),
+            (
+                "PATCH",
+                "/management/client-tokens/:id",
+                ManagementRole::Admin,
+            ),
+            (
+                "POST",
+                "/management/client-tokens/:id/disable",
+                ManagementRole::Admin,
+            ),
+            (
+                "POST",
+                "/management/client-tokens/:id/enable",
+                ManagementRole::Admin,
+            ),
+            ("GET", "/management/providers", ManagementRole::Readonly),
+            (
+                "PUT",
+                "/management/registry/providers/:id",
+                ManagementRole::Admin,
+            ),
+            (
+                "POST",
+                "/management/registry/providers/:id/disable",
+                ManagementRole::Admin,
+            ),
+            (
+                "POST",
+                "/management/registry/providers/:id/enable",
+                ManagementRole::Admin,
+            ),
+            ("GET", "/management/accounts", ManagementRole::Readonly),
+            (
+                "PUT",
+                "/management/registry/accounts/:id",
+                ManagementRole::Admin,
+            ),
+            (
+                "POST",
+                "/management/registry/accounts/:id/disable",
+                ManagementRole::Admin,
+            ),
+            (
+                "POST",
+                "/management/registry/accounts/:id/enable",
+                ManagementRole::Admin,
+            ),
+            (
+                "PUT",
+                "/management/registry/channels/:id",
+                ManagementRole::Admin,
+            ),
+            (
+                "POST",
+                "/management/registry/channels/:id/disable",
+                ManagementRole::Admin,
+            ),
+            (
+                "POST",
+                "/management/registry/channels/:id/enable",
+                ManagementRole::Admin,
+            ),
+            (
+                "GET",
+                "/management/credential-sets",
+                ManagementRole::Readonly,
+            ),
+            (
+                "GET",
+                "/management/credential-sets/:id/operations",
+                ManagementRole::Readonly,
+            ),
+            (
+                "GET",
+                "/management/credential-sets/:id/credentials",
+                ManagementRole::Readonly,
+            ),
+            (
+                "GET",
+                "/management/credential-sets/:id/imports",
+                ManagementRole::Readonly,
+            ),
+            (
+                "GET",
+                "/management/credential-sets/:id/imports/:batch_id",
+                ManagementRole::Readonly,
+            ),
+            (
+                "GET",
+                "/management/credential-sets/:id/credentials/:credential_id",
+                ManagementRole::Readonly,
+            ),
+            (
+                "PUT",
+                "/management/credential-sets/:id/credentials/:credential_id/metadata",
+                ManagementRole::Operator,
+            ),
+            (
+                "GET",
+                "/management/credential-sets/:id/credentials/:credential_id/history",
+                ManagementRole::Readonly,
+            ),
+            (
+                "POST",
+                "/management/credential-sets/:id/credentials/:credential_id/probe",
+                ManagementRole::Operator,
+            ),
+            (
+                "GET",
+                "/management/credential-sets/:id/credentials/:credential_id/probes",
+                ManagementRole::Readonly,
+            ),
+            (
+                "POST",
+                "/management/credential-sets/:id/credentials/:credential_id/apply-latest-probe",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/credential-sets/:id/credentials/apply-latest-probe",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/credential-sets/:id/credentials/import",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/credential-sets/:id/credentials/:credential_id/expire",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/credential-sets/:id/credentials/:credential_id/restore",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/credential-sets/:id/credentials/:credential_id/quota-exhaust",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/credential-sets/:id/credentials/:credential_id/disable",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/credential-sets/:id/credentials/:credential_id/enable",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/credential-sets/:id/credentials/:credential_id/reset-cooldown",
+                ManagementRole::Operator,
+            ),
+            ("GET", "/management/model-routes", ManagementRole::Readonly),
+            (
+                "PUT",
+                "/management/registry/model-routes/*model",
+                ManagementRole::Admin,
+            ),
+            (
+                "POST",
+                "/management/model-discovery/sync-plan",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/model-discovery/sync-apply",
+                ManagementRole::Admin,
+            ),
+            (
+                "GET",
+                "/management/policy-profiles",
+                ManagementRole::Readonly,
+            ),
+            (
+                "PUT",
+                "/management/registry/policy-profiles/:id",
+                ManagementRole::Admin,
+            ),
+            (
+                "GET",
+                "/management/policy-profiles/:id",
+                ManagementRole::Readonly,
+            ),
+            (
+                "GET",
+                "/management/routing-profiles",
+                ManagementRole::Readonly,
+            ),
+            (
+                "PUT",
+                "/management/registry/routing-profiles/:id",
+                ManagementRole::Admin,
+            ),
+            (
+                "GET",
+                "/management/routing-profiles/:id",
+                ManagementRole::Readonly,
+            ),
+            (
+                "GET",
+                "/management/routing/preview",
+                ManagementRole::Readonly,
+            ),
+            ("GET", "/management/runtime", ManagementRole::Readonly),
+            ("POST", "/management/runtime/reload", ManagementRole::Admin),
+            ("GET", "/management/alerts", ManagementRole::Readonly),
+            ("GET", "/management/channels/:id", ManagementRole::Readonly),
+            (
+                "POST",
+                "/management/channels/:id/model-discovery",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/channels/:id/reset-health",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/channels/:id/disable",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/channels/:id/enable",
+                ManagementRole::Operator,
+            ),
+            (
+                "GET",
+                "/management/channels/:id/error-rules",
+                ManagementRole::Readonly,
+            ),
+            (
+                "GET",
+                "/management/channels/:id/credentials",
+                ManagementRole::Readonly,
+            ),
+            (
+                "POST",
+                "/management/channels/:id/credentials/:credential_id/expire",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/channels/:id/credentials/:credential_id/restore",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/channels/:id/credentials/:credential_id/quota-exhaust",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/channels/:id/credentials/:credential_id/disable",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/channels/:id/credentials/:credential_id/enable",
+                ManagementRole::Operator,
+            ),
+            (
+                "POST",
+                "/management/channels/:id/credentials/:credential_id/reset-cooldown",
+                ManagementRole::Operator,
+            ),
+            ("GET", "/management/events", ManagementRole::Readonly),
+            (
+                "GET",
+                "/management/routing-telemetry",
+                ManagementRole::Readonly,
+            ),
+        ];
+        assert_eq!(actual, expected);
+
+        let mut seen = std::collections::HashSet::new();
+        for spec in management_route_specs() {
+            assert!(
+                seen.insert((spec.method, spec.path)),
+                "duplicate management route role registration for {} {}",
+                spec.method,
+                spec.path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn management_route_specs_are_attached_to_the_axum_router() {
+        for spec in management_route_specs() {
+            let body = match spec.method {
+                "GET" => Body::empty(),
+                _ => Body::from("{}"),
+            };
+            let path = sample_management_route_path(spec.path);
+            let response = app(management_role_matrix_state())
+                .oneshot(
+                    Request::builder()
+                        .method(spec.method)
+                        .uri(path.as_str())
+                        .header(header::AUTHORIZATION, admin_bearer())
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                !(status == StatusCode::FORBIDDEN
+                    && body.contains("management route is not registered")),
+                "{} {} did not reach a registered Axum route: {body}",
+                spec.method,
+                path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_management_routes_fail_closed_before_not_found() {
+        assert_eq!(
+            management_role_matrix_response(
+                "GET",
+                "/management/not-registered",
+                None,
+                Body::empty()
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let response = app(management_role_matrix_state())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/management/not-registered")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("management route is not registered"),
+            "{body}"
+        );
+
+        let response = app(management_role_matrix_state())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/not-management")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn management_role_gate_enforces_minimum_roles_before_handlers() {
+        let import_body = Body::from(r#"{"keys":["operator-import-key"],"batch_id":"role-gate"}"#);
+
+        assert_eq!(
+            management_role_matrix_response(
+                "GET",
+                "/management/pools",
+                Some(fixture_readonly_management_token()),
+                Body::empty()
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            management_role_matrix_response(
+                "POST",
+                "/management/credential-sets/test-credentials/credentials/import",
+                Some(fixture_readonly_management_token()),
+                import_body
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            management_role_matrix_response(
+                "POST",
+                "/management/credential-sets/test-credentials/credentials/import",
+                Some(fixture_operator_management_token()),
+                Body::from(r#"{"keys":["operator-import-key"],"batch_id":"role-gate"}"#)
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            management_role_matrix_response(
+                "PUT",
+                "/management/registry/providers/test-provider",
+                Some(fixture_operator_management_token()),
+                Body::from("{}")
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            management_role_matrix_response(
+                "POST",
+                "/management/runtime/reload",
+                Some(fixture_operator_management_token()),
+                Body::empty()
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            management_role_matrix_response(
+                "POST",
+                "/management/client-tokens",
+                Some(fixture_admin_token()),
+                Body::from(
+                    r#"{"name":"created-by-admin-role-gate","token":"fixture-created-admin-role-gate-token"}"#,
+                )
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            management_role_matrix_response("GET", "/management/pools", None, Body::empty()).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
     #[tokio::test]
     async fn management_pools_requires_bearer_auth() {
         let (missing_status, _) = management_pools_response(None).await;
@@ -8150,6 +9221,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -8281,6 +9353,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -8382,6 +9455,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -8845,6 +9919,7 @@ pools:
             ],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -9409,6 +10484,7 @@ pools:
             client_tokens: Vec::new(),
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -9586,6 +10662,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -9719,6 +10796,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -9809,6 +10887,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -9966,6 +11045,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -10091,6 +11171,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -10249,6 +11330,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -10358,6 +11440,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -10657,6 +11740,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -10880,6 +11964,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -10976,6 +12061,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -11340,6 +12426,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -11527,6 +12614,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -11755,6 +12843,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -11998,6 +13087,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -12326,6 +13416,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -12442,6 +13533,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -12574,6 +13666,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -12697,6 +13790,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -12786,6 +13880,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -12922,6 +14017,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -13049,6 +14145,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -13182,6 +14279,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -13351,6 +14449,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -13486,6 +14585,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -13613,6 +14713,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -13748,6 +14849,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -14005,6 +15107,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -14079,6 +15182,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -14181,6 +15285,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -14282,6 +15387,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -14371,6 +15477,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -14449,6 +15556,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -14626,6 +15734,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -14786,6 +15895,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -14950,6 +16060,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -15198,6 +16309,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -15281,6 +16393,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -15413,6 +16526,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -15517,6 +16631,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -15609,6 +16724,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -16491,6 +17607,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -16947,6 +18064,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -18584,6 +19702,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -18694,6 +19813,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -18807,6 +19927,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -18908,6 +20029,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -19005,6 +20127,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -19156,6 +20279,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -19302,6 +20426,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -19413,6 +20538,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -19498,6 +20624,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -19606,6 +20733,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -19720,6 +20848,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -20116,6 +21245,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -20204,6 +21334,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -20301,6 +21432,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -20419,6 +21551,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -20578,6 +21711,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -20675,6 +21809,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -20787,6 +21922,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -20950,6 +22086,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -21127,6 +22264,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -21260,6 +22398,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -21418,6 +22557,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -21575,6 +22715,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -21673,6 +22814,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -21777,6 +22919,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -21935,6 +23078,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -22054,6 +23198,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -22189,6 +23334,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -22627,6 +23773,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -22878,6 +24025,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -23011,6 +24159,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -23111,6 +24260,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -23229,6 +24379,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -23387,6 +24538,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -23503,6 +24655,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
             }),
@@ -23719,6 +24872,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -23986,6 +25140,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -24202,6 +25357,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
@@ -24303,6 +25459,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
                 }),
