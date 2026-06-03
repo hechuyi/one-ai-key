@@ -13,8 +13,9 @@ use crate::{
     client_token_store::ClientTokenStoreHandle,
     config::{
         ProbeResultPolicy, ResolvedClientToken, ResolvedConfig, ResolvedErrorPolicySources,
-        ResolvedManagementPrincipal, ResolvedModelGroup, ResolvedPolicyProfile, ResolvedPoolConfig,
-        ResolvedRoutingConfig, ResolvedRoutingProfile, ResolvedTimeoutProfile,
+        ResolvedManagementIpAllowlist, ResolvedManagementPrincipal, ResolvedModelGroup,
+        ResolvedPolicyProfile, ResolvedPoolConfig, ResolvedRoutingConfig, ResolvedRoutingProfile,
+        ResolvedTimeoutProfile,
     },
     credential_repository::{
         CredentialLifecycleEvidence, CredentialLifecycleSnapshot, CredentialLifecycleState,
@@ -39,6 +40,7 @@ pub struct AppState {
     pub started_at: Instant,
     pub client_tokens: Arc<StdRwLock<Vec<ResolvedClientToken>>>,
     pub management_principals: Arc<Vec<ResolvedManagementPrincipal>>,
+    pub management_ip_allowlist: Arc<StdRwLock<ResolvedManagementIpAllowlist>>,
     pub max_request_body_bytes: usize,
     pub max_model_catalog_body_bytes: usize,
     pub max_error_body_bytes: usize,
@@ -623,6 +625,7 @@ impl AppState {
             started_at: Instant::now(),
             client_tokens: Arc::new(StdRwLock::new(client_tokens)),
             management_principals: Arc::new(config.management_principals),
+            management_ip_allowlist: Arc::new(StdRwLock::new(config.management_ip_allowlist)),
             max_request_body_bytes: config.max_request_body_bytes,
             max_model_catalog_body_bytes: config.max_model_catalog_body_bytes,
             max_error_body_bytes: config.max_error_body_bytes,
@@ -733,6 +736,10 @@ impl AppState {
             .response_filter
             .write()
             .expect("response filter lock poisoned") = config.response_filter;
+        *self
+            .management_ip_allowlist
+            .write()
+            .expect("management IP allowlist lock poisoned") = config.management_ip_allowlist;
         *self
             .active_registry_version
             .write()
@@ -1857,6 +1864,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path,
                 event_window_capacity: None,
@@ -2122,6 +2130,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: Some(event_log_path),
                 event_window_capacity: None,
@@ -2196,6 +2205,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: Some(2),
@@ -2284,6 +2294,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: Some(event_log_path),
                 event_window_capacity: None,
@@ -2380,6 +2391,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: Some(event_log_path),
                 event_window_capacity: None,
@@ -2471,6 +2483,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -2619,6 +2632,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -2776,6 +2790,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -2909,6 +2924,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -3005,6 +3021,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -3117,6 +3134,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: Some(event_log_path),
                 event_window_capacity: None,
@@ -3174,6 +3192,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -3270,6 +3289,7 @@ mod tests {
             }],
             management: Some(ManagementConfig {
                 admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,

@@ -42,7 +42,7 @@ mod upstream_response;
 mod upstream_templates;
 
 use axum::{
-    extract::{MatchedPath, Request, State},
+    extract::{ConnectInfo, MatchedPath, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::Response,
@@ -55,6 +55,7 @@ use config::AppConfig;
 use registry::{RegistryRepository, YamlRegistryRepository};
 use registry_store::{RegistryStoreHandle, SqliteRegistryStore};
 use state::AppState;
+use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
 use crate::{auth::authorize_management, config::ManagementRole};
@@ -420,13 +421,38 @@ fn management_route_spec(method: &str, path: &str) -> Option<&'static Management
         .find(|spec| spec.method == method && spec.path == path)
 }
 
+fn is_management_path(path: &str) -> bool {
+    path == "/management" || path.starts_with("/management/")
+}
+
 async fn management_role_gate(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    if !request.uri().path().starts_with("/management/") {
+    if !is_management_path(request.uri().path()) {
         return next.run(request).await;
+    }
+
+    let peer = match request.extensions().get::<ConnectInfo<SocketAddr>>() {
+        Some(ConnectInfo(peer)) => peer,
+        None => {
+            return auth::json_error(
+                StatusCode::FORBIDDEN,
+                "management peer address is unavailable",
+            );
+        }
+    };
+    let peer_allowed = state
+        .management_ip_allowlist
+        .read()
+        .expect("management IP allowlist lock poisoned")
+        .allows_ip(peer.ip());
+    if !peer_allowed {
+        return auth::json_error(
+            StatusCode::FORBIDDEN,
+            "management peer address is not allowed",
+        );
     }
 
     let principal = match authorize_management(&state, request.headers()) {
@@ -483,14 +509,27 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!("key-pool-router listening on {listen}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }
 
+#[cfg(not(test))]
 fn app(state: AppState) -> Router {
+    app_without_test_peer_default(state)
+}
+
+#[cfg(test)]
+fn app(state: AppState) -> Router {
+    app_without_test_peer_default(state).layer(middleware::from_fn(default_test_connect_info))
+}
+
+fn app_without_test_peer_default(state: AppState) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(management::readiness))
@@ -727,6 +766,7 @@ fn app(state: AppState) -> Router {
             "/management/routing-telemetry",
             get(management::routing_telemetry),
         )
+        .route("/management", any(unregistered_management_route))
         .route("/management/*path", any(unregistered_management_route))
         .route("/v1/*path", any(proxy::proxy_openai_compatible))
         .route("/pools/:pool/*path", any(proxy::proxy_named_pool))
@@ -735,6 +775,22 @@ fn app(state: AppState) -> Router {
             management_role_gate,
         ))
         .with_state(state)
+}
+
+#[cfg(test)]
+async fn default_test_connect_info(mut request: Request, next: Next) -> Response {
+    if is_management_path(request.uri().path())
+        && request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_none()
+    {
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))));
+    }
+
+    next.run(request).await
 }
 
 async fn shutdown_signal() {
@@ -746,6 +802,7 @@ mod tests {
     use super::*;
     use axum::{
         body::{to_bytes, Body},
+        extract::ConnectInfo,
         http::{header, HeaderMap, Request, StatusCode},
         response::IntoResponse,
         response::Response,
@@ -759,6 +816,7 @@ mod tests {
     use std::{
         collections::HashMap,
         fs,
+        net::{IpAddr, SocketAddr},
         path::PathBuf,
         sync::{
             atomic::{AtomicU64, Ordering},
@@ -1126,6 +1184,203 @@ pools:
         assert_eq!(
             operator.token_hash,
             hash_token("fixture-management-operator-token")
+        );
+    }
+
+    fn management_ip_allowlist_config(listen: &str, ip_allowlist_yaml: Option<&str>) -> AppConfig {
+        let keys_file = temp_keys_file("upstream-key\n");
+        let ip_allowlist_yaml = ip_allowlist_yaml
+            .map(|yaml| format!("  ip_allowlist:\n{yaml}"))
+            .unwrap_or_default();
+        let config_path = temp_config_file(&format!(
+            r#"
+listen: {listen}
+client_tokens:
+  - name: test-client
+    token: {}
+management:
+  admin_token: {}
+{ip_allowlist_yaml}default_pool: test
+credential_sets:
+  test-credentials:
+    keys_file: {}
+default_routing_profile: default-routing
+routing_profiles:
+  default-routing:
+    key_selection: sticky_until_failure
+    default_credential_cooldown_seconds: 20
+    same_request_credential_retry:
+      enabled: false
+      max_retries: 0
+    route_target_retry:
+      enabled: true
+pools:
+  test:
+    provider_kind: openai_compatible
+    api_base: https://example.com/v1
+    credential_set: test-credentials
+"#,
+            fixture_client_token(),
+            fixture_admin_token(),
+            keys_file.display()
+        ));
+
+        AppConfig::from_path(config_path).unwrap()
+    }
+
+    fn management_ip_allowlist_state(ip_allowlist_yaml: &str) -> AppState {
+        AppState::new(
+            management_ip_allowlist_config("0.0.0.0:0", Some(ip_allowlist_yaml))
+                .resolve()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn management_ip_allowlist_request(
+        state: AppState,
+        peer: Option<SocketAddr>,
+        forwarded_for: Option<&str>,
+    ) -> StatusCode {
+        let mut builder = Request::builder()
+            .uri("/management/pools")
+            .header(header::AUTHORIZATION, admin_bearer());
+        if let Some(forwarded_for) = forwarded_for {
+            builder = builder
+                .header("Forwarded", format!("for={forwarded_for}"))
+                .header("X-Forwarded-For", forwarded_for);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        if let Some(peer) = peer {
+            request.extensions_mut().insert(ConnectInfo(peer));
+        }
+
+        let router = if peer.is_some() {
+            app(state)
+        } else {
+            app_without_test_peer_default(state)
+        };
+        router.oneshot(request).await.unwrap().status()
+    }
+
+    #[test]
+    fn management_ip_allowlist_rejects_non_loopback_listener_without_allowlist() {
+        let err = management_ip_allowlist_config("0.0.0.0:0", None)
+            .resolve()
+            .expect_err("non-loopback management listener must require management.ip_allowlist")
+            .to_string();
+
+        assert!(
+            err.contains("management.ip_allowlist"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn management_ip_allowlist_non_loopback_listener_accepts_explicit_allowlist() {
+        let resolved = management_ip_allowlist_config("0.0.0.0:0", Some("    - 203.0.113.10\n"))
+            .resolve()
+            .unwrap();
+
+        assert!(matches!(
+            resolved.management_ip_allowlist,
+            crate::config::ResolvedManagementIpAllowlist::Explicit(ref ips)
+                if ips == &vec!["203.0.113.10".parse::<IpAddr>().unwrap()]
+        ));
+    }
+
+    #[test]
+    fn management_ip_allowlist_rejects_empty_explicit_allowlist() {
+        let err = management_ip_allowlist_config("0.0.0.0:0", Some("    []\n"))
+            .resolve()
+            .expect_err("empty management.ip_allowlist must fail closed at startup")
+            .to_string();
+
+        assert!(
+            err.contains("management.ip_allowlist must not be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn management_ip_allowlist_loopback_listener_defaults_to_loopback_peers() {
+        let resolved = management_ip_allowlist_config("127.0.0.1:0", None)
+            .resolve()
+            .unwrap();
+
+        assert!(matches!(
+            resolved.management_ip_allowlist,
+            crate::config::ResolvedManagementIpAllowlist::LoopbackOnly
+        ));
+    }
+
+    #[tokio::test]
+    async fn management_ip_allowlist_rejects_peer_not_in_explicit_allowlist() {
+        let state = management_ip_allowlist_state("    - 203.0.113.10\n");
+
+        let status = management_ip_allowlist_request(
+            state,
+            Some("198.51.100.7:49152".parse().unwrap()),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn management_ip_allowlist_allows_peer_in_explicit_allowlist() {
+        let state = management_ip_allowlist_state("    - 203.0.113.10\n");
+
+        let status = management_ip_allowlist_request(
+            state,
+            Some("203.0.113.10:49152".parse().unwrap()),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn management_ip_allowlist_ignores_forwarded_headers() {
+        let state = management_ip_allowlist_state("    - 203.0.113.10\n");
+
+        let status = management_ip_allowlist_request(
+            state,
+            Some("198.51.100.7:49152".parse().unwrap()),
+            Some("203.0.113.10"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn management_ip_allowlist_rejects_missing_peer_info() {
+        let state = management_ip_allowlist_state("    - 203.0.113.10\n");
+
+        let status = management_ip_allowlist_request(state, None, None).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn management_ip_allowlist_covers_exact_management_path() {
+        assert_eq!(
+            management_role_matrix_response("GET", "/management", None, Body::empty()).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        assert_eq!(
+            management_role_matrix_response(
+                "GET",
+                "/management",
+                Some(fixture_admin_token()),
+                Body::empty()
+            )
+            .await,
+            StatusCode::FORBIDDEN
         );
     }
 
@@ -6853,6 +7108,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -6955,6 +7211,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path,
                 event_window_capacity: None,
@@ -7012,6 +7269,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -7066,6 +7324,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -7119,6 +7378,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -7239,6 +7499,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -7416,6 +7677,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -9221,6 +9483,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -9353,6 +9616,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -9455,6 +9719,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -9919,6 +10184,7 @@ pools:
             ],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -10484,6 +10750,7 @@ pools:
             client_tokens: Vec::new(),
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -10662,6 +10929,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -10796,6 +11064,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -10887,6 +11156,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -11045,6 +11315,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -11171,6 +11442,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -11330,6 +11602,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -11440,6 +11713,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -11740,6 +12014,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -11964,6 +12239,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -12061,6 +12337,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -12426,6 +12703,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -12614,6 +12892,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -12843,6 +13122,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -13087,6 +13367,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -13416,6 +13697,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -13533,6 +13815,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -13666,6 +13949,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -13790,6 +14074,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -13880,6 +14165,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -14017,6 +14303,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -14145,6 +14432,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -14279,6 +14567,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -14449,6 +14738,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -14585,6 +14875,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -14713,6 +15004,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -14849,6 +15141,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -15107,6 +15400,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -15182,6 +15476,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -15285,6 +15580,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -15387,6 +15683,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -15477,6 +15774,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -15556,6 +15854,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -15734,6 +16033,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -15895,6 +16195,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -16060,6 +16361,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -16309,6 +16611,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -16393,6 +16696,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -16526,6 +16830,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -16631,6 +16936,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -16724,6 +17030,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -17607,6 +17914,7 @@ pools:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -18064,6 +18372,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -19702,6 +20011,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -19813,6 +20123,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -19927,6 +20238,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -20029,6 +20341,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -20127,6 +20440,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -20279,6 +20593,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -20426,6 +20741,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -20538,6 +20854,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -20624,6 +20941,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -20733,6 +21051,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -20848,6 +21167,7 @@ pools:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -21245,6 +21565,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -21334,6 +21655,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -21432,6 +21754,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -21551,6 +21874,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -21711,6 +22035,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -21809,6 +22134,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -21922,6 +22248,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -22086,6 +22413,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -22264,6 +22592,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -22398,6 +22727,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -22557,6 +22887,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -22715,6 +23046,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -22814,6 +23146,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -22919,6 +23252,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -23078,6 +23412,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -23198,6 +23533,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -23334,6 +23670,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -23773,6 +24110,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -24025,6 +24363,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -24159,6 +24498,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -24260,6 +24600,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -24379,6 +24720,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -24538,6 +24880,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -24655,6 +24998,7 @@ model_routes:
             }],
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
+                ip_allowlist: None,
                 principals: Vec::new(),
                 event_log_path: None,
                 event_window_capacity: None,
@@ -24872,6 +25216,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -25140,6 +25485,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -25357,6 +25703,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,
@@ -25459,6 +25806,7 @@ model_routes:
                 }],
                 management: Some(ManagementConfig {
                     admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
                     principals: Vec::new(),
                     event_log_path: None,
                     event_window_capacity: None,

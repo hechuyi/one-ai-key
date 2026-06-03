@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     time::Duration,
 };
@@ -80,6 +80,8 @@ pub struct ClientTokenConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManagementConfig {
     pub admin_token: String,
+    #[serde(default)]
+    pub ip_allowlist: Option<Vec<IpAddr>>,
     #[serde(default)]
     pub principals: Vec<ManagementPrincipalConfig>,
     #[serde(default)]
@@ -376,6 +378,7 @@ pub struct ResolvedConfig {
     pub listen: SocketAddr,
     pub client_tokens: Vec<ResolvedClientToken>,
     pub management_principals: Vec<ResolvedManagementPrincipal>,
+    pub management_ip_allowlist: ResolvedManagementIpAllowlist,
     pub max_request_body_bytes: usize,
     pub max_model_catalog_body_bytes: usize,
     pub max_error_body_bytes: usize,
@@ -391,6 +394,21 @@ pub struct ResolvedConfig {
     pub pools: HashMap<String, ResolvedPoolConfig>,
     pub model_groups: HashMap<String, ResolvedModelGroup>,
     pub model_routes: HashMap<String, ModelRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedManagementIpAllowlist {
+    Explicit(Vec<IpAddr>),
+    LoopbackOnly,
+}
+
+impl ResolvedManagementIpAllowlist {
+    pub fn allows_ip(&self, ip: IpAddr) -> bool {
+        match self {
+            Self::Explicit(ips) => ips.contains(&ip),
+            Self::LoopbackOnly => ip.is_loopback(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -801,6 +819,8 @@ impl AppConfig {
             management_event_window_capacity > 0,
             "management.event_window_capacity must be greater than zero"
         );
+        let management_ip_allowlist =
+            resolve_management_ip_allowlist(self.listen, management.ip_allowlist.clone())?;
 
         let mut client_tokens = Vec::new();
         let mut client_token_names = HashSet::new();
@@ -1172,6 +1192,7 @@ impl AppConfig {
             listen: self.listen,
             client_tokens,
             management_principals,
+            management_ip_allowlist,
             max_request_body_bytes: self.max_request_body_bytes,
             max_model_catalog_body_bytes: self.max_model_catalog_body_bytes,
             max_error_body_bytes: self.max_error_body_bytes,
@@ -1209,6 +1230,22 @@ pub(crate) fn resolve_registry_document_with_credential_repository_and_store_pat
             config.response_filter = response_filter;
             config
         })
+}
+
+fn resolve_management_ip_allowlist(
+    listen: SocketAddr,
+    ip_allowlist: Option<Vec<IpAddr>>,
+) -> anyhow::Result<ResolvedManagementIpAllowlist> {
+    match ip_allowlist {
+        Some(ips) if ips.is_empty() => {
+            anyhow::bail!("management.ip_allowlist must not be empty")
+        }
+        Some(ips) => Ok(ResolvedManagementIpAllowlist::Explicit(ips)),
+        None if listen.ip().is_loopback() => Ok(ResolvedManagementIpAllowlist::LoopbackOnly),
+        None => anyhow::bail!(
+            "management.ip_allowlist must be set when management is enabled on non-loopback listen address {listen}"
+        ),
+    }
 }
 
 pub fn hash_token(token: &str) -> String {
