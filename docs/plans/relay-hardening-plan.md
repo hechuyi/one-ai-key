@@ -231,7 +231,7 @@ Stable telemetry schema additions:
 
 Allowed `denial_reason` values: `failure_not_retryable`, `body_not_replayable`, `streaming_not_retryable`, `partial_output_started`, `attempt_limit_reached`, `policy_disabled`, `no_frozen_candidate`, `effective_deadline_exhausted`, `route_target_retry_disabled`, `no_route_candidate`. The field is present when the directive is `return_error`; retry directives leave it unset or `null`.
 
-`duplicate_charge_risk` is a conservative retry-observability field, not a settlement or billing assertion. Use `none` when the gateway has no evidence of a completed upstream transaction, `known_no_charge` only when typed evidence proves the failed attempt could not have charged, and `unknown` whenever an upstream transaction or guarded-success envelope may have reached provider-side accounting before the gateway decided to retry. Until Phase 3 implements the 2xx guard, Phase 2 code may define the `guarded_success_envelope` source and risk semantics but must not classify successful 2xx bodies or fallback because of them.
+`duplicate_charge_risk` is a conservative retry-observability field, not a settlement or billing assertion. Use `none` when the gateway has no evidence of a completed upstream transaction, `known_no_charge` only when typed evidence proves the failed attempt could not have charged, and `unknown` whenever an upstream transaction or guarded-success envelope may have reached provider-side accounting before the gateway decided to retry. Phase 3 now uses the `guarded_success_envelope` source for classified 2xx guard failures and reuses the Phase 2 retry gates; it does not add a guard-specific retry branch.
 
 The effective-deadline gate is evaluated before every fallback attempt. It uses the selected timeout profile's effective request deadline, including any existing per-request timeout budget, and denies retry as `effective_deadline_exhausted` when the next attempt cannot fit. Attempt limits and candidate limits remain independent gates; passing one does not bypass the deadline gate.
 
@@ -243,7 +243,7 @@ Retry-pressure observability is bounded. Implementations may use an in-memory ri
 
 **Purpose:** detect obvious relay error envelopes in body-bearing 2xx upstream responses before any client output, then reuse the normal failure and retry path from Phase 2.
 
-**Likely files:** new `src/success_guard.rs`, `src/proxy.rs`, `src/upstream_response.rs`, `src/error.rs`, `src/provider.rs`, docs and tests.
+**Implemented vertical slice files:** `src/success_guard.rs`, `src/proxy.rs`, `src/main.rs`, docs and tests. `src/upstream_response.rs` supplies the stream reconstruction helpers used by the guard pass-through path.
 
 Scope: guard body-bearing `status.is_success()` upstream responses before `stream_response`. Skip no-body success statuses. Retain original status in telemetry and classifier evidence.
 
@@ -251,26 +251,27 @@ Guard budget:
 
 - `max_peek_bytes`: 8192 bytes.
 - `max_peek_events`: first complete data-bearing SSE event only.
-- `max_peek_duration`: 200 ms default, configurable only within a small documented range.
+- `max_peek_duration`: 200 ms.
 - No accumulation across fallback attempts. Each attempt owns and drops its bounded peek buffer.
 
-`PeekedUpstreamResponse` contract:
+Guard pass-through contract:
 
-- Contains original status, sanitized headers, content type, endpoint kind, peeked prefix bytes, remaining stream, guard outcome, and optional structured evidence.
-- On `pass` or `cap_exhausted`, emits the exact prefix once followed by the exact remaining stream.
+- Keeps original status, response headers, content type, endpoint kind, guard outcome, bounded prefix, remaining stream, and optional structured evidence in process only.
+- On `pass`, `cap_exhausted`, `deadline_exhausted`, or `parse_unsupported`, emits the exact prefix once followed by the exact remaining stream.
 - On `classified`, no bytes have been emitted; the response is converted into `ClassifiedFailure` using `FailureSource::GuardedSuccessEnvelope` and the normal transition/retry path.
-- It must not produce stale body headers. If a downstream filter may mutate the body, strip `Content-Length` and `Content-Encoding` before returning the response.
+- It must not produce stale body headers. If a downstream filter may mutate the body, strip `Content-Length`. Preserve non-identity `Content-Encoding` unless the gateway decodes and re-encodes the body; this phase does not add that transform.
+- Public guard evidence records only status/content kind/endpoint/lengths/error shape; it must not hold or serialize peeked bytes, SSE data, raw body text, matched text, credentials, or tokens.
 
 Detection rules:
 
 - JSON content: inspect only unambiguous top-level structured error envelopes: an `error` object, or a top-level typed `code` plus `message`. Code-less error objects classify as request-only unless a typed relay-profile rule maps them.
 - SSE content: parse only the first complete data-bearing event. Ignore comment-only and empty events. Concatenate multiple `data:` lines per SSE rules. Treat `[DONE]` as pass-through. A structured error object in that first data-bearing event may classify.
 - The SSE scanner must handle LF and CRLF line endings, leading spaces after `:`, `event:` fields, comments, blank events, and split chunks. Pass-through replays original bytes exactly; parsing normalization must not rewrite the stream.
-- Other content types pass through on cap/deadline exhaustion unless a clear JSON object is fully available within the cap. Do not add broad schema mismatch validation.
+- Other content types do not run free-text or opportunistic JSON-object sniffing; they pass through as `parse_unsupported` unless the guard exits by cap/deadline.
 
 Pipeline order: upstream response -> 2xx guard -> reconstructed pass-through stream -> response filter -> client. The reconstructed prefix must be filtered exactly once and must not bypass the response filter.
 
-Guard telemetry outcomes: `pass`, `classified`, `cap_exhausted`, `deadline_exhausted`, `parse_unsupported`. Classified fallback emits the Phase 2 retry decision event with `failure_source: guarded_success_envelope`.
+Guard outcomes: `pass`, `classified`, `cap_exhausted`, `deadline_exhausted`, `parse_unsupported`. Classified fallback emits the Phase 2 retry decision event with `failure_source: guarded_success_envelope` and `duplicate_charge_risk: unknown` when a retry proceeds.
 
 **Phase 3 stop card:** red tests cover JSON error classification, code-less request-only behavior, body-bearing non-200 2xx responses, no-body status skip, first SSE error split across chunks, CRLF/comment/multiple-data-line SSE parsing, `[DONE]` pass-through, byte-exact prefix replay, no stale content length when filtered, cap and deadline pass-through, no fallback for streaming/non-replayable/partial-output paths, duplicate-charge-risk telemetry, and no false rejection of valid OpenAI Responses-style SSE. Complete only when local CI and x86_64 build pass.
 
@@ -296,7 +297,7 @@ Alert aggregation at `GET /management/alerts`: if a channel has at least three r
 
 Framing/header contract:
 
-- Any body-mutating path strips `Content-Length` and `Content-Encoding`. Redaction preserves the original content type; rejection sets a local JSON or SSE content type that matches the emitted payload.
+- Any body-mutating path strips `Content-Length`. Non-identity `Content-Encoding` is preserved unless the body is decoded and re-encoded; redaction preserves the original content type only for bodies that are safe to inspect as text. Rejection sets a local JSON or SSE content type that matches the emitted payload.
 - SSE redaction emits valid SSE frames and preserves event boundaries.
 - SSE rejection emits a valid local SSE error event. Non-SSE rejection emits a local JSON error payload with sanitized body headers.
 - Non-UTF-8 bytes pass through unchanged and do not create matched-text events.

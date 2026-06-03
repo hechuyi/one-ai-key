@@ -6,7 +6,7 @@ use std::{
 
 use axum::{
     body::Body,
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::Response,
 };
 use bytes::{Bytes, BytesMut};
@@ -23,6 +23,7 @@ const FILTER_OVERLAP_BYTES: usize = 1024;
 
 pub type BodyStreamFailureObserver =
     Arc<dyn Fn(bool) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
+pub type UpstreamByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
 pub fn stream_response(
     status: StatusCode,
@@ -34,22 +35,89 @@ pub fn stream_response(
     let stream = upstream_resp
         .bytes_stream()
         .map(|item| item.map_err(std::io::Error::other));
-    let effective_filter = response_filter
+    let stream = prefixed_body_stream(Bytes::new(), stream);
+    stream_response_from_byte_stream(
+        status,
+        headers,
+        Box::pin(stream),
+        response_filter,
+        body_failure_observer,
+        false,
+    )
+}
+
+pub fn stream_response_from_byte_stream(
+    status: StatusCode,
+    mut headers: HeaderMap,
+    stream: UpstreamByteStream,
+    response_filter: Arc<RwLock<ResponseFilterPolicy>>,
+    body_failure_observer: Option<BodyStreamFailureObserver>,
+    strip_body_headers: bool,
+) -> Response {
+    let response_filter = response_filter
         .read()
         .expect("response filter lock poisoned")
-        .is_effective();
-    let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-        if effective_filter {
-            let response_filter = response_filter
-                .read()
-                .expect("response filter lock poisoned")
-                .clone();
-            Box::pin(filter_response_stream(stream, response_filter))
-        } else {
-            Box::pin(stream)
-        };
+        .clone();
+    let configured_filter = response_filter.is_effective();
+    let non_identity_encoded = has_non_identity_content_encoding(&headers);
+    let effective_filter = configured_filter && !non_identity_encoded;
+    if strip_body_headers || configured_filter {
+        strip_stale_body_headers(&mut headers);
+    }
+    let stream: UpstreamByteStream = if effective_filter {
+        Box::pin(filter_response_stream(stream, response_filter))
+    } else {
+        stream
+    };
     let stream = observe_body_stream_failures(stream, body_failure_observer);
     response_with_headers(status, headers, Body::from_stream(stream))
+}
+
+pub fn prefixed_body_stream<S>(
+    prefix: Bytes,
+    remaining: S,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    stream::unfold(
+        PrefixedBodyStreamState {
+            prefix: (!prefix.is_empty()).then_some(prefix),
+            remaining: Box::pin(remaining),
+        },
+        |mut state| async move {
+            if let Some(prefix) = state.prefix.take() {
+                return Some((Ok(prefix), state));
+            }
+            state.remaining.next().await.map(|item| (item, state))
+        },
+    )
+}
+
+struct PrefixedBodyStreamState<S> {
+    prefix: Option<Bytes>,
+    remaining: Pin<Box<S>>,
+}
+
+fn strip_stale_body_headers(headers: &mut HeaderMap) {
+    headers.remove(header::CONTENT_LENGTH);
+    if !has_non_identity_content_encoding(headers) {
+        headers.remove(header::CONTENT_ENCODING);
+    }
+}
+
+fn has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .any(|value| !value.eq_ignore_ascii_case("identity"))
+        })
+        .unwrap_or(false)
 }
 
 fn observe_body_stream_failures<S>(
@@ -194,4 +262,204 @@ pub async fn read_limited_body(resp: reqwest::Response, limit: usize) -> anyhow:
         body.extend_from_slice(&chunk);
     }
     Ok(body.freeze())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::header;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    use crate::response_filter::{
+        ResponseFilterAction, ResponseFilterRuleKind, ResponseFilterRuleSpec, ResponseFilterSpec,
+    };
+
+    fn byte_stream(
+        chunks: Vec<Result<&'static [u8], std::io::Error>>,
+    ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
+        Box::pin(stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| chunk.map(Bytes::from_static)),
+        ))
+    }
+
+    async fn response_bytes(response: Response) -> Result<Bytes, axum::Error> {
+        axum::body::to_bytes(response.into_body(), usize::MAX).await
+    }
+
+    fn disabled_filter() -> Arc<RwLock<ResponseFilterPolicy>> {
+        Arc::new(RwLock::new(ResponseFilterPolicy::disabled()))
+    }
+
+    #[tokio::test]
+    async fn prefixed_body_stream_replays_prefix_once_before_remaining() {
+        let stream = prefixed_body_stream(
+            Bytes::from_static(b"peeked-"),
+            byte_stream(vec![Ok(b"remaining"), Ok(b"-tail")]),
+        );
+        let response = stream_response_from_byte_stream(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Box::pin(stream),
+            disabled_filter(),
+            None,
+            true,
+        );
+
+        let body = response_bytes(response).await.unwrap();
+
+        assert_eq!(body, Bytes::from_static(b"peeked-remaining-tail"));
+    }
+
+    #[tokio::test]
+    async fn prefixed_body_stream_skips_empty_prefix_chunk() {
+        let stream =
+            prefixed_body_stream(Bytes::new(), byte_stream(vec![Ok(b"first"), Ok(b"second")]));
+        let chunks = stream.collect::<Vec<_>>().await;
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].as_ref().unwrap(), &Bytes::from_static(b"first"));
+        assert_eq!(chunks[1].as_ref().unwrap(), &Bytes::from_static(b"second"));
+    }
+
+    #[tokio::test]
+    async fn byte_stream_response_preserves_body_failure_observer() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_observer = observed.clone();
+        let observer: BodyStreamFailureObserver = Arc::new(move |partial_output_started| {
+            let observed = observed_for_observer.clone();
+            Box::pin(async move {
+                observed.lock().unwrap().push(partial_output_started);
+            })
+        });
+        let stream = prefixed_body_stream(
+            Bytes::from_static(b"prefix"),
+            byte_stream(vec![Err(std::io::Error::other("synthetic stream error"))]),
+        );
+        let response = stream_response_from_byte_stream(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Box::pin(stream),
+            disabled_filter(),
+            Some(observer),
+            true,
+        );
+
+        let err = response_bytes(response).await.unwrap_err();
+
+        assert!(err.to_string().contains("synthetic stream error"));
+        assert_eq!(*observed.lock().unwrap(), vec![true]);
+    }
+
+    #[tokio::test]
+    async fn byte_stream_response_strips_stale_length_and_identity_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "128".parse().unwrap());
+        headers.insert(header::CONTENT_ENCODING, "identity".parse().unwrap());
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert("x-request-id", "trace-1".parse().unwrap());
+        let response = stream_response_from_byte_stream(
+            StatusCode::OK,
+            headers,
+            byte_stream(vec![Ok(br#"{"ok":true}"#)]),
+            disabled_filter(),
+            None,
+            true,
+        );
+
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(response.headers().get("x-request-id").unwrap(), "trace-1");
+    }
+
+    #[tokio::test]
+    async fn byte_stream_response_preserves_non_identity_encoding_and_opaque_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "128".parse().unwrap());
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        headers.insert(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
+        let filter = ResponseFilterPolicy::compile(ResponseFilterSpec {
+            enabled: true,
+            replacement: "[removed]".to_string(),
+            rules: vec![ResponseFilterRuleSpec {
+                id: "synthetic-marker".to_string(),
+                kind: ResponseFilterRuleKind::Literal {
+                    value: "synthetic-marker".to_string(),
+                    case_sensitive: true,
+                },
+                action: ResponseFilterAction::Redact,
+            }],
+        })
+        .unwrap();
+        let response = stream_response_from_byte_stream(
+            StatusCode::OK,
+            headers,
+            byte_stream(vec![Ok(b"synthetic-marker-compressed-bytes")]),
+            Arc::new(RwLock::new(filter)),
+            None,
+            true,
+        );
+
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        let body = response_bytes(response).await.unwrap();
+        assert_eq!(
+            body,
+            Bytes::from_static(b"synthetic-marker-compressed-bytes")
+        );
+    }
+
+    #[tokio::test]
+    async fn response_filter_sees_prefixed_and_remaining_stream_once() {
+        let filter = ResponseFilterPolicy::compile(ResponseFilterSpec {
+            enabled: true,
+            replacement: "[removed]".to_string(),
+            rules: vec![ResponseFilterRuleSpec {
+                id: "synthetic-marker".to_string(),
+                kind: ResponseFilterRuleKind::Literal {
+                    value: "synthetic-marker".to_string(),
+                    case_sensitive: true,
+                },
+                action: ResponseFilterAction::Redact,
+            }],
+        })
+        .unwrap();
+        let stream = prefixed_body_stream(
+            Bytes::from_static(b"data: synthetic-"),
+            byte_stream(vec![Ok(b"marker\n\n")]),
+        );
+        let filter_invocations = Arc::new(AtomicUsize::new(0));
+        let response = stream_response_from_byte_stream(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Box::pin(stream.inspect({
+                let filter_invocations = filter_invocations.clone();
+                move |_| {
+                    filter_invocations.fetch_add(1, Ordering::Relaxed);
+                }
+            })),
+            Arc::new(RwLock::new(filter)),
+            None,
+            true,
+        );
+
+        let body = response_bytes(response).await.unwrap();
+
+        assert_eq!(body, Bytes::from_static(b"data: [removed]\n\n"));
+        assert_eq!(filter_invocations.load(Ordering::Relaxed), 2);
+    }
 }

@@ -29,8 +29,10 @@ use crate::{
         RequestSelectionSnapshot, RetryAttemptContinuation, RetryDirective, SelectionReason,
     },
     state::{AppState, ChannelId, PoolState},
+    success_guard::{guard_success_response, should_guard_success_status, GuardResult},
     upstream_response::{
-        read_limited_body, response_with_headers, stream_response, BodyStreamFailureObserver,
+        prefixed_body_stream, read_limited_body, response_with_headers, stream_response,
+        stream_response_from_byte_stream, BodyStreamFailureObserver,
     },
 };
 
@@ -41,6 +43,8 @@ use std::{
 };
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+const SUCCESS_GUARD_MAX_BYTES: usize = 8192;
+const SUCCESS_GUARD_MAX_DURATION: Duration = Duration::from_millis(200);
 
 fn next_request_id() -> String {
     format!("req_{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed))
@@ -68,6 +72,14 @@ fn body_stream_failure_observer(
             .await;
         })
     })
+}
+
+fn guarded_success_envelope_response() -> Response {
+    json_error_with_code(
+        StatusCode::BAD_GATEWAY,
+        "guarded_success_envelope",
+        "upstream returned a structured error envelope with success status",
+    )
 }
 
 pub async fn proxy_openai_compatible(State(state): State<AppState>, req: Request) -> Response {
@@ -741,21 +753,78 @@ async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response 
     let status = upstream_resp.status();
     let response_headers = upstream_resp.headers().clone();
     if status.is_success() {
-        pool_state
-            .failure_domains
-            .record_success(&pool_state.provider_id, &pool_state.account_id);
-        pool_state.record_selected_channel_success();
-        return stream_response(
-            status,
-            response_headers,
+        if !should_guard_success_status(status.as_u16()) {
+            pool_state
+                .failure_domains
+                .record_success(&pool_state.provider_id, &pool_state.account_id);
+            pool_state.record_selected_channel_success();
+            return stream_response(
+                status,
+                response_headers,
+                upstream_resp,
+                state.response_filter.clone(),
+                Some(body_stream_failure_observer(
+                    state.clone(),
+                    pool_state.clone(),
+                    snapshot.clone(),
+                )),
+            );
+        }
+        match guard_success_response(
             upstream_resp,
-            state.response_filter.clone(),
-            Some(body_stream_failure_observer(
-                state.clone(),
-                pool_state.clone(),
-                snapshot.clone(),
-            )),
-        );
+            request_context.endpoint,
+            &pool_state.error_classifier,
+            SUCCESS_GUARD_MAX_BYTES,
+            SUCCESS_GUARD_MAX_DURATION,
+        )
+        .await
+        {
+            Ok(GuardResult::Classified { failure, .. }) => {
+                let _ = transition_observed_failure(
+                    &state,
+                    &pool_state,
+                    &snapshot,
+                    failure,
+                    FailureSource::GuardedSuccessEnvelope,
+                )
+                .await;
+                return guarded_success_envelope_response();
+            }
+            Ok(GuardResult::PassThrough { prefix, stream, .. }) => {
+                pool_state
+                    .failure_domains
+                    .record_success(&pool_state.provider_id, &pool_state.account_id);
+                pool_state.record_selected_channel_success();
+                let stream = Box::pin(prefixed_body_stream(prefix, stream));
+                return stream_response_from_byte_stream(
+                    status,
+                    response_headers,
+                    stream,
+                    state.response_filter.clone(),
+                    Some(body_stream_failure_observer(
+                        state.clone(),
+                        pool_state.clone(),
+                        snapshot.clone(),
+                    )),
+                    false,
+                );
+            }
+            Err(err) => {
+                let failure = pool_state.error_classifier.classify_transport_failure();
+                let _ = transition_observed_failure(
+                    &state,
+                    &pool_state,
+                    &snapshot,
+                    failure,
+                    FailureSource::LocalTransport,
+                )
+                .await;
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("upstream body error: {err}"),
+                );
+            }
+        }
     }
 
     let bytes = match read_limited_body(upstream_resp, state.max_error_body_bytes).await {
@@ -997,21 +1066,124 @@ async fn forward_with_pool(
         let status = upstream_resp.status();
         let response_headers = upstream_resp.headers().clone();
         if status.is_success() {
-            pool_state
-                .failure_domains
-                .record_success(&pool_state.provider_id, &pool_state.account_id);
-            pool_state.record_selected_channel_success();
-            return PoolForwardResult::Response(stream_response(
-                status,
-                response_headers,
+            if !should_guard_success_status(status.as_u16()) {
+                pool_state
+                    .failure_domains
+                    .record_success(&pool_state.provider_id, &pool_state.account_id);
+                pool_state.record_selected_channel_success();
+                return PoolForwardResult::Response(stream_response(
+                    status,
+                    response_headers,
+                    upstream_resp,
+                    state.response_filter.clone(),
+                    Some(body_stream_failure_observer(
+                        state.clone(),
+                        pool_state.clone(),
+                        snapshot.clone(),
+                    )),
+                ));
+            }
+            match guard_success_response(
                 upstream_resp,
-                state.response_filter.clone(),
-                Some(body_stream_failure_observer(
-                    state.clone(),
-                    pool_state.clone(),
-                    snapshot.clone(),
-                )),
-            ));
+                request_context.endpoint,
+                &pool_state.error_classifier,
+                SUCCESS_GUARD_MAX_BYTES,
+                SUCCESS_GUARD_MAX_DURATION,
+            )
+            .await
+            {
+                Ok(GuardResult::Classified { failure, .. }) => {
+                    let directive = transition_observed_failure(
+                        state,
+                        &pool_state,
+                        &snapshot,
+                        failure,
+                        FailureSource::GuardedSuccessEnvelope,
+                    )
+                    .await;
+                    let response = guarded_success_envelope_response();
+                    match apply_retry_directive_to_attempt_state(
+                        directive,
+                        &mut frozen_retry_candidates,
+                        &mut attempt,
+                    ) {
+                        RetryAttemptContinuation::RetryCredential { credential_id } => {
+                            retry_credential_id = Some(credential_id);
+                            continue;
+                        }
+                        RetryAttemptContinuation::RetryRouteTarget => {
+                            return PoolForwardResult::RouteFallback(response);
+                        }
+                        RetryAttemptContinuation::ReturnCurrentError { .. } => {}
+                        RetryAttemptContinuation::FrozenCandidateDrift { .. } => {
+                            return PoolForwardResult::Response(json_error(
+                                StatusCode::BAD_GATEWAY,
+                                "retry candidate drifted from frozen request selection",
+                            ));
+                        }
+                    }
+                    return PoolForwardResult::Response(response);
+                }
+                Ok(GuardResult::PassThrough { prefix, stream, .. }) => {
+                    pool_state
+                        .failure_domains
+                        .record_success(&pool_state.provider_id, &pool_state.account_id);
+                    pool_state.record_selected_channel_success();
+                    let stream = Box::pin(prefixed_body_stream(prefix, stream));
+                    return PoolForwardResult::Response(stream_response_from_byte_stream(
+                        status,
+                        response_headers,
+                        stream,
+                        state.response_filter.clone(),
+                        Some(body_stream_failure_observer(
+                            state.clone(),
+                            pool_state.clone(),
+                            snapshot.clone(),
+                        )),
+                        false,
+                    ));
+                }
+                Err(err) => {
+                    let failure = pool_state.error_classifier.classify_transport_failure();
+                    let directive = transition_observed_failure(
+                        state,
+                        &pool_state,
+                        &snapshot,
+                        failure,
+                        FailureSource::LocalTransport,
+                    )
+                    .await;
+                    match apply_retry_directive_to_attempt_state(
+                        directive,
+                        &mut frozen_retry_candidates,
+                        &mut attempt,
+                    ) {
+                        RetryAttemptContinuation::RetryCredential { credential_id } => {
+                            retry_credential_id = Some(credential_id);
+                            continue;
+                        }
+                        RetryAttemptContinuation::RetryRouteTarget => {
+                            let response = json_error(
+                                StatusCode::BAD_GATEWAY,
+                                format!("upstream body error: {err}"),
+                            );
+                            return PoolForwardResult::RouteFallback(response);
+                        }
+                        RetryAttemptContinuation::ReturnCurrentError { .. } => {}
+                        RetryAttemptContinuation::FrozenCandidateDrift { .. } => {
+                            return PoolForwardResult::Response(json_error(
+                                StatusCode::BAD_GATEWAY,
+                                "retry candidate drifted from frozen request selection",
+                            ));
+                        }
+                    }
+                    let response = json_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("upstream body error: {err}"),
+                    );
+                    return PoolForwardResult::Response(response);
+                }
+            }
         }
 
         let bytes = match read_limited_body(upstream_resp, state.max_error_body_bytes).await {

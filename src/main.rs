@@ -36,6 +36,7 @@ mod response_filter;
 mod route_plan;
 mod routing;
 mod state;
+mod success_guard;
 #[cfg(test)]
 mod test_fixtures;
 mod upstream_response;
@@ -29104,6 +29105,410 @@ model_routes:
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["choices"][0]["message"]["content"], "[filtered]");
+    }
+
+    #[tokio::test]
+    async fn guarded_success_json_error_route_target_fallback_records_unknown_risk() {
+        let fallback_hits = Arc::new(AtomicU64::new(0));
+        let fallback_hits_for_handler = fallback_hits.clone();
+        let primary = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "guarded_provider_unavailable",
+                            "message": "synthetic guarded success"
+                        }
+                    })),
+                )
+            }),
+        );
+        let fallback = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fallback",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "fallback-ok"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let primary_base = spawn_upstream(primary).await;
+        let fallback_base = spawn_upstream(fallback).await;
+
+        let mut pools = HashMap::new();
+        let mut credential_sets = HashMap::new();
+        for (name, api_base, key) in [
+            ("guarded_primary", primary_base, "primary-key"),
+            ("guarded_fallback", fallback_base, "fallback-key"),
+        ] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(&format!("{key}\n")),
+                },
+            );
+            let mut pool = openai_pool(api_base, credential_set);
+            if name == "guarded_primary" {
+                pool.error_rules.adaptation_rules = vec![ErrorAdaptationRuleConfig {
+                    id: "guarded-provider-unavailable".to_string(),
+                    enabled: true,
+                    matcher: ErrorAdaptationMatcherConfig {
+                        codes: vec!["guarded_provider_unavailable".to_string()],
+                        limit_types: Vec::new(),
+                        statuses: Vec::new(),
+                    },
+                    action: ErrorAdaptationActionConfig {
+                        kind: Some(FailureKind::ProviderUnavailable),
+                        primary_scope: Some(FailureScope::Channel),
+                        retryable: Some(true),
+                        cooldown_seconds: None,
+                    },
+                }];
+            }
+            pools.insert(name.to_string(), pool);
+        }
+        let config = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "test-client".to_string(),
+                token: fixture_client_token(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: fixture_admin_token(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path: None,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: TimeoutConfig::default(),
+            routing: crate::config::RoutingConfig::default(),
+            default_pool: Some("guarded_primary".to_string()),
+            providers: HashMap::new(),
+            accounts: HashMap::new(),
+            credential_sets,
+            model_routes: HashMap::from([priority_route(
+                "gpt-guarded",
+                ["guarded_primary", "guarded_fallback"],
+            )]),
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: std::collections::HashMap::from([(
+                "default-routing".to_string(),
+                crate::config::RoutingProfileConfig {
+                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry:
+                        crate::config::SameRequestCredentialRetryConfig {
+                            enabled: false,
+                            max_retries: 0,
+                        },
+                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            pools,
+        }
+        .resolve()
+        .unwrap();
+        let state = AppState::new(config).unwrap();
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-guarded","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "fallback-ok");
+
+        let telemetry =
+            management_response_json(&app(state), "/management/routing-telemetry").await;
+        let guarded_failure = telemetry["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event["kind"] == "upstream_failure_observed"
+                    && event["failure"]["failure_source"] == "guarded_success_envelope"
+            })
+            .expect("guarded success failure telemetry event");
+        assert_eq!(
+            guarded_failure["failure"]["duplicate_charge_risk"],
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_success_streaming_request_does_not_route_fallback() {
+        let fallback_hits = Arc::new(AtomicU64::new(0));
+        let fallback_hits_for_handler = fallback_hits.clone();
+        let primary = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "guarded_stream_unavailable",
+                            "message": "synthetic guarded streaming"
+                        }
+                    })),
+                )
+            }),
+        );
+        let fallback = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fallback",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "fallback-ok"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let primary_base = spawn_upstream(primary).await;
+        let fallback_base = spawn_upstream(fallback).await;
+
+        let mut pools = HashMap::new();
+        let mut credential_sets = HashMap::new();
+        for (name, api_base, key) in [
+            ("guarded_stream_primary", primary_base, "primary-key"),
+            ("guarded_stream_fallback", fallback_base, "fallback-key"),
+        ] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(&format!("{key}\n")),
+                },
+            );
+            let mut pool = openai_pool(api_base, credential_set);
+            if name == "guarded_stream_primary" {
+                pool.error_rules.adaptation_rules = vec![ErrorAdaptationRuleConfig {
+                    id: "guarded-stream-unavailable".to_string(),
+                    enabled: true,
+                    matcher: ErrorAdaptationMatcherConfig {
+                        codes: vec!["guarded_stream_unavailable".to_string()],
+                        limit_types: Vec::new(),
+                        statuses: Vec::new(),
+                    },
+                    action: ErrorAdaptationActionConfig {
+                        kind: Some(FailureKind::ProviderUnavailable),
+                        primary_scope: Some(FailureScope::Channel),
+                        retryable: Some(true),
+                        cooldown_seconds: None,
+                    },
+                }];
+            }
+            pools.insert(name.to_string(), pool);
+        }
+        let config = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "test-client".to_string(),
+                token: fixture_client_token(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: fixture_admin_token(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path: None,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: TimeoutConfig::default(),
+            routing: crate::config::RoutingConfig::default(),
+            default_pool: Some("guarded_stream_primary".to_string()),
+            providers: HashMap::new(),
+            accounts: HashMap::new(),
+            credential_sets,
+            model_routes: HashMap::from([priority_route(
+                "gpt-guarded-stream",
+                ["guarded_stream_primary", "guarded_stream_fallback"],
+            )]),
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: std::collections::HashMap::from([(
+                "default-routing".to_string(),
+                crate::config::RoutingProfileConfig {
+                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry:
+                        crate::config::SameRequestCredentialRetryConfig {
+                            enabled: false,
+                            max_retries: 0,
+                        },
+                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            pools,
+        }
+        .resolve()
+        .unwrap();
+        let state = AppState::new(config).unwrap();
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-guarded-stream","messages":[{"role":"user","content":"ok"}],"stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+
+        let telemetry =
+            management_response_json(&app(state), "/management/routing-telemetry").await;
+        let guarded_failure = telemetry["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event["kind"] == "upstream_failure_observed"
+                    && event["failure"]["failure_source"] == "guarded_success_envelope"
+            })
+            .expect("guarded streaming failure telemetry event");
+        assert_eq!(
+            guarded_failure["failure"]["denial_reason"],
+            "streaming_not_retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_success_prefix_passes_through_response_filter_and_strips_body_headers() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let body = r#"{"id":"fixture","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"unsafe-marker"}}]}"#;
+                Response::builder()
+                    .status(StatusCode::CREATED)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_LENGTH, body.len().to_string())
+                    .header(header::CONTENT_ENCODING, "identity")
+                    .body(Body::from(body))
+                    .unwrap()
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state = test_state_with_response_filter(
+            &api_base,
+            crate::config::ResponseFilterConfig {
+                enabled: true,
+                replacement: Some("[filtered]".to_string()),
+                rules: vec![crate::config::ResponseFilterRuleConfig {
+                    id: "marker".to_string(),
+                    enabled: true,
+                    kind: crate::config::ResponseFilterRuleKindConfig::Literal,
+                    action: crate::config::ResponseFilterActionConfig::Redact,
+                    case_sensitive: false,
+                    value: Some("unsafe-marker".to_string()),
+                    pattern: None,
+                }],
+            },
+        );
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+        assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("[filtered]"));
+        assert!(!body.contains("unsafe-marker"));
+    }
+
+    #[tokio::test]
+    async fn guarded_success_no_body_204_skips_guard_and_success_records() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { StatusCode::NO_CONTENT }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state = test_state_with_api_base(&api_base);
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let telemetry =
+            management_response_json(&app(state), "/management/routing-telemetry").await;
+        let guarded_failure_seen = telemetry["events"].as_array().unwrap().iter().any(|event| {
+            event["kind"] == "upstream_failure_observed"
+                && event["failure"]["failure_source"] == "guarded_success_envelope"
+        });
+        assert!(!guarded_failure_seen);
     }
 
     #[tokio::test]

@@ -93,7 +93,10 @@ Phase 1 relay semantics are limited to typed classifier inputs. `relay_profile` 
 
 When every scoped route target has been excluded by active selected-channel cooldown after client-token scope, configured enablement, and route candidate limits are applied, route planning fails closed with an OpenAI-compatible local error using `code: no_route_candidate`. The error exposes only redacted reason classes such as `channel_cooling_down`; it must not include upstream bodies, credentials, token material, or absolute source paths. Configured-disabled providers, accounts, and channels remain excluded, and runtime `Disabled` channel health remains authoritative: automatic relay-balance transitions, cooldown expiry, and success recovery do not re-enable disabled/configured-disabled resources.
 
-Phase 1B stops at selected-channel transient suppression. It does not add Phase 2 retry telemetry or retry-pressure counters, Phase 3 guarded-success 2xx classification, or Phase 4 response-filter lifecycle mutation.
+Phase 1B stops at selected-channel transient suppression. Phase 2 retry
+telemetry/retry-pressure counters and Phase 3 guarded-success 2xx
+classification are separate layers on the proxy path; Phase 4 response-filter
+lifecycle mutation remains outside the current lifecycle boundary.
 
 Phase 2 adds observability and hard bounds to the existing retry boundary
 without broadening which responses are classified as failures. Every
@@ -115,10 +118,15 @@ means no completed upstream transaction is suspected, `known_no_charge` means
 typed evidence proves the failed attempt could not have charged, and `unknown`
 means the gateway cannot prove whether the upstream charged before failure.
 Retry pressure is exposed through bounded recent counters and a configured
-capacity in management runtime state. This phase deliberately does not add a
-guard for body-bearing HTTP 2xx responses, does not let response-filter events
-mutate credential/channel lifecycle, and does not make `/v1/models` aggregate
-live upstream catalogs.
+capacity in management runtime state. Phase 3 reuses this retry boundary for
+guarded body-bearing HTTP 2xx responses: the proxy performs a bounded
+pre-output peek, classifies only top-level structured JSON/SSE error envelopes,
+emits `failure_source=guarded_success_envelope` for classified attempts, and
+records selected-channel success only after pass-through outcomes. The guard
+does not serialize peeked bytes, SSE data, raw upstream bodies, or matched text
+into management telemetry. It also does not let response-filter events mutate
+credential/channel lifecycle and does not make `/v1/models` aggregate live
+upstream catalogs.
 
 Reusable top-level `routing_profiles` hold routing behavior that is intentionally orthogonal to error classification: key selection strategy, default credential cooldown, same-request credential retry, and route-target retry. Config resolution compiles each profile once into `ResolvedRoutingProfile`; every pool selects either its explicit `routing_profile` or `default_routing_profile`, then receives a flattened `RoutingPolicy`. The proxy hot path reads only the selected channel's flattened policy from `PoolState`; it does not consult the global routing profile catalog. Management APIs expose the resolved profile catalog and profile-to-channel references read-only.
 

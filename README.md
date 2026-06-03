@@ -124,8 +124,9 @@ balance suppression and cooldown expiry do not re-enable disabled or configured
 disabled channels.
 
 This Phase 1B behavior is intentionally narrower than later relay-hardening
-work: it does not add Phase 2 retry telemetry, Phase 3 guarded 2xx response
-classification, or Phase 4 response-filter-driven lifecycle mutation.
+work: Phase 2 retry telemetry and Phase 3 guarded 2xx response classification
+are layered on the proxy path, while Phase 4 response-filter-driven lifecycle
+mutation remains out of scope.
 
 Phase 2 documents the retry boundary and risk observability contract. Retry
 decision telemetry is emitted as bounded management data with request/channel
@@ -142,9 +143,14 @@ the failed attempt could not have charged, and `unknown` means the retry may
 duplicate an upstream transaction because charge status cannot be proven.
 Fallback must not start unless the selected timeout profile leaves enough
 effective deadline for another attempt, and retry-pressure counters are bounded
-so fallback amplification is visible without unbounded memory growth. Phase 2
-does not implement the HTTP 2xx success guard, response-filter-driven lifecycle
-mutation, or live `/v1/models` aggregation.
+so fallback amplification is visible without unbounded memory growth. Phase 3
+adds a bounded HTTP 2xx success guard before success accounting: body-bearing
+2xx JSON/SSE responses are peeked up to 8192 bytes and 200 ms, obvious
+top-level structured error envelopes are classified with
+`failure_source=guarded_success_envelope`, and pass-through outcomes replay the
+peeked prefix exactly once through the response filter with stale body headers
+stripped. No-body success responses skip the guard. Response-filter-driven
+lifecycle mutation and live `/v1/models` aggregation remain unimplemented.
 
 Inspect effective policies through the existing management endpoints:
 
