@@ -196,6 +196,7 @@ pub async fn reset_channel_health_status(
         }
         *health = ChannelHealth::Available;
     }
+    pool_state.reset_relay_suppression_count();
     pool_state
         .channel_health_generation
         .fetch_add(1, Ordering::AcqRel);

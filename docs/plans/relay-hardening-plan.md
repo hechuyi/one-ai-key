@@ -173,22 +173,26 @@ Unsupported matcher fields such as free-form message contains/regex matching mus
 
 **Likely files:** `src/config.rs`, `src/error.rs`, `src/routing.rs`, `src/failure_state_executor.rs`, `src/route_plan.rs`, `src/management_resources.rs`, `src/management_alerts.rs`, tests.
 
-Phase 1B enables `FailureKind::RelayBalanceUnavailable` with `FailureScope::Channel` only for `balance_scope: channel`. It suppresses only the selected channel. It does not suppress account, provider, credential set, or all channels sharing a key file.
+Phase 1B enables `FailureKind::RelayBalanceUnavailable` with `FailureScope::Channel` only for `balance_scope: channel`. It suppresses only the channel selected for the failed attempt. It does not suppress account, provider, credential set, or all channels sharing a key file, and it does not durably quota-exhaust the selected credential.
 
-Channel transition table:
+Out of scope for Phase 1B: Phase 2 retry telemetry and retry-pressure counters, Phase 3 guarded-success 2xx classification, and Phase 4 response-filter event lifecycle mutation. Phase 1B may preserve existing retry/fallback gates, existing routing telemetry, and existing response-filter behavior, but acceptance must not depend on adding those later mechanisms.
+
+Phase 1B recognizes structured channel-balance evidence only when it comes from
+`FailureSource::UpstreamTransaction`. Guarded-success 2xx classification and its
+retry-risk telemetry remain Phase 3/Phase 2 work and are intentionally absent
+from this table.
 
 | Input | Allowed source state | Output | Retry | Recovery/reset |
 | --- | --- | --- | --- | --- |
 | Structured channel-balance evidence from `UpstreamTransaction` | `Available` or `Degraded` | `CoolingDown { reason_code: relay_balance_unavailable, source, until, suppression_count }` | `RetryRouteTarget` only if replayable, no output, effective deadline remains, route-target retry enabled | TTL expiry lazily makes channel available; next success resets relay suppression count. |
-| Structured channel-balance evidence from `GuardedSuccessEnvelope` | `Available` or `Degraded` | Same | Same, plus duplicate-charge risk telemetry | Same. |
 | Local transport failure | `Available` | Optional `Degraded { reason_code: local_transport_failure }` only if configured; no quota/auth mutation | Route fallback only through existing gates | Next success clears degraded state. |
-| Any automatic transition | `Disabled` or configured disabled | No change | No retry added by the state mutation itself | Manual/configured disablement remains authoritative. |
+| Any automatic transition | `Disabled` or configured disabled | No change | No retry added by the state mutation itself | Manual/configured disablement remains authoritative; cooldown expiry, success recovery, and suppression reset do not auto-enable disabled/configured-disabled channels. |
 | Manual `reset-health` | `CoolingDown` or `Degraded` | `Available` and relay suppression counters for that channel cleared | No automatic retry | Does not clear credential expired/quota/disabled state or configured provider/account/channel disablement. |
 | Success on selected channel | Any automatic transient state except `Disabled` | `Available` and provider/account success handling preserved | Not applicable | Clears selected-channel relay suppression count. |
 
 Backoff is consecutive per channel, stored in memory, capped, and visible in management. Default cooldown must be small and configurable; explicit upstream cooldown evidence can override it. Generation preconditions match existing channel-health mutation rules: stale automatic transitions are rejected and reported, not applied.
 
-All-target suppression policy: after client-token scope, configured enablement, and route candidate limits are applied, if every route target is excluded by active channel cooldown/suppression, fail closed with `503` and JSON error `code: no_route_candidate`. The response includes redacted reason classes such as `channel_cooling_down` and never includes keys, upstream bodies, or internal secrets. A management alert reports affected public model id, candidate count, suppressed count, and reason codes.
+All-target suppression policy: after client-token scope, configured enablement, and route candidate limits are applied, if every route target is excluded by active selected-channel cooldown/suppression, fail closed with `503` and JSON error `code: no_route_candidate`. The response includes redacted reason classes such as `channel_cooling_down` and never includes keys, upstream bodies, or internal secrets. A management alert reports affected public model id, candidate count, suppressed count, and reason codes.
 
 Endpoint/schema acceptance:
 
@@ -199,7 +203,9 @@ Endpoint/schema acceptance:
 | `POST /management/channels/:id/reset-health` | Clears only transient channel health and relay suppression counters; disabled/configured-disabled states remain excluded. |
 | `GET /management/alerts` | All-target suppression alert includes resource kind, public model id when available, channel ids, reason codes, severity. |
 
-**Phase 1B stop card:** red tests cover `balance_scope: channel` config acceptance, account/provider scope rejection, transition table rows, stale generation rejection, TTL expiry, success recovery, manual reset scope, all-target `no_route_candidate`, management schemas, and local build gate. Stop as blocked if implementing account/provider balance scope becomes necessary; do not widen scope inside this phase.
+**Phase 1B stop card:** red tests cover `balance_scope: channel` config acceptance, account/provider/credential-set scope rejection, transition table rows, no durable credential quota-exhaust from channel balance evidence, stale generation rejection, TTL expiry, success recovery, manual reset scope, disabled/configured-disabled exclusion, all-target `no_route_candidate`, management schemas, and local build gate. Stop as blocked if implementing account/provider/credential-set balance scope becomes necessary; do not widen scope inside this phase.
+
+**Phase 1B documentation acceptance:** README and architecture docs must describe `balance_scope: channel` as selected-channel transient suppression, state that account/provider/credential-set suppression remains rejected, state that channel balance does not durably quota-exhaust credentials, state that disabled/configured-disabled channels are not auto-restored, state that all-target cooldown fails closed as `no_route_candidate`, and identify the management surfaces for channel health, routing preview, and alerts. They must also explicitly say that Phase 1B does not implement Phase 2 retry telemetry, Phase 3 2xx guard behavior, or Phase 4 response-filter lifecycle mutation.
 
 ## Phase 2: Retry Boundary And Risk Observability
 

@@ -132,10 +132,17 @@ pub enum FailureReason {
     UpstreamAuthInvalid,
     UpstreamRateLimited,
     UpstreamQuotaExhausted,
+    RelayBalanceUnavailable,
     UpstreamProviderUnavailable,
     KeySwitchCooldown,
     ClientOrModelError,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureSource {
+    UpstreamTransaction,
+    LocalTransport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +166,11 @@ pub enum StateMutation {
         credential_id: CredentialId,
         reason: FailureReason,
     },
+    MarkRelayBalanceChannelCoolingDown {
+        channel_id: ChannelId,
+        until: Instant,
+        reason: FailureReason,
+    },
     MarkProviderAccountChannelCoolingDownOrDegraded {
         channel_id: ChannelId,
         provider_id: String,
@@ -172,6 +184,7 @@ pub enum StateMutation {
 pub struct TransitionInput<'a> {
     pub snapshot: &'a RequestSelectionSnapshot,
     pub failure: ClassifiedFailure,
+    pub failure_source: FailureSource,
     pub now: Instant,
     pub policy: RoutingPolicy,
 }
@@ -243,6 +256,22 @@ pub fn transition_after_failure(input: TransitionInput<'_>) -> TransitionResult 
                 reason: FailureReason::UpstreamQuotaExhausted,
             }
         }
+        (FailureKind::RelayBalanceUnavailable, FailureScope::Channel)
+            if input.failure_source == FailureSource::UpstreamTransaction =>
+        {
+            StateMutation::MarkRelayBalanceChannelCoolingDown {
+                channel_id: input.snapshot.channel_id.clone(),
+                until: input.now
+                    + input
+                        .failure
+                        .cooldown
+                        .unwrap_or(input.policy.default_credential_cooldown),
+                reason: FailureReason::RelayBalanceUnavailable,
+            }
+        }
+        (FailureKind::RelayBalanceUnavailable, FailureScope::Channel) => StateMutation::Noop {
+            reason: FailureReason::RelayBalanceUnavailable,
+        },
         (FailureKind::ProviderUnavailable, FailureScope::Channel) => {
             StateMutation::MarkProviderAccountChannelCoolingDownOrDegraded {
                 channel_id: input.snapshot.channel_id.clone(),
@@ -265,7 +294,7 @@ pub fn transition_after_failure(input: TransitionInput<'_>) -> TransitionResult 
         },
     };
 
-    let retry = if !input.failure.retryable {
+    let retry = if rejects_source_gated_channel_balance(&input) || !input.failure.retryable {
         RetryDirective::ReturnCurrentError {
             reason: RetryDecisionReason::FailureNotRetryable,
         }
@@ -322,6 +351,13 @@ pub fn transition_after_failure(input: TransitionInput<'_>) -> TransitionResult 
     TransitionResult { mutation, retry }
 }
 
+fn rejects_source_gated_channel_balance(input: &TransitionInput<'_>) -> bool {
+    matches!(
+        (input.failure.kind, input.failure.primary_scope),
+        (FailureKind::RelayBalanceUnavailable, FailureScope::Channel)
+    ) && input.failure_source != FailureSource::UpstreamTransaction
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +399,21 @@ mod tests {
         ClassifiedFailure {
             retryable: true,
             ..failure(kind, scope)
+        }
+    }
+
+    fn upstream_input<'a>(
+        snapshot: &'a RequestSelectionSnapshot,
+        failure: ClassifiedFailure,
+        now: std::time::Instant,
+        policy: RoutingPolicy,
+    ) -> TransitionInput<'a> {
+        TransitionInput {
+            snapshot,
+            failure,
+            failure_source: FailureSource::UpstreamTransaction,
+            now,
+            policy,
         }
     }
 
@@ -609,6 +660,7 @@ mod tests {
                 ..
             } => pool.apply_credential_quota_exhausted(&credential_id, format!("{reason:?}")),
             StateMutation::Noop { .. }
+            | StateMutation::MarkRelayBalanceChannelCoolingDown { .. }
             | StateMutation::MarkProviderAccountChannelCoolingDownOrDegraded { .. } => {
                 crate::pool::SwitchOutcome::StaleFailure
             }
@@ -622,12 +674,12 @@ mod tests {
         let snapshot = snapshot_for(&selected);
         let now = std::time::Instant::now();
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: failure(FailureKind::AuthInvalid, FailureScope::Credential),
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            failure(FailureKind::AuthInvalid, FailureScope::Credential),
             now,
-            policy: policy(),
-        });
+            policy(),
+        ));
 
         assert_eq!(
             result.mutation,
@@ -654,16 +706,12 @@ mod tests {
         let cooldown = std::time::Duration::from_secs(7);
         let now = std::time::Instant::now();
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: failure_with_cooldown(
-                FailureKind::RateLimited,
-                FailureScope::Credential,
-                cooldown,
-            ),
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            failure_with_cooldown(FailureKind::RateLimited, FailureScope::Credential, cooldown),
             now,
-            policy: policy(),
-        });
+            policy(),
+        ));
 
         assert_eq!(
             result.mutation,
@@ -685,16 +733,12 @@ mod tests {
         let cooldown = std::time::Duration::from_secs(7);
         let now = std::time::Instant::now();
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: failure_with_cooldown(
-                FailureKind::RateLimited,
-                FailureScope::Credential,
-                cooldown,
-            ),
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            failure_with_cooldown(FailureKind::RateLimited, FailureScope::Credential, cooldown),
             now,
-            policy: policy(),
-        });
+            policy(),
+        ));
 
         assert_eq!(
             result.mutation,
@@ -720,12 +764,12 @@ mod tests {
             default_credential_cooldown: std::time::Duration::from_secs(11),
         };
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: failure(FailureKind::RateLimited, FailureScope::Credential),
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            failure(FailureKind::RateLimited, FailureScope::Credential),
             now,
             policy,
-        });
+        ));
 
         assert_eq!(
             result.mutation,
@@ -745,12 +789,12 @@ mod tests {
         let snapshot = snapshot_for(&selected);
         let now = std::time::Instant::now();
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: failure(FailureKind::QuotaExhausted, FailureScope::Credential),
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            failure(FailureKind::QuotaExhausted, FailureScope::Credential),
             now,
-            policy: policy(),
-        });
+            policy(),
+        ));
 
         assert_eq!(
             result.mutation,
@@ -769,17 +813,79 @@ mod tests {
     }
 
     #[test]
-    fn provider_unavailable_channel_does_not_expire_credential() {
+    fn relay_balance_unavailable_channel_marks_selected_channel_cooling_down() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let snapshot = snapshot_for(&selected);
+        let now = std::time::Instant::now();
+        let cooldown = std::time::Duration::from_secs(13);
+
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            ClassifiedFailure {
+                retryable: true,
+                cooldown: Some(cooldown),
+                ..failure(FailureKind::RelayBalanceUnavailable, FailureScope::Channel)
+            },
+            now,
+            policy(),
+        ));
+
+        assert_eq!(
+            result.mutation,
+            StateMutation::MarkRelayBalanceChannelCoolingDown {
+                channel_id: snapshot.channel_id.clone(),
+                until: now + cooldown,
+                reason: FailureReason::RelayBalanceUnavailable,
+            }
+        );
+        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
+        assert_eq!(pool.snapshot().quota_exhausted_credentials, 0);
+    }
+
+    #[test]
+    fn relay_balance_unavailable_channel_from_non_upstream_source_is_rejected() {
         let mut pool = pool();
         let selected = pool.select().unwrap();
         let snapshot = snapshot_for(&selected);
 
         let result = transition_after_failure(TransitionInput {
             snapshot: &snapshot,
-            failure: retryable_failure(FailureKind::ProviderUnavailable, FailureScope::Channel),
+            failure: ClassifiedFailure {
+                retryable: true,
+                ..failure(FailureKind::RelayBalanceUnavailable, FailureScope::Channel)
+            },
+            failure_source: FailureSource::LocalTransport,
             now: std::time::Instant::now(),
             policy: policy(),
         });
+
+        assert_eq!(
+            result.mutation,
+            StateMutation::Noop {
+                reason: FailureReason::RelayBalanceUnavailable
+            }
+        );
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::FailureNotRetryable
+            }
+        );
+    }
+
+    #[test]
+    fn provider_unavailable_channel_does_not_expire_credential() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let snapshot = snapshot_for(&selected);
+
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_failure(FailureKind::ProviderUnavailable, FailureScope::Channel),
+            std::time::Instant::now(),
+            policy(),
+        ));
 
         assert_eq!(
             result.mutation,
@@ -801,15 +907,15 @@ mod tests {
         let selected = pool.select().unwrap();
         let snapshot = snapshot_for(&selected);
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: retryable_failure(
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_failure(
                 FailureKind::ProviderUnavailable,
                 FailureScope::ProviderAdapter,
             ),
-            now: std::time::Instant::now(),
-            policy: policy(),
-        });
+            std::time::Instant::now(),
+            policy(),
+        ));
 
         assert_eq!(
             result.mutation,
@@ -832,16 +938,16 @@ mod tests {
         let snapshot = snapshot_for(&selected);
         let now = std::time::Instant::now();
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: failure_with_cooldown(
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            failure_with_cooldown(
                 FailureKind::RateLimited,
                 FailureScope::Credential,
                 std::time::Duration::from_secs(3),
             ),
             now,
-            policy: policy(),
-        });
+            policy(),
+        ));
 
         assert!(matches!(
             result.mutation,
@@ -855,12 +961,12 @@ mod tests {
         let selected = pool.select().unwrap();
         let snapshot = snapshot_for(&selected);
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: failure(FailureKind::ClientError, FailureScope::ModelGroup),
-            now: std::time::Instant::now(),
-            policy: policy(),
-        });
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            failure(FailureKind::ClientError, FailureScope::ModelGroup),
+            std::time::Instant::now(),
+            policy(),
+        ));
 
         assert_eq!(
             result.mutation,
@@ -881,12 +987,12 @@ mod tests {
         let mut snapshot = retry_snapshot_for(&selected, next);
         snapshot.body_replayable = false;
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
-            now: std::time::Instant::now(),
-            policy: retry_policy(),
-        });
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            std::time::Instant::now(),
+            retry_policy(),
+        ));
 
         assert_eq!(
             result.retry,
@@ -906,12 +1012,12 @@ mod tests {
         let mut snapshot = retry_snapshot_for(&selected, next);
         snapshot.streaming = true;
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
-            now: std::time::Instant::now(),
-            policy: retry_policy(),
-        });
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            std::time::Instant::now(),
+            retry_policy(),
+        ));
 
         assert_eq!(
             result.retry,
@@ -931,12 +1037,12 @@ mod tests {
         let mut snapshot = retry_snapshot_for(&selected, next);
         snapshot.attempt = 1;
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
-            now: std::time::Instant::now(),
-            policy: retry_policy(),
-        });
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            std::time::Instant::now(),
+            retry_policy(),
+        ));
 
         assert_eq!(
             result.retry,
@@ -955,12 +1061,12 @@ mod tests {
             .clone();
         let snapshot = retry_snapshot_for(&selected, next.clone());
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
-            now: std::time::Instant::now(),
-            policy: retry_policy(),
-        });
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            std::time::Instant::now(),
+            retry_policy(),
+        ));
 
         assert_eq!(
             result.retry,
@@ -976,12 +1082,12 @@ mod tests {
         let selected = pool.select().unwrap();
         let snapshot = retry_snapshot_for(&selected, selected.credential_id.clone());
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
-            now: std::time::Instant::now(),
-            policy: retry_policy(),
-        });
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            std::time::Instant::now(),
+            retry_policy(),
+        ));
 
         assert_eq!(
             result.retry,
@@ -998,12 +1104,12 @@ mod tests {
         let snapshot = snapshot_for(&selected);
         let policy = retry_policy();
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: failure(FailureKind::RateLimited, FailureScope::Credential),
-            now: std::time::Instant::now(),
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            failure(FailureKind::RateLimited, FailureScope::Credential),
+            std::time::Instant::now(),
             policy,
-        });
+        ));
         let directive = result.retry;
         apply_state_mutation_for_test(&mut pool, result.mutation);
 
@@ -1024,12 +1130,12 @@ mod tests {
         let snapshot = retry_snapshot_for(&selected, next);
         let policy = retry_policy();
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
-            now: std::time::Instant::now(),
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            std::time::Instant::now(),
             policy,
-        });
+        ));
         let directive = result.retry;
         apply_state_mutation_for_test(&mut pool, result.mutation);
 
@@ -1055,12 +1161,12 @@ mod tests {
             default_credential_cooldown: std::time::Duration::from_secs(20),
         };
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
-            now: std::time::Instant::now(),
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            std::time::Instant::now(),
             policy,
-        });
+        ));
         let directive = result.retry;
         apply_state_mutation_for_test(&mut pool, result.mutation);
 
@@ -1089,16 +1195,16 @@ mod tests {
             default_credential_cooldown: std::time::Duration::from_millis(10),
         };
 
-        let result = transition_after_failure(TransitionInput {
-            snapshot: &snapshot,
-            failure: failure_with_cooldown(
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            failure_with_cooldown(
                 FailureKind::RateLimited,
                 FailureScope::Credential,
                 std::time::Duration::from_millis(100),
             ),
-            now: std::time::Instant::now(),
+            std::time::Instant::now(),
             policy,
-        });
+        ));
         let directive = result.retry;
         apply_state_mutation_for_test(&mut pool, result.mutation);
         std::thread::sleep(std::time::Duration::from_millis(30));

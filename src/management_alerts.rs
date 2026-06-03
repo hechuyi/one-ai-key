@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::BTreeSet;
 
 use crate::{
     credential_probe::probe_result_is_default_key_switch_cooldown,
@@ -12,6 +13,7 @@ use crate::{
         credential_set_operations_for_all_sets, CredentialSetOperationsStatus,
     },
     management_status::RuntimeCredentialCounts,
+    route_plan::{preview_route, RoutePreviewCandidate, RoutePreviewInput, RoutePreviewReason},
     state::AppState,
 };
 
@@ -71,7 +73,13 @@ pub async fn alerts_response_for_state(
     state: &AppState,
 ) -> Result<AlertsResponse, ManagementServiceError> {
     let operations_by_credential_set = credential_set_operations_for_all_sets(state).await?;
-    alerts_response(&state.credential_store, operations_by_credential_set).await
+    let mut response =
+        alerts_response(&state.credential_store, operations_by_credential_set).await?;
+    response
+        .alerts
+        .extend(model_route_all_target_suppression_alerts(state));
+    recompute_alert_totals(&mut response);
+    Ok(response)
 }
 
 async fn credential_set_alert_statuses(
@@ -102,8 +110,19 @@ async fn credential_set_alert_statuses(
 pub struct ManagementAlertStatus {
     pub kind: &'static str,
     pub severity: &'static str,
+    pub resource_kind: &'static str,
     pub resource_type: &'static str,
     pub resource_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppressed_count: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub channel_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
     pub message: &'static str,
     pub serving_mode: &'static str,
     pub accepting_requests: bool,
@@ -138,8 +157,14 @@ pub fn management_alert_status(projection: AlertProjection<'_>) -> ManagementAle
     ManagementAlertStatus {
         kind: projection.kind,
         severity: projection.severity,
+        resource_kind: "credential_set",
         resource_type: "credential_set",
         resource_id: projection.resource_id.to_string(),
+        public_model: None,
+        candidate_count: None,
+        suppressed_count: None,
+        channel_ids: Vec::new(),
+        reason_codes: Vec::new(),
         message: projection.message,
         serving_mode: projection.serving_mode,
         accepting_requests: projection.accepting_requests,
@@ -198,4 +223,123 @@ pub async fn latest_probe_operational_alert(
         &latest_probe,
         operations,
     ))
+}
+
+fn recompute_alert_totals(response: &mut AlertsResponse) {
+    response.alerts.sort_by(|a, b| {
+        severity_rank(a.severity)
+            .cmp(&severity_rank(b.severity))
+            .then_with(|| a.resource_id.cmp(&b.resource_id))
+            .then_with(|| a.kind.cmp(b.kind))
+    });
+    response.total_alerts = response.alerts.len();
+    response.critical_alerts = response
+        .alerts
+        .iter()
+        .filter(|alert| alert.severity == "critical")
+        .count();
+    response.warning_alerts = response
+        .alerts
+        .iter()
+        .filter(|alert| alert.severity == "warning")
+        .count();
+    response.info_alerts = response
+        .alerts
+        .iter()
+        .filter(|alert| alert.severity == "info")
+        .count();
+    response.operator_input_alerts = response
+        .alerts
+        .iter()
+        .filter(|alert| alert.needs_operator_input)
+        .count();
+    response.blocking_alerts = response
+        .alerts
+        .iter()
+        .filter(|alert| !alert.accepting_requests)
+        .count();
+}
+
+fn model_route_all_target_suppression_alerts(state: &AppState) -> Vec<ManagementAlertStatus> {
+    let routes = state.channels.model_routes_context();
+    let mut alerts = Vec::new();
+    for route_context in routes.routes {
+        let public_model = route_context.route.public_model.clone();
+        let plan_context = state.channels.route_plan_context(Some(&public_model));
+        let preview = preview_route(RoutePreviewInput {
+            request_id: format!("alert:{public_model}"),
+            registry_generation: plan_context.registry_generation,
+            public_model: Some(public_model.clone()),
+            route: Some(&route_context.route),
+            channel_states: &plan_context.model_route_channel_states,
+            allowed_channels: &[],
+            candidate_limit: state.routing.max_route_candidates,
+        });
+        let relevant_candidates = route_suppression_relevant_candidates(&preview.candidates);
+        if relevant_candidates.is_empty()
+            || preview
+                .candidates
+                .iter()
+                .any(|candidate| candidate.included)
+            || !relevant_candidates.iter().all(|candidate| {
+                candidate
+                    .reasons
+                    .contains(&RoutePreviewReason::ChannelCoolingDown)
+            })
+        {
+            continue;
+        }
+
+        let candidate_count = relevant_candidates.len();
+        let channel_ids = relevant_candidates
+            .iter()
+            .map(|candidate| candidate.channel_id.0.clone())
+            .collect();
+        let reason_codes = relevant_candidates
+            .iter()
+            .flat_map(|candidate| candidate.reasons.iter().map(|reason| reason.as_str()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        alerts.push(ManagementAlertStatus {
+            kind: "no_route_candidate",
+            severity: "critical",
+            resource_kind: "public_model",
+            resource_type: "public_model",
+            resource_id: public_model.clone(),
+            public_model: Some(public_model),
+            candidate_count: Some(candidate_count),
+            suppressed_count: Some(candidate_count),
+            channel_ids,
+            reason_codes,
+            message: "public model route has no selectable candidates because all targets are cooling down or suppressed",
+            serving_mode: "stopped",
+            accepting_requests: false,
+            needs_operator_input: true,
+            required_action: "wait_for_cooldown_or_restore_route_capacity",
+            credentials: RuntimeCredentialCounts::default(),
+        });
+    }
+    alerts
+}
+
+fn route_suppression_relevant_candidates(
+    candidates: &[RoutePreviewCandidate],
+) -> Vec<&RoutePreviewCandidate> {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate.reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    RoutePreviewReason::TargetDisabled
+                        | RoutePreviewReason::ClientChannelScope
+                        | RoutePreviewReason::ChannelDisabled
+                        | RoutePreviewReason::UnknownChannel
+                        | RoutePreviewReason::CandidateLimit
+                )
+            })
+        })
+        .collect()
 }

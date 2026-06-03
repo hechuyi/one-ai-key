@@ -85,7 +85,11 @@ fn route_context_health_status(health: Option<ChannelHealth>) -> ChannelHealthSt
         None => ChannelHealthStatus {
             kind: "degraded",
             reason: Some("unknown channel".to_string()),
+            reason_code: Some("unknown_channel".to_string()),
+            source: Some("runtime"),
             remaining_seconds: None,
+            suppression_count: 0,
+            generation: 0,
         },
     }
 }
@@ -368,7 +372,11 @@ impl RoutingPreviewChannelStatus {
             health: ChannelHealthStatus {
                 kind: "degraded",
                 reason: Some("unknown channel".to_string()),
+                reason_code: Some("unknown_channel".to_string()),
+                source: Some("runtime"),
                 remaining_seconds: None,
+                suppression_count: 0,
+                generation: 0,
             },
             credential_set_id: String::new(),
             selector_generation: 0,

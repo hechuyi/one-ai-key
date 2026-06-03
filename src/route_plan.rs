@@ -507,7 +507,7 @@ mod tests {
         });
 
         assert_eq!(preview.selected_target_index, None);
-        assert_eq!(preview.candidates[0].included, false);
+        assert!(!preview.candidates[0].included);
         assert_eq!(
             preview.candidates[0].reasons,
             vec![RoutePreviewReason::ChannelCoolingDown]
@@ -595,7 +595,7 @@ mod tests {
         });
 
         assert_eq!(preview.selected_target_index, None);
-        assert_eq!(preview.candidates[0].included, false);
+        assert!(!preview.candidates[0].included);
         assert_eq!(
             preview.candidates[0].reasons,
             vec![RoutePreviewReason::RuntimeUnavailable]
@@ -1052,8 +1052,8 @@ mod tests {
             preview.candidates[2].reasons,
             vec![RoutePreviewReason::ChannelDegraded]
         );
-        assert_eq!(preview.candidates[3].included, true);
-        assert_eq!(preview.candidates[3].selected, true);
+        assert!(preview.candidates[3].included);
+        assert!(preview.candidates[3].selected);
         assert_eq!(
             preview.candidates[3].upstream_model.as_deref(),
             Some("upstream-gpt-x")
@@ -1107,9 +1107,9 @@ mod tests {
             preview.candidates[0].reasons,
             vec![RoutePreviewReason::NoAvailableCredentials]
         );
-        assert_eq!(preview.candidates[0].included, false);
-        assert_eq!(preview.candidates[1].included, true);
-        assert_eq!(preview.candidates[1].selected, true);
+        assert!(!preview.candidates[0].included);
+        assert!(preview.candidates[1].included);
+        assert!(preview.candidates[1].selected);
 
         let plan = plan_route(RoutePlanInput {
             request_id: "req_test".to_string(),

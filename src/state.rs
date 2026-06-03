@@ -372,6 +372,7 @@ pub struct PoolState {
     pub send_gate: Arc<RwLock<()>>,
     pub pool: Arc<Mutex<KeyPool>>,
     pub health: Arc<StdMutex<ChannelHealth>>,
+    pub relay_suppression_count: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1592,6 +1593,7 @@ impl PoolState {
             send_gate: runtime.send_gate,
             pool: runtime.pool,
             health: Arc::new(StdMutex::new(ChannelHealth::Available)),
+            relay_suppression_count: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1623,6 +1625,57 @@ impl PoolState {
         self.channel_health_generation
             .fetch_add(1, Ordering::AcqRel);
         true
+    }
+
+    pub fn apply_automatic_relay_balance_suppression(
+        &self,
+        expected_generation: u64,
+        until: Instant,
+        reason: impl Into<String>,
+    ) -> Option<u64> {
+        if !self.configured_enabled || !self.account_enabled {
+            return None;
+        }
+        let mut health = self.health.lock().expect("channel health mutex poisoned");
+        if matches!(*health, ChannelHealth::Disabled { .. }) {
+            return None;
+        }
+        if self.channel_health_generation.load(Ordering::Acquire) != expected_generation {
+            return None;
+        }
+        let can_apply_suppression = match *health {
+            ChannelHealth::Available | ChannelHealth::Degraded { .. } => true,
+            ChannelHealth::CoolingDown { until, .. } => Instant::now() >= until,
+            ChannelHealth::Disabled { .. } => false,
+        };
+        if !can_apply_suppression {
+            return None;
+        }
+        *health = ChannelHealth::CoolingDown {
+            until,
+            reason: reason.into(),
+        };
+        self.channel_health_generation
+            .fetch_add(1, Ordering::AcqRel);
+        Some(self.relay_suppression_count.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    pub fn record_selected_channel_success(&self) {
+        self.relay_suppression_count.store(0, Ordering::Release);
+        let mut health = self.health.lock().expect("channel health mutex poisoned");
+        if !matches!(*health, ChannelHealth::Disabled { .. }) {
+            *health = ChannelHealth::Available;
+            self.channel_health_generation
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    pub fn reset_relay_suppression_count(&self) {
+        self.relay_suppression_count.store(0, Ordering::Release);
+    }
+
+    pub fn relay_suppression_count(&self) -> u64 {
+        self.relay_suppression_count.load(Ordering::Acquire)
     }
 }
 
@@ -3270,6 +3323,74 @@ mod tests {
             ChannelHealth::CoolingDown {
                 until: cooldown_until,
                 reason: "first failure".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn relay_balance_suppression_reapplies_after_channel_cooldown_expires() {
+        let keys_file = temp_path("key-pool-router-relay-balance-expired-cooldown-keys");
+        fs::write(&keys_file, "k1\n").unwrap();
+        let config = single_pool_config(keys_file, None).resolve().unwrap();
+        let state = AppState::new(config).unwrap();
+        let pool_state = state.channels.get("test").unwrap();
+        let initial_generation = pool_state.channel_health_generation.load(Ordering::Acquire);
+
+        let first_count = pool_state
+            .apply_automatic_relay_balance_suppression(
+                initial_generation,
+                Instant::now() - Duration::from_secs(1),
+                "relay balance unavailable",
+            )
+            .expect("initial suppression should apply");
+        assert_eq!(first_count, 1);
+        assert_eq!(pool_state.relay_suppression_count(), 1);
+        assert_eq!(
+            route_state_for_pool(&pool_state),
+            ChannelRouteState::Available
+        );
+
+        let next_generation = pool_state.channel_health_generation.load(Ordering::Acquire);
+        let next_until = Instant::now() + Duration::from_secs(60);
+        let second_count = pool_state
+            .apply_automatic_relay_balance_suppression(
+                next_generation,
+                next_until,
+                "relay balance unavailable again",
+            )
+            .expect("expired cooldown should accept a new suppression");
+
+        assert_eq!(second_count, 2);
+        assert_eq!(pool_state.relay_suppression_count(), 2);
+        assert_eq!(
+            *pool_state
+                .health
+                .lock()
+                .expect("channel health mutex poisoned"),
+            ChannelHealth::CoolingDown {
+                until: next_until,
+                reason: "relay balance unavailable again".to_string(),
+            }
+        );
+
+        let active_generation = pool_state.channel_health_generation.load(Ordering::Acquire);
+        assert_eq!(
+            pool_state.apply_automatic_relay_balance_suppression(
+                active_generation,
+                next_until + Duration::from_secs(60),
+                "duplicate relay balance unavailable",
+            ),
+            None
+        );
+        assert_eq!(pool_state.relay_suppression_count(), 2);
+        assert_eq!(
+            *pool_state
+                .health
+                .lock()
+                .expect("channel health mutex poisoned"),
+            ChannelHealth::CoolingDown {
+                until: next_until,
+                reason: "relay balance unavailable again".to_string(),
             }
         );
     }

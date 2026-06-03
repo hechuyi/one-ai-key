@@ -3,8 +3,8 @@ use crate::{
     events::RoutingTelemetry,
     failure_state_executor::apply_state_mutation,
     routing::{
-        transition_after_failure, RequestSelectionSnapshot, RetryDecisionReason, RetryDirective,
-        RoutingPolicy, TransitionInput,
+        transition_after_failure, FailureSource, RequestSelectionSnapshot, RetryDecisionReason,
+        RetryDirective, RoutingPolicy, TransitionInput,
     },
     state::{AppState, PoolState},
 };
@@ -15,8 +15,25 @@ pub async fn transition_observed_upstream_failure(
     snapshot: &RequestSelectionSnapshot,
     failure: ClassifiedFailure,
 ) -> RetryDirective {
+    transition_observed_failure(
+        state,
+        pool_state,
+        snapshot,
+        failure,
+        FailureSource::UpstreamTransaction,
+    )
+    .await
+}
+
+pub async fn transition_observed_failure(
+    state: &AppState,
+    pool_state: &PoolState,
+    snapshot: &RequestSelectionSnapshot,
+    failure: ClassifiedFailure,
+    failure_source: FailureSource,
+) -> RetryDirective {
     let (directive, telemetry) =
-        apply_error_action(state, pool_state, snapshot, failure.clone()).await;
+        apply_error_action(state, pool_state, snapshot, failure.clone(), failure_source).await;
     record_routing_telemetry(
         state,
         RoutingTelemetry::UpstreamFailureObserved {
@@ -40,6 +57,7 @@ async fn apply_error_action(
     pool_state: &PoolState,
     snapshot: &RequestSelectionSnapshot,
     failure: ClassifiedFailure,
+    failure_source: FailureSource,
 ) -> (RetryDirective, Vec<RoutingTelemetry>) {
     let _mutation_guard = pool_state.mutation_gate.lock().await;
     let mut pool = pool_state.pool.lock().await;
@@ -47,6 +65,7 @@ async fn apply_error_action(
     let result = transition_after_failure(TransitionInput {
         snapshot,
         failure,
+        failure_source,
         now: std::time::Instant::now(),
         policy,
     });
@@ -124,6 +143,7 @@ fn failure_kind_code(kind: FailureKind) -> &'static str {
         FailureKind::KeySwitchCooldown => "key_switch_cooldown",
         FailureKind::AuthInvalid => "auth_invalid",
         FailureKind::QuotaExhausted => "quota_exhausted",
+        FailureKind::RelayBalanceUnavailable => "relay_balance_unavailable",
         FailureKind::ProviderUnavailable => "provider_unavailable",
         FailureKind::ClientError => "client_error",
         FailureKind::Unknown => "unknown",

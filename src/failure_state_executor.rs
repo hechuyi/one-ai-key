@@ -105,6 +105,22 @@ pub fn apply_state_mutation(
                 )];
             }
         }
+        StateMutation::MarkRelayBalanceChannelCoolingDown { until, reason, .. } => {
+            let applied = pool_state.apply_automatic_relay_balance_suppression(
+                snapshot.channel_health_generation,
+                until,
+                reason_text(reason),
+            );
+            if applied.is_some() {
+                let health = ChannelHealth::CoolingDown {
+                    until,
+                    reason: reason_text(reason).to_string(),
+                };
+                return vec![channel_health_transition_telemetry(
+                    snapshot, &health, reason,
+                )];
+            }
+        }
         StateMutation::MarkProviderAccountChannelCoolingDownOrDegraded {
             provider_id,
             account_id,
@@ -231,6 +247,7 @@ fn reason_text(reason: FailureReason) -> &'static str {
         FailureReason::UpstreamAuthInvalid => "upstream reported expired credential",
         FailureReason::UpstreamRateLimited => "switchable upstream failure",
         FailureReason::UpstreamQuotaExhausted => "upstream reported quota exhausted",
+        FailureReason::RelayBalanceUnavailable => "relay balance unavailable",
         FailureReason::UpstreamProviderUnavailable => "upstream provider unavailable",
         FailureReason::KeySwitchCooldown => "upstream key switch cooldown",
         FailureReason::ClientOrModelError => "client or model error",
@@ -243,6 +260,7 @@ fn reason_code(reason: FailureReason) -> &'static str {
         FailureReason::UpstreamAuthInvalid => "upstream_auth_invalid",
         FailureReason::UpstreamRateLimited => "upstream_rate_limited",
         FailureReason::UpstreamQuotaExhausted => "upstream_quota_exhausted",
+        FailureReason::RelayBalanceUnavailable => "relay_balance_unavailable",
         FailureReason::UpstreamProviderUnavailable => "upstream_provider_unavailable",
         FailureReason::KeySwitchCooldown => "key_switch_cooldown",
         FailureReason::ClientOrModelError => "client_or_model_error",

@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Path, Request, State},
-    http::{HeaderMap, Method, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     response::Response,
 };
 use bytes::Bytes;
@@ -12,21 +12,27 @@ use crate::{
     auth::{authorize_client, json_error, json_error_with_code},
     credentials::CredentialId,
     events::RoutingTelemetry,
-    failure_observer::{record_routing_telemetry, transition_observed_upstream_failure},
+    failure_observer::{
+        record_routing_telemetry, transition_observed_failure, transition_observed_upstream_failure,
+    },
     model_catalog,
     provider::{
         bytes_from_body_for_context, EndpointKind, InboundProtocol, NamedPoolRequestMode,
         ProviderAdapter,
     },
-    route_plan::{plan_route, ChannelRouteState, RouteCandidate, RoutePlan, RoutePlanInput},
+    route_plan::{
+        plan_route, preview_route, ChannelRouteState, RouteCandidate, RoutePlan, RoutePlanInput,
+        RoutePreview, RoutePreviewInput, RoutePreviewReason,
+    },
     routing::{
-        apply_retry_directive_to_attempt_state, FrozenRetryCandidates, RequestSelectionSnapshot,
-        RetryAttemptContinuation, RetryDirective, SelectionReason,
+        apply_retry_directive_to_attempt_state, FailureSource, FrozenRetryCandidates,
+        RequestSelectionSnapshot, RetryAttemptContinuation, RetryDirective, SelectionReason,
     },
     state::{AppState, ChannelId},
     upstream_response::{read_limited_body, response_with_headers, stream_response},
 };
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -144,6 +150,15 @@ fn route_plan_for_openai_request(
     route_context: &crate::state::ChannelRoutePlanContext,
 ) -> Result<FrozenRoutePlan, Box<Response>> {
     if let Some(route) = route_context.model_route.as_ref() {
+        let preview = preview_route(RoutePreviewInput {
+            request_id: request_id.to_string(),
+            registry_generation: route_context.registry_generation,
+            public_model: model.map(ToOwned::to_owned),
+            route: Some(route),
+            channel_states: &route_context.model_route_channel_states,
+            allowed_channels,
+            candidate_limit: state.routing.max_route_candidates,
+        });
         if let Ok(plan) = plan_route(RoutePlanInput {
             request_id: request_id.to_string(),
             registry_generation: route_context.registry_generation,
@@ -157,6 +172,15 @@ fn route_plan_for_openai_request(
                 plan,
                 &route_context.model_route_channel_states,
             ));
+        }
+        if all_relevant_route_candidates_are_cooling_down(&preview) {
+            return Err(Box::new(no_route_candidate_response(&[
+                "channel_cooling_down",
+            ])));
+        }
+        let reason_codes = relevant_route_candidate_reason_codes(&preview);
+        if !reason_codes.is_empty() {
+            return Err(Box::new(no_route_candidate_response(&reason_codes)));
         }
         return Ok(FrozenRoutePlan {
             request_id: request_id.to_string(),
@@ -191,6 +215,54 @@ fn route_plan_for_openai_request(
         pool_name.to_string(),
         route_state,
     ))
+}
+
+fn route_preview_reason_excludes_candidate_from_cooling_denominator(
+    reason: &RoutePreviewReason,
+) -> bool {
+    matches!(
+        reason,
+        RoutePreviewReason::TargetDisabled
+            | RoutePreviewReason::ClientChannelScope
+            | RoutePreviewReason::ChannelDisabled
+            | RoutePreviewReason::UnknownChannel
+            | RoutePreviewReason::CandidateLimit
+    )
+}
+
+fn all_relevant_route_candidates_are_cooling_down(preview: &RoutePreview) -> bool {
+    let mut relevant_candidates = preview.candidates.iter().filter(|candidate| {
+        !candidate
+            .reasons
+            .iter()
+            .any(route_preview_reason_excludes_candidate_from_cooling_denominator)
+    });
+    let Some(first) = relevant_candidates.next() else {
+        return false;
+    };
+    first
+        .reasons
+        .contains(&RoutePreviewReason::ChannelCoolingDown)
+        && relevant_candidates.all(|candidate| {
+            candidate
+                .reasons
+                .contains(&RoutePreviewReason::ChannelCoolingDown)
+        })
+}
+
+fn relevant_route_candidate_reason_codes(preview: &RoutePreview) -> Vec<&'static str> {
+    preview
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate.reasons.iter().any(|reason| {
+                route_preview_reason_excludes_candidate_from_cooling_denominator(reason)
+            })
+        })
+        .flat_map(|candidate| candidate.reasons.iter().map(|reason| reason.as_str()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 pub async fn proxy_named_pool(
@@ -301,13 +373,12 @@ fn route_state_unavailable_response(
     channel_id: &str,
     state: ChannelRouteState,
 ) -> Option<Response> {
+    if matches!(state, ChannelRouteState::CoolingDown) {
+        return Some(no_route_candidate_response(&["channel_cooling_down"]));
+    }
     let (status, code, message) = match state {
         ChannelRouteState::Available | ChannelRouteState::Degraded => return None,
-        ChannelRouteState::CoolingDown => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "channel_cooling_down",
-            format!("channel {channel_id} is cooling down"),
-        ),
+        ChannelRouteState::CoolingDown => unreachable!("cooling down handled above"),
         ChannelRouteState::Disabled => (
             StatusCode::SERVICE_UNAVAILABLE,
             "channel_disabled",
@@ -338,6 +409,22 @@ fn credential_pool_exhausted_response(message: impl Into<String>) -> Response {
         "credential_pool_exhausted",
         message.into(),
     )
+}
+
+fn no_route_candidate_response(reason_classes: &[&str]) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": "no route candidate",
+            "type": "router_error",
+            "code": "no_route_candidate",
+            "reasons": reason_classes,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("valid json error response")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -576,8 +663,14 @@ async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response 
         Ok(resp) => resp,
         Err(err) => {
             let failure = pool_state.error_classifier.classify_transport_failure();
-            let _ =
-                transition_observed_upstream_failure(&state, &pool_state, &snapshot, failure).await;
+            let _ = transition_observed_failure(
+                &state,
+                &pool_state,
+                &snapshot,
+                failure,
+                FailureSource::LocalTransport,
+            )
+            .await;
             return json_error(StatusCode::BAD_GATEWAY, format!("upstream error: {err}"));
         }
     };
@@ -588,6 +681,7 @@ async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response 
         pool_state
             .failure_domains
             .record_success(&pool_state.provider_id, &pool_state.account_id);
+        pool_state.record_selected_channel_success();
         return stream_response(
             status,
             response_headers,
@@ -803,9 +897,14 @@ async fn forward_with_pool(req: &ForwardRequest, target: ForwardTarget) -> PoolF
             Ok(resp) => resp,
             Err(err) => {
                 let failure = pool_state.error_classifier.classify_transport_failure();
-                let directive =
-                    transition_observed_upstream_failure(state, &pool_state, &snapshot, failure)
-                        .await;
+                let directive = transition_observed_failure(
+                    state,
+                    &pool_state,
+                    &snapshot,
+                    failure,
+                    FailureSource::LocalTransport,
+                )
+                .await;
                 let response =
                     json_error(StatusCode::BAD_GATEWAY, format!("upstream error: {err}"));
                 if matches!(directive, RetryDirective::RetryRouteTarget) {
@@ -821,6 +920,7 @@ async fn forward_with_pool(req: &ForwardRequest, target: ForwardTarget) -> PoolF
             pool_state
                 .failure_domains
                 .record_success(&pool_state.provider_id, &pool_state.account_id);
+            pool_state.record_selected_channel_success();
             return PoolForwardResult::Response(stream_response(
                 status,
                 response_headers,

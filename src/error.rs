@@ -11,6 +11,7 @@ pub enum FailureKind {
     KeySwitchCooldown,
     AuthInvalid,
     QuotaExhausted,
+    RelayBalanceUnavailable,
     ProviderUnavailable,
     ClientError,
     Unknown,
@@ -297,9 +298,21 @@ impl ErrorClassifier {
         if contains_code(&self.switch_codes, code) {
             return Some(match code {
                 "insufficient_quota" | "quota_exceeded" | "billing_hard_limit_reached" => (
-                    FailureKind::QuotaExhausted,
-                    FailureScope::Credential,
-                    false,
+                    match self.balance_scope {
+                        BalanceScope::Credential => FailureKind::QuotaExhausted,
+                        BalanceScope::Channel => FailureKind::RelayBalanceUnavailable,
+                        BalanceScope::Account
+                        | BalanceScope::Provider
+                        | BalanceScope::ClientToken => FailureKind::Unknown,
+                    },
+                    match self.balance_scope {
+                        BalanceScope::Credential => FailureScope::Credential,
+                        BalanceScope::Channel => FailureScope::Channel,
+                        BalanceScope::Account => FailureScope::Account,
+                        BalanceScope::Provider => FailureScope::ProviderAdapter,
+                        BalanceScope::ClientToken => FailureScope::ClientToken,
+                    },
+                    matches!(self.balance_scope, BalanceScope::Channel),
                     FailureConfidence::Medium,
                 ),
                 "rate_limit_exceeded" | "rate_limit_cooldown" => (
@@ -1019,6 +1032,27 @@ mod tests {
         assert_eq!(failure.kind, FailureKind::QuotaExhausted);
         assert_eq!(failure.primary_scope, FailureScope::Credential);
         assert!(!failure.retryable);
+    }
+
+    #[test]
+    fn phase_1b_structured_balance_with_channel_scope_suppresses_channel() {
+        let failure = ErrorClassifierSpec {
+            relay_profile: RelayProfile::GenericRelay,
+            balance_scope: BalanceScope::Channel,
+            ..Default::default()
+        }
+        .build()
+        .unwrap()
+        .classify_failure(
+            400,
+            &[],
+            br#"{"error":{"code":"insufficient_quota","limit_type":"balance"}}"#,
+        );
+
+        assert_eq!(failure.kind, FailureKind::RelayBalanceUnavailable);
+        assert_eq!(failure.primary_scope, FailureScope::Channel);
+        assert!(failure.retryable);
+        assert_eq!(failure.upstream_limit_type.as_deref(), Some("balance"));
     }
 
     #[test]

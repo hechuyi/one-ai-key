@@ -106,18 +106,35 @@ evidence is present. All profiles keep structured invalid-key evidence
 credential-scoped, bare `429` credential-scoped, and code-less top-level error
 objects request-only.
 
-`balance_scope` defaults to `credential`. In Phase 1A, only credential-scoped
-structured quota evidence is supported; `balance_scope: channel` parses but is
-rejected during config resolution until Phase 1B adds channel suppression state.
-Account, provider, and client-token balance scopes are also rejected. Error
-rules match structured status, upstream code, and limit-type evidence only; there
-is no free-form upstream message matcher on the request path.
+`balance_scope` defaults to `credential`. Credential-scoped structured quota
+evidence may use durable `quota_exhausted` lifecycle semantics for the selected
+credential. In Phase 1B, `balance_scope: channel` means selected-channel
+transient suppression: structured relay balance evidence cools down only the
+channel that was selected for the failed attempt, without quota-exhausting the
+credential and without suppressing other channels that share the same account,
+provider, or credential set. Account, provider, credential-set, and client-token
+balance scopes remain rejected. Error rules match structured status, upstream
+code, and limit-type evidence only; there is no free-form upstream message
+matcher on the request path.
+
+If every scoped route target is excluded by active selected-channel cooldown,
+the router fails closed with `503` and JSON error `code: no_route_candidate`.
+Manual or configured channel disablement remains authoritative: automatic relay
+balance suppression and cooldown expiry do not re-enable disabled or configured
+disabled channels.
+
+This Phase 1B behavior is intentionally narrower than later relay-hardening
+work: it does not add Phase 2 retry telemetry, Phase 3 guarded 2xx response
+classification, or Phase 4 response-filter-driven lifecycle mutation.
 
 Inspect effective policies through the existing management endpoints:
 
 ```text
 GET /management/channels/{channel_id}/error-rules
 GET /management/policy-profiles/{profile_id}
+GET /management/channels/{channel_id}
+GET /management/routing/preview?model={model}
+GET /management/alerts
 ```
 
 Example request:

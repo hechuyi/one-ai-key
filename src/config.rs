@@ -1622,6 +1622,7 @@ fn validate_adaptation_action_combination(
         (FailureKind::AuthInvalid, FailureScope::Credential)
             | (FailureKind::RateLimited, FailureScope::Credential)
             | (FailureKind::QuotaExhausted, FailureScope::Credential)
+            | (FailureKind::RelayBalanceUnavailable, FailureScope::Channel)
             | (FailureKind::ProviderUnavailable, FailureScope::Channel)
             | (FailureKind::KeySwitchCooldown, FailureScope::Credential)
             | (FailureKind::ClientError, FailureScope::RequestOnly)
@@ -1642,10 +1643,7 @@ fn validate_balance_scope(
     balance_scope: BalanceScope,
 ) -> anyhow::Result<BalanceScope> {
     match balance_scope {
-        BalanceScope::Credential => Ok(balance_scope),
-        BalanceScope::Channel => {
-            anyhow::bail!("{context}.balance_scope channel is reserved for Phase 1B")
-        }
+        BalanceScope::Credential | BalanceScope::Channel => Ok(balance_scope),
         BalanceScope::Account | BalanceScope::Provider | BalanceScope::ClientToken => {
             anyhow::bail!(
                 "{context}.balance_scope {} is not implemented",
@@ -1661,6 +1659,7 @@ fn kind_as_config(kind: FailureKind) -> &'static str {
         FailureKind::KeySwitchCooldown => "key_switch_cooldown",
         FailureKind::AuthInvalid => "auth_invalid",
         FailureKind::QuotaExhausted => "quota_exhausted",
+        FailureKind::RelayBalanceUnavailable => "relay_balance_unavailable",
         FailureKind::ProviderUnavailable => "provider_unavailable",
         FailureKind::ClientError => "client_error",
         FailureKind::Unknown => "unknown",
@@ -2150,19 +2149,21 @@ pools:
     }
 
     #[test]
-    fn balance_scope_channel_parses_but_config_resolution_rejects_phase_1a() {
+    fn balance_scope_channel_resolves_in_phase_1b() {
         let raw = config_yaml("balance_scope: channel");
         let config: AppConfig = serde_yaml::from_str(&raw).unwrap();
 
-        let err = config
+        let resolved = config
             .resolve_with_credential_repository(&FileCredentialRepository::new())
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            err.to_string().contains("balance_scope channel")
-                && err.to_string().contains("Phase 1B"),
-            "unexpected error: {err}"
+        let failure = resolved.pools["relay"].error_classifier.classify_failure(
+            400,
+            &[],
+            br#"{"error":{"code":"insufficient_quota"}}"#,
         );
+        assert_eq!(failure.kind, FailureKind::RelayBalanceUnavailable);
+        assert_eq!(failure.primary_scope, FailureScope::Channel);
     }
 
     #[test]

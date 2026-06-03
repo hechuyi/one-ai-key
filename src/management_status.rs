@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::Ordering;
 
 use crate::{
     pool::KeyPoolSnapshot,
@@ -12,7 +13,13 @@ pub struct ChannelHealthStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_seconds: Option<u64>,
+    pub suppression_count: u64,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -321,25 +328,41 @@ pub fn redact_management_reason(reason: &str) -> String {
 }
 
 pub fn channel_health_status(pool_state: &PoolState) -> ChannelHealthStatus {
-    channel_health_status_from_health(
+    channel_health_status_from_health_with_runtime(
         pool_state
             .health
             .lock()
             .expect("channel health mutex poisoned")
             .clone(),
+        pool_state.channel_health_generation.load(Ordering::Acquire),
+        pool_state.relay_suppression_count(),
     )
 }
 
 pub fn channel_health_status_from_health(health: ChannelHealth) -> ChannelHealthStatus {
+    channel_health_status_from_health_with_runtime(health, 0, 0)
+}
+
+fn channel_health_status_from_health_with_runtime(
+    health: ChannelHealth,
+    generation: u64,
+    suppression_count: u64,
+) -> ChannelHealthStatus {
     match health {
         ChannelHealth::Available => ChannelHealthStatus {
             kind: "available",
             reason: None,
+            reason_code: None,
+            source: None,
             remaining_seconds: None,
+            suppression_count: 0,
+            generation,
         },
         ChannelHealth::CoolingDown { until, reason } if std::time::Instant::now() < until => {
             ChannelHealthStatus {
                 kind: "cooling_down",
+                reason_code: Some(channel_health_reason_code(&reason).to_string()),
+                source: Some(channel_health_source(&reason)),
                 reason: Some(reason),
                 remaining_seconds: Some(
                     until
@@ -347,23 +370,61 @@ pub fn channel_health_status_from_health(health: ChannelHealth) -> ChannelHealth
                         .as_secs()
                         .max(1),
                 ),
+                suppression_count,
+                generation,
             }
         }
         ChannelHealth::CoolingDown { .. } => ChannelHealthStatus {
             kind: "available",
             reason: None,
+            reason_code: None,
+            source: None,
             remaining_seconds: None,
+            suppression_count: 0,
+            generation,
         },
         ChannelHealth::Degraded { reason } => ChannelHealthStatus {
             kind: "degraded",
+            reason_code: Some(channel_health_reason_code(&reason).to_string()),
+            source: Some(channel_health_source(&reason)),
             reason: Some(reason),
             remaining_seconds: None,
+            suppression_count,
+            generation,
         },
         ChannelHealth::Disabled { reason } => ChannelHealthStatus {
             kind: "disabled",
+            reason_code: Some("manual_channel_disable".to_string()),
+            source: Some("management"),
             reason: Some(redact_management_reason(&reason)),
             remaining_seconds: None,
+            suppression_count: 0,
+            generation,
         },
+    }
+}
+
+fn channel_health_reason_code(reason: &str) -> &'static str {
+    match reason {
+        "upstream reported expired credential" => "upstream_auth_invalid",
+        "switchable upstream failure" => "upstream_rate_limited",
+        "upstream reported quota exhausted" => "upstream_quota_exhausted",
+        "relay balance unavailable" => "relay_balance_unavailable",
+        "upstream provider unavailable" => "upstream_provider_unavailable",
+        "upstream key switch cooldown" => "key_switch_cooldown",
+        "client or model error" => "client_or_model_error",
+        "unknown upstream failure" => "unknown",
+        "manual_channel_disable" => "manual_channel_disable",
+        "manual_channel_health_reset" => "manual_channel_health_reset",
+        _ => "unknown",
+    }
+}
+
+fn channel_health_source(reason: &str) -> &'static str {
+    if reason.starts_with("manual") {
+        "management"
+    } else {
+        "automatic"
     }
 }
 pub fn redacted_api_base(api_base: &str) -> String {

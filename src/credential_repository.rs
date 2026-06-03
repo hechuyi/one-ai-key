@@ -2995,13 +2995,9 @@ fn persistent_fingerprint(secret: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "test_fixtures.rs"]
-mod test_fixtures;
-
-#[cfg(test)]
 mod tests {
-    use super::test_fixtures::fixtures;
     use super::*;
+    use crate::test_fixtures::fixtures;
     use std::sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Barrier,

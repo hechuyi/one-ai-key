@@ -3804,7 +3804,7 @@ pools:
                 .unwrap_or_else(|| panic!("{handler} handler exists"));
             let handler_end = management_source[handler_start..]
                 .find(&format!("\npub async fn {next_handler}"))
-                .or_else(|| management_source[handler_start..].find(&format!("\n#[derive")))
+                .or_else(|| management_source[handler_start..].find("\n#[derive"))
                 .map(|offset| handler_start + offset)
                 .unwrap_or_else(|| panic!("{next_handler} follows {handler}"));
             let handler_body = &management_source[handler_start..handler_end];
@@ -3930,7 +3930,7 @@ pools:
                 .unwrap_or_else(|| panic!("{handler} handler exists"));
             let handler_end = management_source[handler_start..]
                 .find(&format!("\npub async fn {next_handler}"))
-                .or_else(|| management_source[handler_start..].find(&format!("\n#[derive")))
+                .or_else(|| management_source[handler_start..].find("\n#[derive"))
                 .map(|offset| handler_start + offset)
                 .unwrap_or_else(|| panic!("{next_handler} follows {handler}"));
             let handler_body = &management_source[handler_start..handler_end];
@@ -6103,7 +6103,7 @@ pools:
                 .unwrap_or_else(|| panic!("{handler} handler exists"));
             let handler_end = management_source[handler_start..]
                 .find(&format!("\npub async fn {next_handler}"))
-                .or_else(|| management_source[handler_start..].find(&format!("\n#[derive")))
+                .or_else(|| management_source[handler_start..].find("\n#[derive"))
                 .map(|offset| handler_start + offset)
                 .unwrap_or_else(|| panic!("{next_handler} follows {handler}"));
             let handler_body = &management_source[handler_start..handler_end];
@@ -6492,7 +6492,7 @@ pools:
                 .unwrap_or_else(|| panic!("{handler} handler exists"));
             let handler_end = management_source[handler_start..]
                 .find(&format!("\npub async fn {next_handler}"))
-                .or_else(|| management_source[handler_start..].find(&format!("\n#[derive")))
+                .or_else(|| management_source[handler_start..].find("\n#[derive"))
                 .map(|offset| handler_start + offset)
                 .unwrap_or_else(|| panic!("{next_handler} follows {handler}"));
             let handler_body = &management_source[handler_start..handler_end];
@@ -10064,22 +10064,24 @@ pools:
     #[tokio::test]
     async fn management_error_rules_show_configured_adaptation_rules() {
         let keys_file = temp_keys_file("upstream-key\n");
-        let mut error_rules = ErrorRulesConfig::default();
-        error_rules.adaptation_rules = vec![ErrorAdaptationRuleConfig {
-            id: "relay-cooldown".to_string(),
-            enabled: true,
-            matcher: ErrorAdaptationMatcherConfig {
-                codes: vec!["rate_limit_cooldown".to_string()],
-                limit_types: vec!["cooldown".to_string()],
-                statuses: vec!["400".to_string()],
-            },
-            action: ErrorAdaptationActionConfig {
-                kind: Some(crate::error::FailureKind::RateLimited),
-                primary_scope: Some(crate::error::FailureScope::Credential),
-                retryable: Some(true),
-                cooldown_seconds: Some(20),
-            },
-        }];
+        let error_rules = ErrorRulesConfig {
+            adaptation_rules: vec![ErrorAdaptationRuleConfig {
+                id: "relay-cooldown".to_string(),
+                enabled: true,
+                matcher: ErrorAdaptationMatcherConfig {
+                    codes: vec!["rate_limit_cooldown".to_string()],
+                    limit_types: vec!["cooldown".to_string()],
+                    statuses: vec!["400".to_string()],
+                },
+                action: ErrorAdaptationActionConfig {
+                    kind: Some(crate::error::FailureKind::RateLimited),
+                    primary_scope: Some(crate::error::FailureScope::Credential),
+                    retryable: Some(true),
+                    cooldown_seconds: Some(20),
+                },
+            }],
+            ..Default::default()
+        };
         let mut pools = HashMap::new();
         pools.insert(
             "test".to_string(),
@@ -10595,6 +10597,100 @@ pools:
         );
         assert_eq!(events["events"][0]["actor"]["name"], "local-admin");
         assert_eq!(events["events"][0]["actor"]["role"], "admin");
+    }
+
+    #[tokio::test]
+    async fn management_reset_health_clears_channel_health_without_resetting_credentials() {
+        let state = test_state_with_keys(["expired-key", "quota-key", "disabled-key"]);
+        let credential_ids = {
+            let channel = state.channels.get("test").unwrap();
+            let pool = channel.pool.lock().await;
+            pool.credential_snapshots()
+                .into_iter()
+                .map(|credential| credential.id)
+                .collect::<Vec<_>>()
+        };
+        {
+            let channel = state.channels.get("test").unwrap();
+            let generation = channel.channel_health_generation.load(Ordering::Acquire);
+            assert_eq!(
+                channel.apply_automatic_relay_balance_suppression(
+                    generation,
+                    Instant::now() + Duration::from_secs(60),
+                    "relay balance unavailable",
+                ),
+                Some(1)
+            );
+            let mut pool = channel.pool.lock().await;
+            pool.expire_credential_by_id(
+                &crate::credentials::CredentialId(credential_ids[0].clone()),
+                "expired fixture",
+            )
+            .unwrap();
+            pool.apply_credential_quota_exhausted(
+                &crate::credentials::CredentialId(credential_ids[1].clone()),
+                "quota fixture",
+            );
+            pool.disable_credential_by_id(
+                &crate::credentials::CredentialId(credential_ids[2].clone()),
+                "disabled fixture",
+            )
+            .unwrap();
+        }
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/channels/test/reset-health")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let pool_state = state.channels.get("test").unwrap();
+        assert_eq!(*pool_state.health.lock().unwrap(), ChannelHealth::Available);
+        assert_eq!(pool_state.relay_suppression_count(), 0);
+        let channel = management_response_json(&app(state), "/management/channels/test").await;
+        assert_eq!(channel["health"]["kind"], "available");
+        assert_eq!(channel["health"]["suppression_count"], 0);
+        assert_eq!(channel["expired_credentials"], 1);
+        assert_eq!(channel["quota_exhausted_credentials"], 1);
+        assert_eq!(channel["disabled_credentials"], 1);
+        assert_eq!(channel["available_credentials"], 0);
+    }
+
+    #[tokio::test]
+    async fn management_channel_detail_projects_core_transient_health_schema() {
+        let state = test_state();
+        let before_generation = {
+            let channel = state.channels.get("test").unwrap();
+            let generation = channel.channel_health_generation.load(Ordering::Acquire);
+            assert_eq!(
+                channel.apply_automatic_relay_balance_suppression(
+                    generation,
+                    Instant::now() + Duration::from_secs(60),
+                    "relay balance unavailable",
+                ),
+                Some(1)
+            );
+            generation
+        };
+
+        let value = management_response_json(&app(state), "/management/channels/test").await;
+
+        assert_eq!(value["health"]["kind"], "cooling_down");
+        assert_eq!(value["health"]["reason"], "relay balance unavailable");
+        assert_eq!(value["health"]["reason_code"], "relay_balance_unavailable");
+        assert_eq!(value["health"]["source"], "automatic");
+        assert_eq!(value["health"]["suppression_count"], 1);
+        assert_eq!(value["health"]["generation"], before_generation + 1);
+        let remaining = value["health"]["remaining_seconds"].as_u64().unwrap();
+        assert!(remaining > 0);
+        assert!(remaining <= 60);
     }
 
     #[tokio::test]
@@ -12742,7 +12838,7 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri(&format!(
+                    .uri(format!(
                         "/management/credential-sets/shared-credentials/credentials/{credential_id}/metadata"
                     ))
                     .header(header::AUTHORIZATION, admin_bearer())
@@ -19218,6 +19314,518 @@ pools:
     }
 
     #[tokio::test]
+    async fn management_alerts_report_all_target_no_route_candidate_suppression() {
+        let mut pools = HashMap::new();
+        let mut credential_sets = HashMap::new();
+        for name in ["cooling_a", "cooling_b"] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(&format!("{name}-key\n")),
+                },
+            );
+            pools.insert(
+                name.to_string(),
+                openai_pool(format!("https://{name}.example.com/v1"), credential_set),
+            );
+        }
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("cooling_a".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets,
+                model_routes: HashMap::from([priority_route(
+                    "gpt-suppressed",
+                    ["cooling_a", "cooling_b"],
+                )]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools,
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+        for channel_id in ["cooling_a", "cooling_b"] {
+            let channel = state.channels.get(channel_id).unwrap();
+            let generation = channel.channel_health_generation.load(Ordering::Acquire);
+            assert_eq!(
+                channel.apply_automatic_relay_balance_suppression(
+                    generation,
+                    Instant::now() + Duration::from_secs(60),
+                    "relay balance unavailable",
+                ),
+                Some(1)
+            );
+        }
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/management/alerts")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("cooling_a-key"));
+        assert!(!body.contains("cooling_b-key"));
+        let alerts = serde_json::from_str::<Value>(&body).unwrap();
+        let route_alert = alerts["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|alert| alert["kind"] == "no_route_candidate")
+            .expect("no_route_candidate alert");
+        assert_eq!(route_alert["severity"], "critical");
+        assert_eq!(route_alert["resource_kind"], "public_model");
+        assert_eq!(route_alert["resource_type"], "public_model");
+        assert_eq!(route_alert["resource_id"], "gpt-suppressed");
+        assert_eq!(route_alert["public_model"], "gpt-suppressed");
+        assert_eq!(route_alert["candidate_count"], 2);
+        assert_eq!(route_alert["suppressed_count"], 2);
+        assert_eq!(
+            route_alert["channel_ids"],
+            serde_json::json!(["cooling_a", "cooling_b"])
+        );
+        assert_eq!(
+            route_alert["reason_codes"],
+            serde_json::json!(["channel_cooling_down"])
+        );
+    }
+
+    #[tokio::test]
+    async fn management_alerts_ignore_configured_disabled_targets_when_all_active_targets_cooling_down(
+    ) {
+        let mut pools = HashMap::new();
+        let mut credential_sets = HashMap::new();
+        for name in ["cooling", "configured_disabled"] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(&format!("{name}-key\n")),
+                },
+            );
+            pools.insert(
+                name.to_string(),
+                openai_pool(format!("https://{name}.example.com/v1"), credential_set),
+            );
+        }
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("cooling".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets,
+                model_routes: HashMap::from([(
+                    "gpt-mixed-suppressed".to_string(),
+                    crate::config::ModelRouteConfig {
+                        strategy: Some("priority".to_string()),
+                        targets: vec![
+                            crate::config::ModelRouteTargetConfig {
+                                channel: "cooling".to_string(),
+                                upstream_model: None,
+                                priority: 10,
+                                weight: 1,
+                                enabled: true,
+                            },
+                            crate::config::ModelRouteTargetConfig {
+                                channel: "configured_disabled".to_string(),
+                                upstream_model: None,
+                                priority: 20,
+                                weight: 1,
+                                enabled: false,
+                            },
+                        ],
+                    },
+                )]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools,
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            let channel = state.channels.get("cooling").unwrap();
+            let generation = channel.channel_health_generation.load(Ordering::Acquire);
+            assert_eq!(
+                channel.apply_automatic_relay_balance_suppression(
+                    generation,
+                    Instant::now() + Duration::from_secs(60),
+                    "relay balance unavailable",
+                ),
+                Some(1)
+            );
+        }
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/management/alerts")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("cooling-key"));
+        assert!(!body.contains("configured_disabled-key"));
+        let alerts = serde_json::from_str::<Value>(&body).unwrap();
+        let route_alert = alerts["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|alert| alert["kind"] == "no_route_candidate")
+            .expect("no_route_candidate alert");
+        assert_eq!(route_alert["resource_id"], "gpt-mixed-suppressed");
+        assert_eq!(route_alert["candidate_count"], 1);
+        assert_eq!(route_alert["suppressed_count"], 1);
+        assert_eq!(route_alert["channel_ids"], serde_json::json!(["cooling"]));
+        assert_eq!(
+            route_alert["reason_codes"],
+            serde_json::json!(["channel_cooling_down"])
+        );
+        assert!(!route_alert["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "target_disabled"));
+    }
+
+    #[tokio::test]
+    async fn management_alerts_do_not_report_no_route_candidate_for_mixed_dynamic_route_failures() {
+        let mut pools = HashMap::new();
+        let mut credential_sets = HashMap::new();
+        for name in ["cooling", "empty"] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(&format!("{name}-key\n")),
+                },
+            );
+            pools.insert(
+                name.to_string(),
+                openai_pool(format!("https://{name}.example.com/v1"), credential_set),
+            );
+        }
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("cooling".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets,
+                model_routes: HashMap::from([priority_route(
+                    "gpt-mixed-dynamic",
+                    ["cooling", "empty"],
+                )]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools,
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            let channel = state.channels.get("cooling").unwrap();
+            let generation = channel.channel_health_generation.load(Ordering::Acquire);
+            assert_eq!(
+                channel.apply_automatic_relay_balance_suppression(
+                    generation,
+                    Instant::now() + Duration::from_secs(60),
+                    "relay balance unavailable",
+                ),
+                Some(1)
+            );
+        }
+        {
+            let empty_channel = state.channels.get("empty").unwrap();
+            let credential_id = {
+                let pool = empty_channel.pool.lock().await;
+                pool.credential_snapshots()[0].id.clone()
+            };
+            empty_channel
+                .pool
+                .lock()
+                .await
+                .disable_credential_by_id(
+                    &crate::credentials::CredentialId(credential_id),
+                    "manual stop",
+                )
+                .unwrap();
+        }
+
+        let alerts = management_response_json(&app(state), "/management/alerts").await;
+
+        assert!(alerts["alerts"].as_array().unwrap().iter().all(|alert| {
+            alert["kind"] != "no_route_candidate" || alert["resource_id"] != "gpt-mixed-dynamic"
+        }));
+    }
+
+    #[tokio::test]
+    async fn management_alerts_do_not_report_no_route_candidate_for_mixed_cooling_and_runtime_unavailable(
+    ) {
+        let mut pools = HashMap::new();
+        let mut credential_sets = HashMap::new();
+        for name in ["cooling", "runtime-target"] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(&format!("{name}-key\n")),
+                },
+            );
+            pools.insert(
+                name.to_string(),
+                openai_pool(format!("https://{name}.example.com/v1"), credential_set),
+            );
+        }
+        pools.insert(
+            "runtime-target-canonical".to_string(),
+            openai_pool(
+                "https://runtime-target-canonical.example.com/v1",
+                "runtime-target-credentials",
+            ),
+        );
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("cooling".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets,
+                model_routes: HashMap::from([priority_route(
+                    "gpt-mixed-runtime",
+                    ["cooling", "runtime-target"],
+                )]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools,
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            let channel = state.channels.get("cooling").unwrap();
+            let generation = channel.channel_health_generation.load(Ordering::Acquire);
+            assert_eq!(
+                channel.apply_automatic_relay_balance_suppression(
+                    generation,
+                    Instant::now() + Duration::from_secs(60),
+                    "relay balance unavailable",
+                ),
+                Some(1)
+            );
+        }
+        let runtime_target = state.channels.get("runtime-target").unwrap();
+        let mut locked_runtime_target = runtime_target.clone();
+        locked_runtime_target.credential_set_id =
+            CredentialSetId("runtime-target-preview-only".to_string());
+        locked_runtime_target.pool = Arc::new(Mutex::new(
+            crate::pool::KeyPool::new(crate::pool::KeyPoolConfig {
+                name: "runtime-target-preview-only".to_string(),
+                credential_namespace: "runtime-target-preview-only".to_string(),
+                api_base: "https://runtime-target.example.com/v1".to_string(),
+                credentials: vec![crate::pool::PoolCredentialInput {
+                    secret: "runtime-target-key".to_string(),
+                    source: crate::credentials::CredentialSource::unknown(),
+                }],
+            })
+            .unwrap(),
+        ));
+        let locked_runtime_pool = locked_runtime_target.pool.clone();
+        let _runtime_pool_guard = locked_runtime_pool.lock().await;
+        let cooling_channel = state.channels.get("cooling").unwrap();
+        let canonical_runtime_channel = state.channels.get("runtime-target-canonical").unwrap();
+        state.channels.replace(
+            state.runtime_catalogs.registry_generation(),
+            Some("cooling".to_string()),
+            state
+                .channels
+                .model_routes_context()
+                .routes
+                .into_iter()
+                .map(|route_context| {
+                    (
+                        route_context.route.public_model.clone(),
+                        route_context.route,
+                    )
+                })
+                .collect(),
+            cooling_channel.failure_domains.clone(),
+            HashMap::from([
+                ("cooling".to_string(), cooling_channel),
+                (
+                    "runtime-target-canonical".to_string(),
+                    canonical_runtime_channel,
+                ),
+                ("runtime-target".to_string(), locked_runtime_target),
+            ]),
+        );
+
+        let alerts_app = app(state.clone());
+        let alerts_request = management_response_json(&alerts_app, "/management/alerts");
+        let alerts = tokio::time::timeout(Duration::from_secs(1), alerts_request)
+            .await
+            .expect("management alerts should not wait on the runtime target pool lock");
+
+        assert!(alerts["alerts"].as_array().unwrap().iter().all(|alert| {
+            alert["kind"] != "no_route_candidate" || alert["resource_id"] != "gpt-mixed-runtime"
+        }));
+    }
+
+    #[tokio::test]
     async fn management_alerts_requires_management_auth() {
         let response = app(test_state())
             .oneshot(
@@ -20892,7 +21500,7 @@ pools:
         };
         assert!(matches!(
             snapshot.state,
-            crate::credentials::CredentialStateSnapshot::Available { .. }
+            crate::credentials::CredentialStateSnapshot::Available
         ));
         assert_eq!(state.events.len(), 0);
     }
@@ -24684,6 +25292,389 @@ model_routes:
     }
 
     #[tokio::test]
+    async fn explicit_model_route_all_channel_cooldown_returns_no_route_candidate() {
+        let upstream_hits = Arc::new(Mutex::new(0usize));
+        let upstream_hits_for_handler = upstream_hits.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let upstream_hits = upstream_hits_for_handler.clone();
+                async move {
+                    *upstream_hits.lock().await += 1;
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "should-not-route"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let upstream_base = spawn_upstream(upstream).await;
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("cooling".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets: credential_sets_from_files([(
+                    "cooling-credentials",
+                    temp_keys_file("cooling-key\n"),
+                )]),
+                model_routes: HashMap::from([priority_route("gpt-route", ["cooling"])]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([(
+                    "cooling".to_string(),
+                    openai_pool(upstream_base, "cooling-credentials"),
+                )]),
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+        *state
+            .channels
+            .get("cooling")
+            .unwrap()
+            .health
+            .lock()
+            .unwrap() = ChannelHealth::CoolingDown {
+            until: Instant::now() + Duration::from_secs(30),
+            reason: "relay balance unavailable".to_string(),
+        };
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-route","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(*upstream_hits.lock().await, 0);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "no_route_candidate");
+        assert_eq!(value["error"]["reasons"][0], "channel_cooling_down");
+        assert!(!value.to_string().contains("cooling-key"));
+    }
+
+    #[tokio::test]
+    async fn explicit_model_route_mixed_cooling_and_no_credentials_reports_mixed_reasons() {
+        let upstream_hits = Arc::new(Mutex::new(0usize));
+        let upstream_hits_for_handler = upstream_hits.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let upstream_hits = upstream_hits_for_handler.clone();
+                async move {
+                    *upstream_hits.lock().await += 1;
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "should-not-route"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let upstream_base = spawn_upstream(upstream).await;
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("cooling".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets: credential_sets_from_files([
+                    ("cooling-credentials", temp_keys_file("cooling-key\n")),
+                    ("empty-credentials", temp_keys_file("empty-key\n")),
+                ]),
+                model_routes: HashMap::from([priority_route("gpt-route", ["cooling", "empty"])]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([
+                    (
+                        "cooling".to_string(),
+                        openai_pool(upstream_base.clone(), "cooling-credentials"),
+                    ),
+                    (
+                        "empty".to_string(),
+                        openai_pool(upstream_base, "empty-credentials"),
+                    ),
+                ]),
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+        *state
+            .channels
+            .get("cooling")
+            .unwrap()
+            .health
+            .lock()
+            .unwrap() = ChannelHealth::CoolingDown {
+            until: Instant::now() + Duration::from_secs(30),
+            reason: "relay balance unavailable".to_string(),
+        };
+        {
+            let empty_channel = state.channels.get("empty").unwrap();
+            let credential_id = {
+                let pool = empty_channel.pool.lock().await;
+                pool.credential_snapshots()[0].id.clone()
+            };
+            empty_channel
+                .pool
+                .lock()
+                .await
+                .disable_credential_by_id(
+                    &crate::credentials::CredentialId(credential_id),
+                    "manual stop",
+                )
+                .unwrap();
+        }
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-route","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(*upstream_hits.lock().await, 0);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "no_route_candidate");
+        assert_eq!(
+            value["error"]["reasons"],
+            serde_json::json!(["channel_cooling_down", "no_available_credentials"])
+        );
+        assert!(!value.to_string().contains("cooling-key"));
+        assert!(!value.to_string().contains("empty-key"));
+    }
+
+    #[tokio::test]
+    async fn explicit_model_route_mixed_cooling_and_runtime_unavailable_reports_mixed_reasons() {
+        let upstream_hits = Arc::new(Mutex::new(0usize));
+        let upstream_hits_for_handler = upstream_hits.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let upstream_hits = upstream_hits_for_handler.clone();
+                async move {
+                    *upstream_hits.lock().await += 1;
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "should-not-route"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let upstream_base = spawn_upstream(upstream).await;
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("cooling".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets: credential_sets_from_files([
+                    ("cooling-credentials", temp_keys_file("cooling-key\n")),
+                    ("runtime-credentials", temp_keys_file("runtime-key\n")),
+                ]),
+                model_routes: HashMap::from([priority_route("gpt-route", ["cooling", "runtime"])]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([
+                    (
+                        "cooling".to_string(),
+                        openai_pool(upstream_base.clone(), "cooling-credentials"),
+                    ),
+                    (
+                        "runtime".to_string(),
+                        openai_pool(upstream_base, "runtime-credentials"),
+                    ),
+                ]),
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            let channel = state.channels.get("cooling").unwrap();
+            let generation = channel.channel_health_generation.load(Ordering::Acquire);
+            assert_eq!(
+                channel.apply_automatic_relay_balance_suppression(
+                    generation,
+                    Instant::now() + Duration::from_secs(60),
+                    "relay balance unavailable",
+                ),
+                Some(1)
+            );
+        }
+        let runtime_channel = state.channels.get("runtime").unwrap();
+        let _runtime_pool_guard = runtime_channel.pool.lock().await;
+
+        let request = app(state.clone()).oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::AUTHORIZATION, client_bearer())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-route","messages":[{"role":"user","content":"ok"}]}"#,
+                ))
+                .unwrap(),
+        );
+        let response = tokio::time::timeout(Duration::from_millis(250), request)
+            .await
+            .expect(
+                "explicit route should report runtime unavailable without waiting for pool lock",
+            )
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(*upstream_hits.lock().await, 0);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "no_route_candidate");
+        let reasons = value["error"]["reasons"].as_array().unwrap();
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason == "channel_cooling_down"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|reason| reason == "runtime_unavailable"),
+            "{reasons:?}"
+        );
+        assert!(!value.to_string().contains("cooling-key"));
+        assert!(!value.to_string().contains("runtime-key"));
+    }
+
+    #[tokio::test]
     async fn explicit_model_route_uses_degraded_target_as_last_resort() {
         let upstream = Router::new().route(
             "/v1/chat/completions",
@@ -25482,7 +26473,8 @@ model_routes:
         assert_eq!(*upstream_hits.lock().await, 0);
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["error"]["code"], "channel_cooling_down");
+        assert_eq!(value["error"]["code"], "no_route_candidate");
+        assert_eq!(value["error"]["reasons"][0], "channel_cooling_down");
     }
 
     #[tokio::test]
@@ -25531,7 +26523,8 @@ model_routes:
         assert_eq!(*upstream_hits.lock().await, 0);
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["error"]["code"], "channel_cooling_down");
+        assert_eq!(value["error"]["code"], "no_route_candidate");
+        assert_eq!(value["error"]["reasons"][0], "channel_cooling_down");
     }
 
     #[tokio::test]
