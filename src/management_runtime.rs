@@ -1,9 +1,12 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use serde::Serialize;
 
 use crate::{
-    events::{ManagementAuditEvent, ManagementEventActor, RoutingTelemetry},
+    events::{ManagementAuditEvent, ManagementEventActor, RetryPressureCounters, RoutingTelemetry},
     management_errors::{registry_store_error, ManagementServiceError},
     management_registry::resolve_staged_registry_document,
     management_status::{
@@ -61,6 +64,9 @@ pub struct RuntimeResponse {
     pub credentials: RuntimeCredentialCounts,
     pub credential_pool_alerts: Vec<CredentialPoolAlertStatus>,
     pub retry_policy: RuntimeRetryPolicy,
+    pub retry_profile_summary: RuntimeRetryProfileSummary,
+    pub retry_pressure_capacity: RuntimeRetryPressureCapacity,
+    pub recent_retry_counters: RuntimeRecentRetryCounters,
     pub management_events: usize,
     pub management_event_window_capacity: usize,
     pub routing_telemetry_events: usize,
@@ -78,6 +84,9 @@ pub struct RuntimeResponseParts {
     pub client_tokens: usize,
     pub credentials: RuntimeCredentialCounts,
     pub retry_policy: RuntimeRetryPolicy,
+    pub retry_profile_summary: RuntimeRetryProfileSummary,
+    pub retry_pressure_capacity: RuntimeRetryPressureCapacity,
+    pub recent_retry_counters: RuntimeRecentRetryCounters,
     pub management_events: usize,
     pub management_event_window_capacity: usize,
     pub routing_telemetry_events: usize,
@@ -105,6 +114,9 @@ pub fn runtime_response_from_parts(parts: RuntimeResponseParts) -> RuntimeRespon
         credential_pool_alerts,
         credentials: parts.credentials,
         retry_policy: parts.retry_policy,
+        retry_profile_summary: parts.retry_profile_summary,
+        retry_pressure_capacity: parts.retry_pressure_capacity,
+        recent_retry_counters: parts.recent_retry_counters,
         management_events: parts.management_events,
         management_event_window_capacity: parts.management_event_window_capacity,
         routing_telemetry_events: parts.routing_telemetry_events,
@@ -139,6 +151,16 @@ pub async fn runtime_response(
         client_tokens: sample.client_tokens,
         credentials: sample.credentials,
         retry_policy: sample.retry_policy,
+        retry_profile_summary: sample.retry_profile_summary,
+        retry_pressure_capacity: RuntimeRetryPressureCapacity {
+            same_request_credential_retry_attempts: sample
+                .same_request_credential_retry_attempt_capacity,
+            route_target_fallback_candidates: state.routing.max_route_candidates,
+        },
+        recent_retry_counters: RuntimeRecentRetryCounters::from_window(
+            sample.recent_retry_counters,
+            state.routing.telemetry_buffer_capacity,
+        ),
         management_events: sample.management_events,
         management_event_window_capacity: sample.management_event_window_capacity,
         routing_telemetry_events: sample.routing_telemetry_events,
@@ -173,6 +195,9 @@ struct RuntimeSnapshotSample {
     client_tokens: usize,
     credentials: RuntimeCredentialCounts,
     retry_policy: RuntimeRetryPolicy,
+    retry_profile_summary: RuntimeRetryProfileSummary,
+    same_request_credential_retry_attempt_capacity: usize,
+    recent_retry_counters: RetryPressureCounters,
     management_events: usize,
     management_event_window_capacity: usize,
     routing_telemetry_events: usize,
@@ -200,7 +225,10 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
     let mut credential_sets_without_spare = 0usize;
     let mut channels_cooling_down = 0usize;
 
-    for topology in state.runtime_catalogs.credential_set_topologies() {
+    let credential_set_topologies = state.runtime_catalogs.credential_set_topologies();
+    let channel_topologies = state.runtime_catalogs.channel_topologies();
+
+    for topology in credential_set_topologies {
         for channel_id in topology.channel_ids {
             let Some(pool_state) = state.channels.get(&channel_id) else {
                 continue;
@@ -220,7 +248,17 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
         }
     }
 
-    for topology in state.runtime_catalogs.channel_topologies() {
+    let route_target_retry_enabled_channels = channel_topologies
+        .iter()
+        .filter(|topology| topology.route_target_retry_enabled)
+        .count();
+    let same_request_credential_retry_attempt_capacity = channel_topologies
+        .iter()
+        .filter(|topology| topology.retry_switched_key_in_same_request)
+        .map(|topology| topology.max_same_request_retries)
+        .sum();
+
+    for topology in channel_topologies {
         let Some(pool_state) = state.channels.get(&topology.id) else {
             continue;
         };
@@ -257,11 +295,13 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
         .read()
         .expect("client token registry lock poisoned")
         .len();
-    let routing_telemetry_events = state
-        .routing_telemetry
-        .lock()
-        .expect("routing telemetry mutex poisoned")
-        .len();
+    let (routing_telemetry_events, recent_retry_counters) = {
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned");
+        (telemetry.len(), telemetry.retry_pressure_snapshot())
+    };
 
     RuntimeSnapshotSample {
         active_registry_generation,
@@ -269,7 +309,13 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
         channels: topology_summary.channels,
         client_tokens,
         credentials,
-        retry_policy: runtime_retry_policy_from_topology_summary(topology_summary),
+        retry_policy: runtime_retry_policy_from_topology_summary(topology_summary.clone()),
+        retry_profile_summary: runtime_retry_profile_summary_from_topology(
+            topology_summary,
+            route_target_retry_enabled_channels,
+        ),
+        same_request_credential_retry_attempt_capacity,
+        recent_retry_counters,
         management_events: state.events.len(),
         management_event_window_capacity: state.events.window_capacity(),
         routing_telemetry_events,
@@ -402,11 +448,84 @@ pub struct RuntimeRetryPolicy {
     pub max_same_request_retries: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RuntimeRetryProfileSummary {
+    pub channels: usize,
+    pub same_request_credential_retry_enabled_channels: usize,
+    pub route_target_retry_enabled_channels: usize,
+    pub max_same_request_retries: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RuntimeRetryPressureCapacity {
+    pub same_request_credential_retry_attempts: usize,
+    pub route_target_fallback_candidates: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RuntimeRecentRetryCounters {
+    pub same_request_credential_retries: u64,
+    pub route_target_fallbacks: u64,
+    pub terminal_retry_decisions: u64,
+    pub window_capacity: usize,
+    pub by_directive: RuntimeRetryPressureDirectiveCounters,
+    pub by_denial_reason: BTreeMap<String, u64>,
+    pub by_duplicate_charge_risk: RuntimeDuplicateChargeRiskCounters,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RuntimeRetryPressureDirectiveCounters {
+    pub retry_credential: u64,
+    pub retry_route_target: u64,
+    pub return_error: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RuntimeDuplicateChargeRiskCounters {
+    pub none: u64,
+    pub known_no_charge: u64,
+    pub unknown: u64,
+}
+
+impl RuntimeRecentRetryCounters {
+    fn from_window(counters: RetryPressureCounters, window_capacity: usize) -> Self {
+        Self {
+            same_request_credential_retries: counters.by_directive.retry_credential,
+            route_target_fallbacks: counters.by_directive.retry_route_target,
+            terminal_retry_decisions: counters.by_directive.return_error,
+            window_capacity,
+            by_directive: RuntimeRetryPressureDirectiveCounters {
+                retry_credential: counters.by_directive.retry_credential,
+                retry_route_target: counters.by_directive.retry_route_target,
+                return_error: counters.by_directive.return_error,
+            },
+            by_denial_reason: counters.by_denial_reason,
+            by_duplicate_charge_risk: RuntimeDuplicateChargeRiskCounters {
+                none: counters.by_duplicate_charge_risk.none,
+                known_no_charge: counters.by_duplicate_charge_risk.known_no_charge,
+                unknown: counters.by_duplicate_charge_risk.unknown,
+            },
+        }
+    }
+}
+
 fn runtime_retry_policy_from_topology_summary(
     summary: RuntimeTopologySummary,
 ) -> RuntimeRetryPolicy {
     RuntimeRetryPolicy {
         same_request_retry_enabled_channels: summary.same_request_retry_enabled_channels,
+        max_same_request_retries: summary.max_same_request_retries,
+    }
+}
+
+fn runtime_retry_profile_summary_from_topology(
+    summary: RuntimeTopologySummary,
+    route_target_retry_enabled_channels: usize,
+) -> RuntimeRetryProfileSummary {
+    RuntimeRetryProfileSummary {
+        channels: summary.channels,
+        same_request_credential_retry_enabled_channels: summary.same_request_retry_enabled_channels,
+        route_target_retry_enabled_channels,
         max_same_request_retries: summary.max_same_request_retries,
     }
 }

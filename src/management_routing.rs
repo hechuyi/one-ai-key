@@ -101,20 +101,34 @@ pub struct RoutingPreviewResponse {
     pub route_kind: &'static str,
     pub registry_generation: u64,
     pub candidate_limit: usize,
+    pub policy_summary: RoutingPreviewPolicySummary,
     pub client_token: RoutingPreviewClientStatus,
     pub selected_target: Option<RoutingPreviewSelectedTarget>,
     pub candidates: Vec<RoutingPreviewCandidateStatus>,
 }
 
-pub fn routing_preview_response(
-    request_id: String,
-    model: String,
-    route_kind: &'static str,
-    registry_generation: u64,
-    candidate_limit: usize,
-    client_token: RoutingPreviewClientStatus,
-    candidates: Vec<RoutingPreviewCandidateStatus>,
-) -> RoutingPreviewResponse {
+pub struct RoutingPreviewResponseInput {
+    pub request_id: String,
+    pub model: String,
+    pub route_kind: &'static str,
+    pub registry_generation: u64,
+    pub candidate_limit: usize,
+    pub policy_summary: RoutingPreviewPolicySummary,
+    pub client_token: RoutingPreviewClientStatus,
+    pub candidates: Vec<RoutingPreviewCandidateStatus>,
+}
+
+pub fn routing_preview_response(input: RoutingPreviewResponseInput) -> RoutingPreviewResponse {
+    let RoutingPreviewResponseInput {
+        request_id,
+        model,
+        route_kind,
+        registry_generation,
+        candidate_limit,
+        policy_summary,
+        client_token,
+        candidates,
+    } = input;
     let selected_target = candidates
         .iter()
         .find(|candidate| candidate.selected)
@@ -133,10 +147,19 @@ pub fn routing_preview_response(
         route_kind,
         registry_generation,
         candidate_limit,
+        policy_summary,
         client_token,
         selected_target,
         candidates,
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct RoutingPreviewPolicySummary {
+    pub route_target_retry_enabled: bool,
+    pub same_request_credential_retry_enabled: bool,
+    pub max_same_request_retries: usize,
+    pub candidate_limit: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,29 +267,37 @@ pub async fn routing_preview_for_model(
             .runtime_catalogs
             .client_model_allowed(&client.allowed_model_groups, model)
     {
-        return Ok(routing_preview_response(
-            format!("preview:{model}:{}", client.id),
-            model.to_string(),
-            "client_model_denied",
-            route_context.registry_generation,
-            state.routing.max_route_candidates,
-            client_status,
-            Vec::new(),
-        ));
+        return Ok(routing_preview_response(RoutingPreviewResponseInput {
+            request_id: format!("preview:{model}:{}", client.id),
+            model: model.to_string(),
+            route_kind: "client_model_denied",
+            registry_generation: route_context.registry_generation,
+            candidate_limit: state.routing.max_route_candidates,
+            policy_summary: RoutingPreviewPolicySummary {
+                candidate_limit: state.routing.max_route_candidates,
+                ..RoutingPreviewPolicySummary::default()
+            },
+            client_token: client_status,
+            candidates: Vec::new(),
+        }));
     }
 
     let routing_preview_route = routing_preview_route(&route_context, model)?;
     let route_ref = routing_preview_route.route.as_ref();
     if route_ref.is_none() {
-        return Ok(routing_preview_response(
-            format!("preview:{model}:{}", client.id),
-            model.to_string(),
-            routing_preview_route.route_kind,
-            route_context.registry_generation,
-            state.routing.max_route_candidates,
-            client_status,
-            Vec::new(),
-        ));
+        return Ok(routing_preview_response(RoutingPreviewResponseInput {
+            request_id: format!("preview:{model}:{}", client.id),
+            model: model.to_string(),
+            route_kind: routing_preview_route.route_kind,
+            registry_generation: route_context.registry_generation,
+            candidate_limit: state.routing.max_route_candidates,
+            policy_summary: RoutingPreviewPolicySummary {
+                candidate_limit: state.routing.max_route_candidates,
+                ..RoutingPreviewPolicySummary::default()
+            },
+            client_token: client_status,
+            candidates: Vec::new(),
+        }));
     }
 
     let channel_states = if route_context.model_route.is_some() {
@@ -292,16 +323,22 @@ pub async fn routing_preview_for_model(
 
     let channel_statuses =
         routing_preview_channel_statuses_for_candidates(state, &preview.candidates).await;
-    let candidates = routing_preview_candidate_statuses(&channel_statuses, preview.candidates);
-    Ok(routing_preview_response(
-        request_id,
-        model.to_string(),
-        routing_preview_route.route_kind,
-        preview.registry_generation,
+    let policy_summary = routing_preview_policy_summary(
+        &channel_statuses,
+        &preview.candidates,
         preview.candidate_limit,
-        client_status,
+    );
+    let candidates = routing_preview_candidate_statuses(&channel_statuses, preview.candidates);
+    Ok(routing_preview_response(RoutingPreviewResponseInput {
+        request_id,
+        model: model.to_string(),
+        route_kind: routing_preview_route.route_kind,
+        registry_generation: preview.registry_generation,
+        candidate_limit: preview.candidate_limit,
+        policy_summary,
+        client_token: client_status,
         candidates,
-    ))
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -364,6 +401,9 @@ pub struct RoutingPreviewChannelStatus {
     pub credential_set_id: String,
     pub selector_generation: u64,
     pub credentials: RuntimeCredentialCounts,
+    pub route_target_retry_enabled: bool,
+    pub same_request_credential_retry_enabled: bool,
+    pub max_same_request_retries: usize,
 }
 
 impl RoutingPreviewChannelStatus {
@@ -381,6 +421,9 @@ impl RoutingPreviewChannelStatus {
             credential_set_id: String::new(),
             selector_generation: 0,
             credentials: RuntimeCredentialCounts::default(),
+            route_target_retry_enabled: false,
+            same_request_credential_retry_enabled: false,
+            max_same_request_retries: 0,
         }
     }
 }
@@ -414,10 +457,37 @@ pub async fn routing_preview_channel_status(
                 credential_set_id: pool_state.credential_set_id.0.clone(),
                 selector_generation: pool_state.selector_generation.load(Ordering::Acquire),
                 credentials,
+                route_target_retry_enabled: pool_state.route_target_retry_enabled,
+                same_request_credential_retry_enabled: pool_state
+                    .retry_switched_key_in_same_request,
+                max_same_request_retries: pool_state.max_same_request_retries,
             }
         }
         None => RoutingPreviewChannelStatus::unknown_channel(),
     }
+}
+
+pub fn routing_preview_policy_summary(
+    channel_statuses: &HashMap<String, RoutingPreviewChannelStatus>,
+    candidates: &[RoutePreviewCandidate],
+    candidate_limit: usize,
+) -> RoutingPreviewPolicySummary {
+    let mut summary = RoutingPreviewPolicySummary {
+        candidate_limit,
+        ..RoutingPreviewPolicySummary::default()
+    };
+    for candidate in candidates {
+        let Some(status) = channel_statuses.get(&candidate.channel_id.0) else {
+            continue;
+        };
+        summary.route_target_retry_enabled |= status.route_target_retry_enabled;
+        summary.same_request_credential_retry_enabled |=
+            status.same_request_credential_retry_enabled;
+        summary.max_same_request_retries = summary
+            .max_same_request_retries
+            .max(status.max_same_request_retries);
+    }
+    summary
 }
 
 pub fn routing_preview_candidate_statuses(

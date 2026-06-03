@@ -1,4 +1,8 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, RwLock},
+};
 
 use axum::{
     body::Body,
@@ -6,7 +10,7 @@ use axum::{
     response::Response,
 };
 use bytes::{Bytes, BytesMut};
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, Stream, StreamExt};
 
 use crate::{
     auth::json_error,
@@ -17,11 +21,15 @@ use crate::{
 const MAX_FILTER_PENDING_BYTES: usize = 8192;
 const FILTER_OVERLAP_BYTES: usize = 1024;
 
+pub type BodyStreamFailureObserver =
+    Arc<dyn Fn(bool) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
+
 pub fn stream_response(
     status: StatusCode,
     headers: HeaderMap,
     upstream_resp: reqwest::Response,
     response_filter: Arc<RwLock<ResponseFilterPolicy>>,
+    body_failure_observer: Option<BodyStreamFailureObserver>,
 ) -> Response {
     let stream = upstream_resp
         .bytes_stream()
@@ -30,15 +38,55 @@ pub fn stream_response(
         .read()
         .expect("response filter lock poisoned")
         .is_effective();
-    if effective_filter {
-        let response_filter = response_filter
-            .read()
-            .expect("response filter lock poisoned")
-            .clone();
-        let stream = filter_response_stream(stream, response_filter);
-        return response_with_headers(status, headers, Body::from_stream(stream));
-    }
+    let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+        if effective_filter {
+            let response_filter = response_filter
+                .read()
+                .expect("response filter lock poisoned")
+                .clone();
+            Box::pin(filter_response_stream(stream, response_filter))
+        } else {
+            Box::pin(stream)
+        };
+    let stream = observe_body_stream_failures(stream, body_failure_observer);
     response_with_headers(status, headers, Body::from_stream(stream))
+}
+
+fn observe_body_stream_failures<S>(
+    stream: S,
+    observer: Option<BodyStreamFailureObserver>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    stream::unfold(
+        BodyStreamFailureState {
+            stream: Box::pin(stream),
+            observer,
+            partial_output_started: true,
+        },
+        |mut state| async move {
+            match state.stream.next().await {
+                Some(Ok(chunk)) => {
+                    state.partial_output_started = true;
+                    Some((Ok(chunk), state))
+                }
+                Some(Err(err)) => {
+                    if let Some(observer) = state.observer.take() {
+                        observer(state.partial_output_started).await;
+                    }
+                    Some((Err(err), state))
+                }
+                None => None,
+            }
+        },
+    )
+}
+
+struct BodyStreamFailureState<S> {
+    stream: Pin<Box<S>>,
+    observer: Option<BodyStreamFailureObserver>,
+    partial_output_started: bool,
 }
 
 fn filter_response_stream<S>(

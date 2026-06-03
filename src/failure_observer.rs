@@ -1,10 +1,12 @@
 use crate::{
+    credentials::short_hash,
     error::{ClassifiedFailure, FailureConfidence, FailureKind, FailureScope, RetryAfterSource},
     events::RoutingTelemetry,
     failure_state_executor::apply_state_mutation,
     routing::{
-        transition_after_failure, FailureSource, RequestSelectionSnapshot, RetryDecisionReason,
-        RetryDirective, RoutingPolicy, TransitionInput,
+        transition_after_failure, DuplicateChargeRisk, FailureSource, RequestSelectionSnapshot,
+        RetryDecisionReason, RetryDirective, RoutingPolicy, TransitionInput, TransitionResult,
+        FAILURE_SOURCE_TELEMETRY_CONTRACT,
     },
     state::{AppState, PoolState},
 };
@@ -32,18 +34,23 @@ pub async fn transition_observed_failure(
     failure: ClassifiedFailure,
     failure_source: FailureSource,
 ) -> RetryDirective {
-    let (directive, telemetry) =
+    let (result, telemetry) =
         apply_error_action(state, pool_state, snapshot, failure.clone(), failure_source).await;
     record_routing_telemetry(
         state,
         RoutingTelemetry::UpstreamFailureObserved {
             request_id: snapshot.request_id.clone(),
             channel_id: snapshot.channel_id.0.clone(),
-            failure: upstream_failure_telemetry(&failure, &directive),
+            failure: Box::new(upstream_failure_telemetry(
+                snapshot,
+                &failure,
+                failure_source,
+                &result,
+            )),
         },
     );
     record_transition_telemetry(state, snapshot, telemetry);
-    directive
+    result.retry
 }
 
 pub fn record_routing_telemetry(state: &AppState, event: RoutingTelemetry) {
@@ -58,7 +65,7 @@ async fn apply_error_action(
     snapshot: &RequestSelectionSnapshot,
     failure: ClassifiedFailure,
     failure_source: FailureSource,
-) -> (RetryDirective, Vec<RoutingTelemetry>) {
+) -> (TransitionResult, Vec<RoutingTelemetry>) {
     let _mutation_guard = pool_state.mutation_gate.lock().await;
     let mut pool = pool_state.pool.lock().await;
     let policy = routing_policy_for_pool(pool_state);
@@ -67,10 +74,17 @@ async fn apply_error_action(
         failure,
         failure_source,
         now: std::time::Instant::now(),
+        next_attempt_budget: (!snapshot.streaming).then_some(state.timeout_profile.connect),
         policy,
     });
-    let telemetry = apply_state_mutation(state, pool_state, &mut pool, snapshot, result.mutation);
-    (result.retry, telemetry)
+    let telemetry = apply_state_mutation(
+        state,
+        pool_state,
+        &mut pool,
+        snapshot,
+        result.mutation.clone(),
+    );
+    (result, telemetry)
 }
 
 fn routing_policy_for_pool(pool_state: &PoolState) -> RoutingPolicy {
@@ -103,11 +117,18 @@ fn record_transition_telemetry(
 }
 
 fn upstream_failure_telemetry(
+    snapshot: &RequestSelectionSnapshot,
     failure: &ClassifiedFailure,
-    directive: &RetryDirective,
+    failure_source: FailureSource,
+    result: &TransitionResult,
 ) -> crate::events::UpstreamFailureTelemetry {
-    let (retry_decision, retry_decision_reason) = retry_decision_telemetry(directive);
+    let (directive, retry_decision, retry_decision_reason) =
+        retry_decision_telemetry(&result.retry);
     crate::events::UpstreamFailureTelemetry {
+        public_model: snapshot.requested_model.clone(),
+        credential_id_hash: short_hash(&snapshot.credential_id.0),
+        attempt: snapshot.attempt,
+        failure_source: failure_source_code(failure_source).to_string(),
         failure_kind: failure_kind_code(failure.kind).to_string(),
         failure_scope: failure_scope_code(failure.primary_scope).to_string(),
         retryable: failure.retryable,
@@ -121,19 +142,50 @@ fn upstream_failure_telemetry(
             .map(retry_after_source_code)
             .map(str::to_string),
         cooldown_seconds: failure.cooldown.map(|cooldown| cooldown.as_secs()),
+        directive: directive.to_string(),
+        denial_reason: retry_decision_reason.map(str::to_string),
+        duplicate_charge_risk: duplicate_charge_risk_code(result.duplicate_charge_risk).to_string(),
+        effective_deadline_remaining_ms: result.effective_deadline_remaining_ms,
+        retry_pressure_accounted: retry_pressure_accounted(&result.retry),
         retry_decision: retry_decision.to_string(),
         retry_decision_reason: retry_decision_reason.map(str::to_string),
     }
 }
 
-fn retry_decision_telemetry(directive: &RetryDirective) -> (&'static str, Option<&'static str>) {
+fn retry_pressure_accounted(directive: &RetryDirective) -> bool {
+    !matches!(
+        directive,
+        RetryDirective::ReturnCurrentError {
+            reason: RetryDecisionReason::PartialOutputStarted
+        }
+    )
+}
+
+fn failure_source_code(source: FailureSource) -> &'static str {
+    FAILURE_SOURCE_TELEMETRY_CONTRACT
+        .iter()
+        .find_map(|(candidate, code)| (*candidate == source).then_some(*code))
+        .expect("failure source telemetry contract must cover all variants")
+}
+
+fn duplicate_charge_risk_code(risk: DuplicateChargeRisk) -> &'static str {
+    match risk {
+        DuplicateChargeRisk::None => "none",
+        DuplicateChargeRisk::Unknown => "unknown",
+    }
+}
+
+fn retry_decision_telemetry(
+    directive: &RetryDirective,
+) -> (&'static str, &'static str, Option<&'static str>) {
     match directive {
         RetryDirective::ReturnCurrentError { reason } => (
+            "return_error",
             "return_current_error",
             Some(retry_decision_reason_code(*reason)),
         ),
-        RetryDirective::RetryCredential { .. } => ("retry_credential", None),
-        RetryDirective::RetryRouteTarget => ("retry_route_target", None),
+        RetryDirective::RetryCredential { .. } => ("retry_credential", "retry_credential", None),
+        RetryDirective::RetryRouteTarget => ("retry_route_target", "retry_route_target", None),
     }
 }
 
@@ -184,7 +236,102 @@ fn retry_decision_reason_code(reason: RetryDecisionReason) -> &'static str {
         RetryDecisionReason::FailureNotRetryable => "failure_not_retryable",
         RetryDecisionReason::BodyNotReplayable => "body_not_replayable",
         RetryDecisionReason::StreamingNotRetryable => "streaming_not_retryable",
+        RetryDecisionReason::PartialOutputStarted => "partial_output_started",
         RetryDecisionReason::AttemptLimitReached => "attempt_limit_reached",
         RetryDecisionReason::NoFrozenCandidate => "no_frozen_candidate",
+        RetryDecisionReason::EffectiveDeadlineExhausted => "effective_deadline_exhausted",
+        RetryDecisionReason::RouteTargetRetryDisabled => "route_target_retry_disabled",
+        RetryDecisionReason::NoRouteCandidate => "no_route_candidate",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        credentials::{CredentialFingerprint, CredentialId},
+        error::ClassifiedFailure,
+        provider::{EndpointKind, ProviderKind},
+        routing::{RequestSelectionSnapshot, SelectionReason, StateMutation},
+        state::ChannelId,
+    };
+
+    #[test]
+    fn retry_decision_telemetry_uses_stable_terminal_directive() {
+        let (directive, retry_decision, reason) =
+            retry_decision_telemetry(&RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::AttemptLimitReached,
+            });
+
+        assert_eq!(directive, "return_error");
+        assert_eq!(retry_decision, "return_current_error");
+        assert_eq!(reason, Some("attempt_limit_reached"));
+    }
+
+    fn snapshot() -> RequestSelectionSnapshot {
+        RequestSelectionSnapshot {
+            request_id: "req-1".to_string(),
+            config_generation: 1,
+            channel_health_generation: 1,
+            client_token_id: "client-a".to_string(),
+            requested_model: Some("gpt-test".to_string()),
+            endpoint: EndpointKind::ChatCompletions,
+            route_target_index: Some(0),
+            channel_id: ChannelId("channel-a".to_string()),
+            provider_id: "provider-a".to_string(),
+            account_id: "account-a".to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            credential_id: CredentialId("credential-a".to_string()),
+            credential_fingerprint: CredentialFingerprint("fingerprint-a".to_string()),
+            classifier_id: "classifier-a".to_string(),
+            classifier_version: "1".to_string(),
+            retry_candidates: Vec::new(),
+            body_replayable: true,
+            streaming: false,
+            partial_output_started: false,
+            route_target_available: true,
+            effective_deadline: None,
+            attempt: 0,
+            selection_reason: SelectionReason::DefaultPool,
+        }
+    }
+
+    fn failure() -> ClassifiedFailure {
+        ClassifiedFailure {
+            kind: FailureKind::ProviderUnavailable,
+            primary_scope: FailureScope::Channel,
+            retryable: true,
+            cooldown: None,
+            retry_after_source: None,
+            confidence: FailureConfidence::Medium,
+            upstream_status: Some(200),
+            upstream_code: None,
+            upstream_limit_type: None,
+            classifier_id: "classifier-a".to_string(),
+            classifier_version: "1".to_string(),
+            adaptation_rule_id: None,
+        }
+    }
+
+    #[test]
+    fn guarded_success_envelope_failure_source_serializes_for_telemetry() {
+        let result = TransitionResult {
+            mutation: StateMutation::Noop {
+                reason: crate::routing::FailureReason::Unknown,
+            },
+            retry: RetryDirective::RetryRouteTarget,
+            duplicate_charge_risk: DuplicateChargeRisk::Unknown,
+            effective_deadline_remaining_ms: Some(100),
+        };
+
+        let telemetry = upstream_failure_telemetry(
+            &snapshot(),
+            &failure(),
+            FailureSource::GuardedSuccessEnvelope,
+            &result,
+        );
+
+        assert_eq!(telemetry.failure_source, "guarded_success_envelope");
+        assert_eq!(telemetry.duplicate_charge_risk, "unknown");
     }
 }

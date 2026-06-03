@@ -127,6 +127,25 @@ This Phase 1B behavior is intentionally narrower than later relay-hardening
 work: it does not add Phase 2 retry telemetry, Phase 3 guarded 2xx response
 classification, or Phase 4 response-filter-driven lifecycle mutation.
 
+Phase 2 documents the retry boundary and risk observability contract. Retry
+decision telemetry is emitted as bounded management data with request/channel
+context, failure classification, the selected directive, denial reason,
+duplicate-charge risk, and effective-deadline budget. The `denial_reason` enum
+is intentionally closed to policy and safety gates: `failure_not_retryable`,
+`body_not_replayable`, `streaming_not_retryable`, `partial_output_started`,
+`attempt_limit_reached`, `policy_disabled`, `no_frozen_candidate`,
+`effective_deadline_exhausted`, `route_target_retry_disabled`, and
+`no_route_candidate`. `duplicate_charge_risk` is a conservative retry evidence
+field, not billing truth: `none` means the gateway has no completed upstream
+transaction to suspect, `known_no_charge` means typed upstream evidence proves
+the failed attempt could not have charged, and `unknown` means the retry may
+duplicate an upstream transaction because charge status cannot be proven.
+Fallback must not start unless the selected timeout profile leaves enough
+effective deadline for another attempt, and retry-pressure counters are bounded
+so fallback amplification is visible without unbounded memory growth. Phase 2
+does not implement the HTTP 2xx success guard, response-filter-driven lifecycle
+mutation, or live `/v1/models` aggregation.
+
 Inspect effective policies through the existing management endpoints:
 
 ```text

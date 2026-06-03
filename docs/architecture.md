@@ -95,6 +95,31 @@ When every scoped route target has been excluded by active selected-channel cool
 
 Phase 1B stops at selected-channel transient suppression. It does not add Phase 2 retry telemetry or retry-pressure counters, Phase 3 guarded-success 2xx classification, or Phase 4 response-filter lifecycle mutation.
 
+Phase 2 adds observability and hard bounds to the existing retry boundary
+without broadening which responses are classified as failures. Every
+same-request credential retry and route-target retry uses the same attempt-state
+path and emits a management `retry_decision` event containing `request_id`,
+`public_model`, `channel_id`, `credential_id_hash`, `attempt`,
+`failure_source`, `failure_kind`, `failure_scope`, `directive`,
+`denial_reason`, `duplicate_charge_risk`, and
+`effective_deadline_remaining_ms`. The closed `denial_reason` set is
+`failure_not_retryable`, `body_not_replayable`, `streaming_not_retryable`,
+`partial_output_started`, `attempt_limit_reached`, `policy_disabled`,
+`no_frozen_candidate`, `effective_deadline_exhausted`,
+`route_target_retry_disabled`, and `no_route_candidate`. A retry may proceed
+only when the body is replayable, no client output has started, the attempt
+budget and policy allow it, a frozen candidate exists, and the effective request
+deadline can still contain the next attempt. `duplicate_charge_risk` is
+conservative telemetry for retry after upstream transaction failure: `none`
+means no completed upstream transaction is suspected, `known_no_charge` means
+typed evidence proves the failed attempt could not have charged, and `unknown`
+means the gateway cannot prove whether the upstream charged before failure.
+Retry pressure is exposed through bounded recent counters and a configured
+capacity in management runtime state. This phase deliberately does not add a
+guard for body-bearing HTTP 2xx responses, does not let response-filter events
+mutate credential/channel lifecycle, and does not make `/v1/models` aggregate
+live upstream catalogs.
+
 Reusable top-level `routing_profiles` hold routing behavior that is intentionally orthogonal to error classification: key selection strategy, default credential cooldown, same-request credential retry, and route-target retry. Config resolution compiles each profile once into `ResolvedRoutingProfile`; every pool selects either its explicit `routing_profile` or `default_routing_profile`, then receives a flattened `RoutingPolicy`. The proxy hot path reads only the selected channel's flattened policy from `PoolState`; it does not consult the global routing profile catalog. Management APIs expose the resolved profile catalog and profile-to-channel references read-only.
 
 ### Credential State Layer

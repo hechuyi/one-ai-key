@@ -219,18 +219,25 @@ Endpoint/schema acceptance:
 - [ ] Add an effective request deadline for retry/fallback if not already present in the selected timeout profile. Fallback must not start if it cannot fit inside the effective deadline.
 - [ ] Add duplicate-charge risk fields for fallback after upstream transaction failure or guarded 2xx failure when charge status is unknown.
 - [ ] Add bounded retry-pressure counters/events to prevent silent traffic amplification.
+- [ ] Keep HTTP 2xx success-guard classification, response-filter lifecycle mutation, and live `/v1/models` aggregation out of Phase 2.
 
 Stable telemetry schema additions:
 
 | Surface | Fields |
 | --- | --- |
 | `/management/routing-telemetry` event `retry_decision` | `request_id`, `public_model`, `channel_id`, `credential_id_hash`, `attempt`, `failure_source`, `failure_kind`, `failure_scope`, `directive: retry_credential|retry_route_target|return_error`, `denial_reason`, `duplicate_charge_risk: none|unknown|known_no_charge`, `effective_deadline_remaining_ms`. |
-| `/management/runtime` | Retry profile summary, `retry_pressure_capacity`, recent retry/fallback counters. |
+| `/management/runtime` | Retry profile summary, `retry_pressure_capacity`, bounded recent retry/fallback counters split by directive, denial reason, and duplicate-charge risk. |
 | `/management/routing/preview` | Read-only policy summary: route-target retry enabled, same-request credential retry enabled, max retries, candidate limit. |
 
-Allowed `denial_reason` values: `failure_not_retryable`, `body_not_replayable`, `streaming_not_retryable`, `partial_output_started`, `attempt_limit_reached`, `policy_disabled`, `no_frozen_candidate`, `effective_deadline_exhausted`, `route_target_retry_disabled`, `no_route_candidate`.
+Allowed `denial_reason` values: `failure_not_retryable`, `body_not_replayable`, `streaming_not_retryable`, `partial_output_started`, `attempt_limit_reached`, `policy_disabled`, `no_frozen_candidate`, `effective_deadline_exhausted`, `route_target_retry_disabled`, `no_route_candidate`. The field is present when the directive is `return_error`; retry directives leave it unset or `null`.
 
-**Phase 2 stop card:** red tests cover each denial reason, duplicate-charge risk for guarded and non-2xx fallback classes, effective-deadline denial, bounded retry-pressure capacity, schemas above, and existing same-request retry behavior. Complete only when local CI and x86_64 build pass.
+`duplicate_charge_risk` is a conservative retry-observability field, not a settlement or billing assertion. Use `none` when the gateway has no evidence of a completed upstream transaction, `known_no_charge` only when typed evidence proves the failed attempt could not have charged, and `unknown` whenever an upstream transaction or guarded-success envelope may have reached provider-side accounting before the gateway decided to retry. Until Phase 3 implements the 2xx guard, Phase 2 code may define the `guarded_success_envelope` source and risk semantics but must not classify successful 2xx bodies or fallback because of them.
+
+The effective-deadline gate is evaluated before every fallback attempt. It uses the selected timeout profile's effective request deadline, including any existing per-request timeout budget, and denies retry as `effective_deadline_exhausted` when the next attempt cannot fit. Attempt limits and candidate limits remain independent gates; passing one does not bypass the deadline gate.
+
+Retry-pressure observability is bounded. Implementations may use an in-memory ring, windowed counters, or equivalent capped structure, but `/management/runtime` must expose the configured capacity and recent counts without unbounded cardinality from model ids, upstream text, credentials, request ids, or raw provider payloads.
+
+**Phase 2 stop card:** red tests cover each denial reason, duplicate-charge risk for guarded and non-2xx fallback classes, effective-deadline denial, bounded retry-pressure capacity, schemas above, and existing same-request retry behavior. Tests must also assert that Phase 2 does not implement HTTP 2xx success-guard classification, response-filter-driven lifecycle mutation, or live `/v1/models` aggregation. Complete only when local CI and x86_64 build pass.
 
 ## Phase 3: HTTP 2xx Success Guard
 

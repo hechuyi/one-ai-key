@@ -28,17 +28,46 @@ use crate::{
         apply_retry_directive_to_attempt_state, FailureSource, FrozenRetryCandidates,
         RequestSelectionSnapshot, RetryAttemptContinuation, RetryDirective, SelectionReason,
     },
-    state::{AppState, ChannelId},
-    upstream_response::{read_limited_body, response_with_headers, stream_response},
+    state::{AppState, ChannelId, PoolState},
+    upstream_response::{
+        read_limited_body, response_with_headers, stream_response, BodyStreamFailureObserver,
+    },
 };
 
-use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn next_request_id() -> String {
     format!("req_{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+fn body_stream_failure_observer(
+    state: AppState,
+    pool_state: PoolState,
+    snapshot: RequestSelectionSnapshot,
+) -> BodyStreamFailureObserver {
+    std::sync::Arc::new(move |partial_output_started| {
+        let state = state.clone();
+        let pool_state = pool_state.clone();
+        let mut snapshot = snapshot.clone();
+        Box::pin(async move {
+            snapshot.partial_output_started = partial_output_started;
+            let failure = pool_state.error_classifier.classify_transport_failure();
+            let _ = transition_observed_failure(
+                &state,
+                &pool_state,
+                &snapshot,
+                failure,
+                FailureSource::LocalTransport,
+            )
+            .await;
+        })
+    })
 }
 
 pub async fn proxy_openai_compatible(State(state): State<AppState>, req: Request) -> Response {
@@ -116,6 +145,10 @@ pub async fn proxy_openai_compatible(State(state): State<AppState>, req: Request
         }
     }
     let query = parts.uri.query().map(ToOwned::to_owned);
+    let effective_deadline = effective_deadline_for_request(
+        context.streaming,
+        state.timeout_profile.non_streaming_total,
+    );
 
     forward_with_pools(ForwardRequest {
         state,
@@ -128,6 +161,7 @@ pub async fn proxy_openai_compatible(State(state): State<AppState>, req: Request
         client_token_id: client.id,
         request_context: context,
         selection_reason,
+        effective_deadline,
     })
     .await
 }
@@ -339,6 +373,10 @@ pub async fn proxy_named_pool(
                 return json_error(StatusCode::FORBIDDEN, "model not allowed for client token");
             }
         }
+        let effective_deadline = effective_deadline_for_request(
+            request_context.streaming,
+            state.timeout_profile.non_streaming_total,
+        );
         return forward_with_pools(ForwardRequest {
             state,
             route_plan,
@@ -350,6 +388,7 @@ pub async fn proxy_named_pool(
             client_token_id: client.id,
             request_context,
             selection_reason: SelectionReason::NamedChannel,
+            effective_deadline,
         })
         .await;
     }
@@ -533,6 +572,7 @@ struct ForwardRequest {
     client_token_id: String,
     request_context: crate::provider::RequestContext,
     selection_reason: SelectionReason,
+    effective_deadline: Option<Instant>,
 }
 
 struct StreamingForwardRequest {
@@ -545,6 +585,26 @@ struct StreamingForwardRequest {
     body: Body,
     client_token_id: String,
     request_context: crate::provider::RequestContext,
+}
+
+fn effective_deadline_for_request(
+    streaming: bool,
+    non_streaming_total: Duration,
+) -> Option<Instant> {
+    (!streaming).then(|| Instant::now() + non_streaming_total)
+}
+
+fn upstream_timeout_for_effective_deadline(
+    effective_deadline: Option<Instant>,
+    non_streaming_total: Duration,
+) -> Duration {
+    effective_deadline
+        .map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(non_streaming_total)
+        })
+        .unwrap_or(non_streaming_total)
 }
 
 async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response {
@@ -621,6 +681,9 @@ async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response 
             retry_candidates: Vec::new(),
             body_replayable: false,
             streaming: false,
+            partial_output_started: false,
+            route_target_available: false,
+            effective_deadline: None,
             attempt: 0,
             selection_reason: SelectionReason::NamedChannel,
         };
@@ -687,6 +750,11 @@ async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response 
             response_headers,
             upstream_resp,
             state.response_filter.clone(),
+            Some(body_stream_failure_observer(
+                state.clone(),
+                pool_state.clone(),
+                snapshot.clone(),
+            )),
         );
     }
 
@@ -740,9 +808,10 @@ async fn forward_with_pools(req: ForwardRequest) -> Response {
     let mut last_response = None;
     let total_pools = req.route_plan.targets.len();
     for (route_attempt, target) in req.route_plan.targets.iter().enumerate() {
-        match forward_with_pool(&req, target.clone()).await {
+        let route_target_available = route_attempt + 1 < total_pools;
+        match forward_with_pool(&req, target.clone(), route_target_available).await {
             PoolForwardResult::Response(response) => return response,
-            PoolForwardResult::RouteFallback(response) if route_attempt + 1 < total_pools => {
+            PoolForwardResult::RouteFallback(response) if route_target_available => {
                 last_response = Some(response);
             }
             PoolForwardResult::RouteFallback(response) => return response,
@@ -757,7 +826,11 @@ enum PoolForwardResult {
     RouteFallback(Response),
 }
 
-async fn forward_with_pool(req: &ForwardRequest, target: ForwardTarget) -> PoolForwardResult {
+async fn forward_with_pool(
+    req: &ForwardRequest,
+    target: ForwardTarget,
+    route_target_available: bool,
+) -> PoolForwardResult {
     let ForwardRequest {
         state,
         method,
@@ -768,6 +841,7 @@ async fn forward_with_pool(req: &ForwardRequest, target: ForwardTarget) -> PoolF
         client_token_id,
         request_context,
         selection_reason,
+        effective_deadline,
         route_plan,
         ..
     } = req;
@@ -849,6 +923,9 @@ async fn forward_with_pool(req: &ForwardRequest, target: ForwardTarget) -> PoolF
                 retry_candidates: retry_candidates.clone(),
                 body_replayable: request_context.body_replayable,
                 streaming: request_context.streaming,
+                partial_output_started: false,
+                route_target_available,
+                effective_deadline: *effective_deadline,
                 attempt,
                 selection_reason: *selection_reason,
             };
@@ -885,7 +962,10 @@ async fn forward_with_pool(req: &ForwardRequest, target: ForwardTarget) -> PoolF
             &selected.key,
         );
         if !request_context.streaming {
-            upstream = upstream.timeout(state.timeout_profile.non_streaming_total);
+            upstream = upstream.timeout(upstream_timeout_for_effective_deadline(
+                *effective_deadline,
+                state.timeout_profile.non_streaming_total,
+            ));
         }
         if !outbound.body.is_empty() {
             upstream = upstream.body(outbound.body);
@@ -926,6 +1006,11 @@ async fn forward_with_pool(req: &ForwardRequest, target: ForwardTarget) -> PoolF
                 response_headers,
                 upstream_resp,
                 state.response_filter.clone(),
+                Some(body_stream_failure_observer(
+                    state.clone(),
+                    pool_state.clone(),
+                    snapshot.clone(),
+                )),
             ));
         }
 

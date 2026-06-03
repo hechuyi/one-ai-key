@@ -859,11 +859,12 @@ mod tests {
             CredentialLifecycleState, CredentialRepository, CredentialSetId,
             SqliteCredentialRepository,
         },
+        credentials::{CredentialFingerprint, CredentialId},
         error::{
             BalanceScope, ClassifiedFailure, FailureConfidence, FailureKind, FailureScope,
             RelayProfile,
         },
-        events::{EventLog, ManagementEventActor, RoutingTelemetry},
+        events::{EventLog, ManagementEventActor, RoutingTelemetry, UpstreamFailureTelemetry},
         failure_observer::transition_observed_upstream_failure,
         management_commands::{
             disable_credential_response_for_channel, enable_credential_response_for_channel,
@@ -871,10 +872,13 @@ mod tests {
             restore_credential_response_for_channel, CredentialCommand, CredentialCommandKind,
         },
         management_resources::{pool_status_for_channel, reset_channel_health_status},
-        provider::ProviderKind,
+        provider::{EndpointKind, ProviderKind},
         registry::{RegistryDocument, RegistryRepository, YamlRegistryRepository},
         registry_store::{RegistryStore, RegistryStoreHandle, SqliteRegistryStore},
-        routing::{RequestSelectionSnapshot, SelectionReason},
+        routing::{
+            DuplicateChargeRisk, FailureSource, RequestSelectionSnapshot, RetryDecisionReason,
+            RetryDirective, RoutingPolicy, SelectionReason, TransitionInput,
+        },
         state::{ChannelHealth, ChannelId},
         test_fixtures::{bearer, credential_lines, fixtures},
     };
@@ -7274,6 +7278,383 @@ pools:
                     .collect(),
             },
         )
+    }
+
+    fn phase2_stop_card_snapshot(
+        retry_candidates: Vec<CredentialId>,
+        body_replayable: bool,
+        streaming: bool,
+        attempt: usize,
+        route_target_index: Option<usize>,
+    ) -> RequestSelectionSnapshot {
+        RequestSelectionSnapshot {
+            request_id: "phase2-request".to_string(),
+            config_generation: 1,
+            channel_health_generation: 1,
+            client_token_id: "phase2-client".to_string(),
+            requested_model: Some("gpt-phase2".to_string()),
+            endpoint: EndpointKind::ChatCompletions,
+            route_target_index,
+            channel_id: ChannelId("phase2-channel".to_string()),
+            provider_id: "phase2-provider".to_string(),
+            account_id: "phase2-account".to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            credential_id: CredentialId("phase2-current-credential".to_string()),
+            credential_fingerprint: CredentialFingerprint("phase2-current-fingerprint".to_string()),
+            classifier_id: "phase2-classifier".to_string(),
+            classifier_version: "phase2-version".to_string(),
+            retry_candidates,
+            body_replayable,
+            streaming,
+            partial_output_started: false,
+            route_target_available: true,
+            effective_deadline: None,
+            attempt,
+            selection_reason: SelectionReason::ModelMapping,
+        }
+    }
+
+    fn phase2_stop_card_failure(
+        kind: FailureKind,
+        primary_scope: FailureScope,
+        retryable: bool,
+    ) -> ClassifiedFailure {
+        ClassifiedFailure {
+            kind,
+            primary_scope,
+            retryable,
+            cooldown: None,
+            retry_after_source: None,
+            confidence: FailureConfidence::High,
+            upstream_status: Some(429),
+            upstream_code: Some("phase2_unavailable".to_string()),
+            upstream_limit_type: None,
+            classifier_id: "phase2-classifier".to_string(),
+            classifier_version: "phase2-version".to_string(),
+            adaptation_rule_id: None,
+        }
+    }
+
+    fn phase2_stop_card_policy(
+        retry_switched_key_in_same_request: bool,
+        max_same_request_retries: usize,
+        route_target_retry_enabled: bool,
+    ) -> RoutingPolicy {
+        RoutingPolicy {
+            retry_switched_key_in_same_request,
+            max_same_request_retries,
+            route_target_retry_enabled,
+            default_credential_cooldown: Duration::from_secs(20),
+        }
+    }
+
+    fn phase2_stop_card_decision(
+        snapshot: &RequestSelectionSnapshot,
+        failure: ClassifiedFailure,
+        policy: RoutingPolicy,
+    ) -> RetryDirective {
+        crate::routing::transition_after_failure(TransitionInput {
+            snapshot,
+            failure,
+            failure_source: FailureSource::UpstreamTransaction,
+            now: Instant::now(),
+            next_attempt_budget: Some(Duration::from_secs(120)),
+            policy,
+        })
+        .retry
+    }
+
+    fn assert_phase2_stop_card_reason(
+        snapshot: &RequestSelectionSnapshot,
+        failure: ClassifiedFailure,
+        policy: RoutingPolicy,
+        expected: RetryDecisionReason,
+    ) {
+        assert_eq!(
+            phase2_stop_card_decision(snapshot, failure, policy),
+            RetryDirective::ReturnCurrentError { reason: expected }
+        );
+    }
+
+    #[test]
+    fn phase2_stop_card_retry_decision_reasons_cover_current_retry_gates() {
+        let next = CredentialId("phase2-next-credential".to_string());
+        let retryable_credential =
+            phase2_stop_card_failure(FailureKind::RateLimited, FailureScope::Credential, true);
+        let retry_enabled = phase2_stop_card_policy(true, 1, true);
+
+        assert_phase2_stop_card_reason(
+            &phase2_stop_card_snapshot(vec![next.clone()], true, false, 0, None),
+            phase2_stop_card_failure(FailureKind::AuthInvalid, FailureScope::Credential, false),
+            retry_enabled,
+            RetryDecisionReason::FailureNotRetryable,
+        );
+        assert_phase2_stop_card_reason(
+            &phase2_stop_card_snapshot(vec![next.clone()], false, false, 0, None),
+            retryable_credential.clone(),
+            retry_enabled,
+            RetryDecisionReason::BodyNotReplayable,
+        );
+        assert_phase2_stop_card_reason(
+            &phase2_stop_card_snapshot(vec![next.clone()], true, true, 0, None),
+            retryable_credential.clone(),
+            retry_enabled,
+            RetryDecisionReason::StreamingNotRetryable,
+        );
+        let mut partial_output_snapshot =
+            phase2_stop_card_snapshot(vec![next.clone()], true, false, 0, None);
+        partial_output_snapshot.partial_output_started = true;
+        assert_phase2_stop_card_reason(
+            &partial_output_snapshot,
+            retryable_credential.clone(),
+            retry_enabled,
+            RetryDecisionReason::PartialOutputStarted,
+        );
+        let mut exhausted_deadline_snapshot =
+            phase2_stop_card_snapshot(vec![next.clone()], true, false, 0, None);
+        exhausted_deadline_snapshot.effective_deadline = Some(Instant::now());
+        assert_phase2_stop_card_reason(
+            &exhausted_deadline_snapshot,
+            retryable_credential.clone(),
+            retry_enabled,
+            RetryDecisionReason::EffectiveDeadlineExhausted,
+        );
+        assert_phase2_stop_card_reason(
+            &phase2_stop_card_snapshot(vec![next.clone()], true, false, 1, None),
+            retryable_credential.clone(),
+            retry_enabled,
+            RetryDecisionReason::AttemptLimitReached,
+        );
+        assert_phase2_stop_card_reason(
+            &phase2_stop_card_snapshot(vec![next.clone()], true, false, 0, None),
+            retryable_credential.clone(),
+            phase2_stop_card_policy(false, 1, true),
+            RetryDecisionReason::PolicyDisabled,
+        );
+        assert_phase2_stop_card_reason(
+            &phase2_stop_card_snapshot(Vec::new(), true, false, 0, None),
+            retryable_credential,
+            retry_enabled,
+            RetryDecisionReason::NoFrozenCandidate,
+        );
+        assert_phase2_stop_card_reason(
+            &phase2_stop_card_snapshot(Vec::new(), true, false, 0, Some(0)),
+            phase2_stop_card_failure(
+                FailureKind::ProviderUnavailable,
+                FailureScope::Channel,
+                true,
+            ),
+            phase2_stop_card_policy(true, 1, false),
+            RetryDecisionReason::RouteTargetRetryDisabled,
+        );
+        let mut no_route_candidate_snapshot =
+            phase2_stop_card_snapshot(Vec::new(), true, false, 0, Some(0));
+        no_route_candidate_snapshot.route_target_available = false;
+        assert_phase2_stop_card_reason(
+            &no_route_candidate_snapshot,
+            phase2_stop_card_failure(
+                FailureKind::ProviderUnavailable,
+                FailureScope::Channel,
+                true,
+            ),
+            retry_enabled,
+            RetryDecisionReason::NoRouteCandidate,
+        );
+    }
+
+    #[test]
+    fn phase2_stop_card_route_target_retry_uses_explicit_retry_route_target_directive() {
+        let snapshot = phase2_stop_card_snapshot(Vec::new(), true, false, 0, Some(0));
+
+        assert_eq!(
+            phase2_stop_card_decision(
+                &snapshot,
+                phase2_stop_card_failure(
+                    FailureKind::ProviderUnavailable,
+                    FailureScope::Channel,
+                    true,
+                ),
+                phase2_stop_card_policy(false, 0, true),
+            ),
+            RetryDirective::RetryRouteTarget
+        );
+    }
+
+    #[test]
+    fn phase2_stop_card_non_2xx_route_fallback_records_duplicate_charge_risk() {
+        let snapshot = phase2_stop_card_snapshot(Vec::new(), true, false, 0, Some(0));
+        let result = crate::routing::transition_after_failure(TransitionInput {
+            snapshot: &snapshot,
+            failure: phase2_stop_card_failure(
+                FailureKind::ProviderUnavailable,
+                FailureScope::Channel,
+                true,
+            ),
+            failure_source: FailureSource::UpstreamTransaction,
+            now: Instant::now(),
+            next_attempt_budget: Some(Duration::from_secs(120)),
+            policy: phase2_stop_card_policy(false, 0, true),
+        });
+
+        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
+    }
+
+    #[test]
+    fn phase2_stop_card_candidate_pressure_and_no_route_gates_are_bounded() {
+        let proxy_source = production_source("src/proxy.rs");
+        let route_plan_source = production_source("src/route_plan.rs");
+
+        assert!(proxy_source.contains("candidate_limit: state.routing.max_route_candidates"));
+        assert!(proxy_source.contains("fn no_route_candidate_response"));
+        assert!(proxy_source.contains("let total_pools = req.route_plan.targets.len();"));
+        assert!(proxy_source.contains("for (route_attempt, target) in req.route_plan.targets"));
+        assert!(route_plan_source.contains("input.candidate_limit.min(eligible.len())"));
+        assert!(route_plan_source.contains("RoutePreviewReason::CandidateLimit"));
+    }
+
+    #[test]
+    fn phase2_stop_card_same_request_retry_remains_opt_in_by_default() {
+        let config = test_config_with_api_base("https://phase2.invalid/v1")
+            .resolve()
+            .unwrap();
+        let pool = config.pools.get("test").unwrap();
+
+        assert!(!pool.routing_policy.retry_switched_key_in_same_request);
+        assert_eq!(pool.routing_policy.max_same_request_retries, 0);
+    }
+
+    #[test]
+    fn phase2_stop_card_phase2_production_reasons_are_represented() {
+        let routing_source = production_source("src/routing.rs");
+
+        for reason in [
+            "EffectiveDeadlineExhausted",
+            "PartialOutputStarted",
+            "RouteTargetRetryDisabled",
+            "NoRouteCandidate",
+            "DuplicateChargeRisk",
+        ] {
+            assert!(
+                routing_source.contains(reason),
+                "Phase 2 stop-card production reason {reason} must be represented"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn effective_deadline_is_shared_across_route_target_attempts() {
+        let failing_upstream = || {
+            Router::new().route(
+                "/v1/chat/completions",
+                post(|| async {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "upstream_unavailable",
+                                "message": "provider unavailable"
+                            }
+                        })),
+                    )
+                }),
+            )
+        };
+        let primary_base = spawn_upstream(failing_upstream()).await;
+        let fallback_base = spawn_upstream(failing_upstream()).await;
+
+        let mut pools = HashMap::new();
+        let mut credential_sets = HashMap::new();
+        for (name, api_base, key) in [
+            ("deadline_primary", primary_base, "primary-key"),
+            ("deadline_fallback", fallback_base, "fallback-key"),
+        ] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(&format!("{key}\n")),
+                },
+            );
+            pools.insert(name.to_string(), openai_pool(api_base, credential_set));
+        }
+        let config = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "test-client".to_string(),
+                token: fixture_client_token(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: fixture_admin_token(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path: None,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: TimeoutConfig::default(),
+            routing: crate::config::RoutingConfig::default(),
+            default_pool: Some("deadline_primary".to_string()),
+            providers: HashMap::new(),
+            accounts: HashMap::new(),
+            credential_sets,
+            model_routes: HashMap::from([priority_route(
+                "gpt-effective-deadline",
+                ["deadline_primary", "deadline_fallback"],
+            )]),
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: std::collections::HashMap::from([(
+                "default-routing".to_string(),
+                crate::config::RoutingProfileConfig {
+                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry:
+                        crate::config::SameRequestCredentialRetryConfig {
+                            enabled: false,
+                            max_retries: 0,
+                        },
+                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            pools,
+        }
+        .resolve()
+        .unwrap();
+
+        crate::routing::clear_test_transition_snapshots();
+        let response = app(AppState::new(config).unwrap())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-effective-deadline","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let snapshots = crate::routing::take_test_transition_snapshots();
+        let first = snapshots
+            .iter()
+            .find(|snapshot| snapshot.channel_id == ChannelId("deadline_primary".to_string()))
+            .expect("primary route target failure transition snapshot");
+        let second = snapshots
+            .iter()
+            .find(|snapshot| snapshot.channel_id == ChannelId("deadline_fallback".to_string()))
+            .expect("fallback route target failure transition snapshot");
+
+        assert_eq!(first.effective_deadline, second.effective_deadline);
     }
 
     async fn spawn_upstream(router: Router) -> String {
@@ -18281,7 +18662,11 @@ pools:
                     enabled: true,
                     account: None,
                     policy_profile: None,
-                    routing_profile: None,
+                    routing_profile: Some(if name == "fallback" {
+                        "retry-routing".to_string()
+                    } else {
+                        "default-routing".to_string()
+                    }),
                     provider_kind: ProviderKind::OpenAiCompatible,
                     api_base: format!("https://{name}.example.com/v1?token=hidden"),
                     credential_set: "shared-credentials".to_string(),
@@ -18319,19 +18704,38 @@ pools:
             model_routes: HashMap::from([priority_route("gpt-preview", ["primary", "fallback"])]),
             policy_profiles: HashMap::new(),
             default_routing_profile: Some("default-routing".to_string()),
-            routing_profiles: std::collections::HashMap::from([(
-                "default-routing".to_string(),
-                crate::config::RoutingProfileConfig {
-                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
-                    default_credential_cooldown_seconds: 20,
-                    same_request_credential_retry:
-                        crate::config::SameRequestCredentialRetryConfig {
+            routing_profiles: std::collections::HashMap::from([
+                (
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig {
                             enabled: false,
-                            max_retries: 0,
                         },
-                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
-                },
-            )]),
+                    },
+                ),
+                (
+                    "retry-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: true,
+                                max_retries: 2,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                ),
+            ]),
             pools,
         }
         .resolve()
@@ -18365,6 +18769,13 @@ pools:
         assert_eq!(value["model"], "gpt-preview");
         assert_eq!(value["route_kind"], "explicit_model_route");
         assert_eq!(value["client_token"]["name"], "scoped-client");
+        assert_eq!(value["policy_summary"]["route_target_retry_enabled"], true);
+        assert_eq!(
+            value["policy_summary"]["same_request_credential_retry_enabled"],
+            true
+        );
+        assert_eq!(value["policy_summary"]["max_same_request_retries"], 2);
+        assert_eq!(value["policy_summary"]["candidate_limit"], 16);
         assert_eq!(value["selected_target"]["channel_id"], "fallback");
         assert_eq!(value["candidates"].as_array().unwrap().len(), 2);
         assert_eq!(value["candidates"][0]["channel_id"], "primary");
@@ -18872,6 +19283,247 @@ pools:
         );
         assert_eq!(runtime["request_limits"]["max_route_candidates"], 16);
         assert_eq!(runtime["timeout_seconds"]["connect"], 10);
+    }
+
+    fn runtime_retry_pressure_failure(
+        directive: &str,
+        denial_reason: Option<&str>,
+        duplicate_charge_risk: &str,
+        credential_id_hash: &str,
+    ) -> UpstreamFailureTelemetry {
+        UpstreamFailureTelemetry {
+            public_model: Some("gpt-test".to_string()),
+            credential_id_hash: credential_id_hash.to_string(),
+            attempt: 0,
+            failure_source: "upstream_transaction".to_string(),
+            failure_kind: "rate_limited".to_string(),
+            failure_scope: "credential".to_string(),
+            retryable: true,
+            confidence: "medium".to_string(),
+            status: Some(429),
+            classifier_id: "test-classifier".to_string(),
+            classifier_version: "1".to_string(),
+            adaptation_rule_id: None,
+            retry_after_source: None,
+            cooldown_seconds: None,
+            directive: directive.to_string(),
+            denial_reason: denial_reason.map(str::to_string),
+            duplicate_charge_risk: duplicate_charge_risk.to_string(),
+            effective_deadline_remaining_ms: Some(1000),
+            retry_pressure_accounted: true,
+            retry_decision: if directive == "return_error" {
+                "return_current_error"
+            } else {
+                directive
+            }
+            .to_string(),
+            retry_decision_reason: denial_reason.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn management_runtime_reports_retry_projection_without_secret_material() {
+        let state = test_state();
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::UpstreamFailureObserved {
+                request_id: "req_retry".to_string(),
+                channel_id: "test".to_string(),
+                failure: Box::new(runtime_retry_pressure_failure(
+                    "retry_credential",
+                    None,
+                    "unknown",
+                    "fingerprint-a",
+                )),
+            });
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::UpstreamFailureObserved {
+                request_id: "req_fallback".to_string(),
+                channel_id: "test".to_string(),
+                failure: Box::new(runtime_retry_pressure_failure(
+                    "retry_route_target",
+                    None,
+                    "unknown",
+                    "fingerprint-b",
+                )),
+            });
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::UpstreamFailureObserved {
+                request_id: "req_terminal".to_string(),
+                channel_id: "test".to_string(),
+                failure: Box::new(runtime_retry_pressure_failure(
+                    "return_error",
+                    Some("attempt_limit_reached"),
+                    "none",
+                    "fingerprint-c",
+                )),
+            });
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/management/runtime")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("upstream-key"));
+        assert!(!body.contains("req_retry"));
+        assert!(!body.contains("fingerprint-a"));
+        let runtime = serde_json::from_str::<Value>(&body).unwrap();
+        assert_eq!(runtime["retry_profile_summary"]["channels"], 1);
+        assert_eq!(
+            runtime["retry_profile_summary"]["same_request_credential_retry_enabled_channels"],
+            0
+        );
+        assert_eq!(
+            runtime["retry_profile_summary"]["route_target_retry_enabled_channels"],
+            1
+        );
+        assert_eq!(
+            runtime["retry_profile_summary"]["max_same_request_retries"],
+            0
+        );
+        assert_eq!(
+            runtime["retry_pressure_capacity"]["same_request_credential_retry_attempts"],
+            0
+        );
+        assert_eq!(
+            runtime["retry_pressure_capacity"]["route_target_fallback_candidates"],
+            16
+        );
+        assert_eq!(
+            runtime["recent_retry_counters"]["same_request_credential_retries"],
+            1
+        );
+        assert_eq!(
+            runtime["recent_retry_counters"]["route_target_fallbacks"],
+            1
+        );
+        assert_eq!(
+            runtime["recent_retry_counters"]["terminal_retry_decisions"],
+            1
+        );
+        assert_eq!(runtime["recent_retry_counters"]["window_capacity"], 1024);
+        assert_eq!(
+            runtime["recent_retry_counters"]["by_directive"]["retry_credential"],
+            1
+        );
+        assert_eq!(
+            runtime["recent_retry_counters"]["by_directive"]["retry_route_target"],
+            1
+        );
+        assert_eq!(
+            runtime["recent_retry_counters"]["by_directive"]["return_error"],
+            1
+        );
+        assert_eq!(
+            runtime["recent_retry_counters"]["by_denial_reason"]["attempt_limit_reached"],
+            1
+        );
+        assert_eq!(
+            runtime["recent_retry_counters"]["by_duplicate_charge_risk"]["unknown"],
+            2
+        );
+        assert_eq!(
+            runtime["recent_retry_counters"]["by_duplicate_charge_risk"]["none"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn management_runtime_retry_pressure_excludes_evicted_telemetry_events() {
+        let mut config = test_config_with_api_base("https://example.com/v1");
+        config.routing = crate::config::RoutingConfig {
+            max_route_candidates: None,
+            max_model_catalog_channels: None,
+            telemetry_buffer_capacity: Some(1),
+        };
+        let state = AppState::new(config.resolve().unwrap()).unwrap();
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::UpstreamFailureObserved {
+                request_id: "req_evicted".to_string(),
+                channel_id: "test".to_string(),
+                failure: Box::new(runtime_retry_pressure_failure(
+                    "retry_credential",
+                    None,
+                    "unknown",
+                    "fingerprint-evicted",
+                )),
+            });
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::UpstreamFailureObserved {
+                request_id: "req_recent".to_string(),
+                channel_id: "test".to_string(),
+                failure: Box::new(runtime_retry_pressure_failure(
+                    "return_error",
+                    Some("attempt_limit_reached"),
+                    "none",
+                    "fingerprint-recent",
+                )),
+            });
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/management/runtime")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("upstream-key"));
+        assert!(!body.contains("req_evicted"));
+        assert!(!body.contains("fingerprint-evicted"));
+        let runtime = serde_json::from_str::<Value>(&body).unwrap();
+        assert_eq!(runtime["routing_telemetry_capacity"], 1);
+        assert_eq!(runtime["routing_telemetry_events"], 1);
+        assert_eq!(runtime["recent_retry_counters"]["window_capacity"], 1);
+        assert_eq!(
+            runtime["recent_retry_counters"]["by_directive"]["retry_credential"],
+            0
+        );
+        assert_eq!(
+            runtime["recent_retry_counters"]["by_directive"]["return_error"],
+            1
+        );
+        assert_eq!(
+            runtime["recent_retry_counters"]["by_denial_reason"]["attempt_limit_reached"],
+            1
+        );
+        assert_eq!(
+            runtime["recent_retry_counters"]["by_duplicate_charge_risk"]["unknown"],
+            0
+        );
+        assert_eq!(
+            runtime["recent_retry_counters"]["by_duplicate_charge_risk"]["none"],
+            1
+        );
     }
 
     #[tokio::test]
@@ -20273,6 +20925,9 @@ pools:
             retry_candidates: Vec::new(),
             body_replayable: true,
             streaming: false,
+            partial_output_started: false,
+            route_target_available: false,
+            effective_deadline: None,
             attempt: 0,
             selection_reason: SelectionReason::DefaultPool,
         };
@@ -20611,6 +21266,75 @@ pools:
         let body = serde_json::from_slice::<Value>(&body).unwrap();
         assert_eq!(body["buffered_events"], 1);
         assert_eq!(body["events"][0]["request_id"], "req_2");
+    }
+
+    #[tokio::test]
+    async fn management_routing_telemetry_preserves_retry_decision_fields_without_secret_material()
+    {
+        let state = test_state();
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::UpstreamFailureObserved {
+                request_id: "req_retry_decision".to_string(),
+                channel_id: "test".to_string(),
+                failure: Box::new(UpstreamFailureTelemetry {
+                    public_model: Some("gpt-test".to_string()),
+                    credential_id_hash: "fingerprint-a".to_string(),
+                    attempt: 2,
+                    failure_source: "upstream_transaction".to_string(),
+                    failure_kind: "rate_limited".to_string(),
+                    failure_scope: "credential".to_string(),
+                    retryable: true,
+                    confidence: "medium".to_string(),
+                    status: Some(429),
+                    classifier_id: "test-classifier".to_string(),
+                    classifier_version: "1".to_string(),
+                    adaptation_rule_id: None,
+                    retry_after_source: Some("delta_seconds".to_string()),
+                    cooldown_seconds: Some(30),
+                    directive: "return_error".to_string(),
+                    denial_reason: Some("attempt_limit_reached".to_string()),
+                    duplicate_charge_risk: "unknown".to_string(),
+                    effective_deadline_remaining_ms: Some(0),
+                    retry_pressure_accounted: true,
+                    retry_decision: "return_current_error".to_string(),
+                    retry_decision_reason: Some("attempt_limit_reached".to_string()),
+                }),
+            });
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/management/routing-telemetry")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("upstream-key"));
+        let body = serde_json::from_str::<Value>(&body).unwrap();
+        assert_eq!(body["events"][0]["failure"]["retryable"], true);
+        assert_eq!(body["events"][0]["failure"]["directive"], "return_error");
+        assert_eq!(
+            body["events"][0]["failure"]["denial_reason"],
+            "attempt_limit_reached"
+        );
+        assert_eq!(
+            body["events"][0]["failure"]["retry_decision"],
+            "return_current_error"
+        );
+        assert_eq!(
+            body["events"][0]["failure"]["retry_decision_reason"],
+            "attempt_limit_reached"
+        );
+        assert!(body["events"][0].get("credential_id").is_none());
     }
 
     #[tokio::test]
@@ -27492,6 +28216,180 @@ model_routes:
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(*fallback_hits.lock().await, 0);
+    }
+
+    #[tokio::test]
+    async fn partial_output_started_body_error_does_not_route_fallback() {
+        let fallback_hits = Arc::new(Mutex::new(0usize));
+        let primary_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = primary_listener.accept().await.unwrap();
+            let mut request_buffer = [0_u8; 1024];
+            let _ = socket.read(&mut request_buffer).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 128\r\n\r\n{\"id\":\"partial\"",
+                )
+                .await
+                .unwrap();
+        });
+        let primary_base = format!("http://{primary_addr}/v1");
+        let fallback_hits_for_handler = fallback_hits.clone();
+        let fallback = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    *fallback_hits.lock().await += 1;
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "fallback-ok"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let fallback_base = spawn_upstream(fallback).await;
+
+        let mut pools = HashMap::new();
+        let mut credential_sets = HashMap::new();
+        for (name, api_base, key) in [
+            ("a_primary", primary_base, "primary-key"),
+            ("b_fallback", fallback_base, "fallback-key"),
+        ] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(&format!("{key}\n")),
+                },
+            );
+            pools.insert(
+                name.to_string(),
+                PoolConfig {
+                    enabled: true,
+                    account: None,
+                    policy_profile: None,
+                    routing_profile: None,
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    api_base,
+                    credential_set,
+                    auth_header: "authorization".to_string(),
+                    auth_prefix: "Bearer ".to_string(),
+                    error_rules: ErrorRulesConfig::default(),
+                },
+            );
+        }
+        let state = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "test-client".to_string(),
+                token: fixture_client_token(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: fixture_admin_token(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path: None,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: TimeoutConfig::default(),
+            routing: crate::config::RoutingConfig::default(),
+            default_pool: Some("a_primary".to_string()),
+            providers: HashMap::new(),
+            accounts: HashMap::new(),
+            credential_sets,
+            model_routes: HashMap::from([priority_route(
+                "gpt-partial-output",
+                ["a_primary", "b_fallback"],
+            )]),
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: std::collections::HashMap::from([(
+                "default-routing".to_string(),
+                crate::config::RoutingProfileConfig {
+                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry:
+                        crate::config::SameRequestCredentialRetryConfig {
+                            enabled: false,
+                            max_retries: 0,
+                        },
+                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            pools,
+        }
+        .resolve()
+        .unwrap();
+
+        let app_state = AppState::new(state).unwrap();
+
+        crate::routing::clear_test_transition_snapshots();
+        let response = app(app_state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-partial-output","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(to_bytes(response.into_body(), 4096).await.is_err());
+        assert_eq!(*fallback_hits.lock().await, 0);
+        let snapshots = crate::routing::take_test_transition_snapshots();
+        assert!(
+            snapshots.iter().any(|snapshot| {
+                snapshot.requested_model.as_deref() == Some("gpt-partial-output")
+                    && snapshot.channel_id == ChannelId("a_primary".to_string())
+                    && snapshot.partial_output_started
+            }),
+            "body stream failure after committed output must enter retry decision with partial_output_started=true"
+        );
+        let telemetry = app_state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned");
+        let events = telemetry.snapshot();
+        let terminal_body_error_observed = events.iter().any(|event| {
+            matches!(
+                event,
+                RoutingTelemetry::UpstreamFailureObserved { failure, .. }
+                    if failure.directive == "return_error"
+                        && failure.failure_source == "local_transport"
+                        && failure.duplicate_charge_risk == "none"
+                        && failure.denial_reason.as_deref() == Some("partial_output_started")
+                        && !failure.retry_pressure_accounted
+            )
+        });
+        let counters = telemetry.retry_pressure_snapshot();
+        drop(telemetry);
+        assert!(
+            terminal_body_error_observed,
+            "body stream failure after committed output must remain terminal telemetry"
+        );
+        assert_eq!(counters.by_directive.retry_route_target, 0);
+        assert_eq!(counters.by_directive.return_error, 0);
+        assert_eq!(
+            counters.by_denial_reason.get("partial_output_started"),
+            None
+        );
     }
 
     #[tokio::test]

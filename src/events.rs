@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -146,7 +146,7 @@ pub enum RoutingTelemetry {
     UpstreamFailureObserved {
         request_id: String,
         channel_id: String,
-        failure: UpstreamFailureTelemetry,
+        failure: Box<UpstreamFailureTelemetry>,
     },
     TransitionApplied {
         request_id: String,
@@ -177,6 +177,11 @@ pub enum RoutingTelemetry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpstreamFailureTelemetry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_model: Option<String>,
+    pub credential_id_hash: String,
+    pub attempt: usize,
+    pub failure_source: String,
     pub failure_kind: String,
     pub failure_scope: String,
     pub retryable: bool,
@@ -191,9 +196,83 @@ pub struct UpstreamFailureTelemetry {
     pub retry_after_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_seconds: Option<u64>,
+    pub directive: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denial_reason: Option<String>,
+    pub duplicate_charge_risk: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_deadline_remaining_ms: Option<u64>,
+    pub retry_pressure_accounted: bool,
     pub retry_decision: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_decision_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetryPressureDirectiveCounters {
+    pub retry_credential: u64,
+    pub retry_route_target: u64,
+    pub return_error: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetryPressureDuplicateChargeRiskCounters {
+    pub none: u64,
+    pub known_no_charge: u64,
+    pub unknown: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetryPressureCounters {
+    pub by_directive: RetryPressureDirectiveCounters,
+    pub by_denial_reason: BTreeMap<String, u64>,
+    pub by_duplicate_charge_risk: RetryPressureDuplicateChargeRiskCounters,
+}
+
+impl RetryPressureCounters {
+    fn observe(&mut self, failure: &UpstreamFailureTelemetry) {
+        if !failure.retry_pressure_accounted {
+            return;
+        }
+        match failure.directive.as_str() {
+            "retry_credential" => {
+                self.by_directive.retry_credential =
+                    self.by_directive.retry_credential.saturating_add(1)
+            }
+            "retry_route_target" => {
+                self.by_directive.retry_route_target =
+                    self.by_directive.retry_route_target.saturating_add(1)
+            }
+            "return_error" | "return_current_error" => {
+                self.by_directive.return_error = self.by_directive.return_error.saturating_add(1)
+            }
+            _ => {}
+        }
+        if let Some(denial_reason) = failure.denial_reason.as_deref() {
+            let count = self
+                .by_denial_reason
+                .entry(denial_reason.to_string())
+                .or_default();
+            *count = count.saturating_add(1);
+        }
+        match failure.duplicate_charge_risk.as_str() {
+            "none" => {
+                self.by_duplicate_charge_risk.none =
+                    self.by_duplicate_charge_risk.none.saturating_add(1)
+            }
+            "known_no_charge" => {
+                self.by_duplicate_charge_risk.known_no_charge = self
+                    .by_duplicate_charge_risk
+                    .known_no_charge
+                    .saturating_add(1)
+            }
+            "unknown" => {
+                self.by_duplicate_charge_risk.unknown =
+                    self.by_duplicate_charge_risk.unknown.saturating_add(1)
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +305,16 @@ impl RoutingTelemetryBuffer {
 
     pub fn snapshot(&self) -> Vec<RoutingTelemetry> {
         self.events.iter().cloned().collect()
+    }
+
+    pub fn retry_pressure_snapshot(&self) -> RetryPressureCounters {
+        let mut counters = RetryPressureCounters::default();
+        for event in &self.events {
+            if let RoutingTelemetry::UpstreamFailureObserved { failure, .. } = event {
+                counters.observe(failure);
+            }
+        }
+        counters
     }
 }
 
@@ -1314,7 +1403,7 @@ mod tests {
         buffer.push(RoutingTelemetry::UpstreamFailureObserved {
             request_id: "req-2".to_string(),
             channel_id: "channel-a".to_string(),
-            failure: test_failure_telemetry(),
+            failure: Box::new(test_failure_telemetry()),
         });
         buffer.push(RoutingTelemetry::TransitionApplied {
             request_id: "req-3".to_string(),
@@ -1327,7 +1416,7 @@ mod tests {
                 RoutingTelemetry::UpstreamFailureObserved {
                     request_id: "req-2".to_string(),
                     channel_id: "channel-a".to_string(),
-                    failure: test_failure_telemetry(),
+                    failure: Box::new(test_failure_telemetry()),
                 },
                 RoutingTelemetry::TransitionApplied {
                     request_id: "req-3".to_string(),
@@ -1373,7 +1462,7 @@ mod tests {
         let event = RoutingTelemetry::UpstreamFailureObserved {
             request_id: "req-2".to_string(),
             channel_id: "channel-a".to_string(),
-            failure: test_failure_telemetry(),
+            failure: Box::new(test_failure_telemetry()),
         };
 
         let value = serde_json::to_value(event).unwrap();
@@ -1389,12 +1478,81 @@ mod tests {
         assert_eq!(value["failure"]["adaptation_rule_id"], "rule-a");
         assert_eq!(value["failure"]["retry_after_source"], "delta_seconds");
         assert_eq!(value["failure"]["cooldown_seconds"], 30);
+        assert_eq!(value["failure"]["public_model"], "gpt-test");
+        assert_eq!(value["failure"]["credential_id_hash"], "hash-a");
+        assert_eq!(value["failure"]["attempt"], 2);
+        assert_eq!(value["failure"]["failure_source"], "upstream_transaction");
+        assert_eq!(value["failure"]["directive"], "retry_credential");
+        assert!(value["failure"]["denial_reason"].is_null());
+        assert_eq!(value["failure"]["duplicate_charge_risk"], "unknown");
+        assert_eq!(value["failure"]["effective_deadline_remaining_ms"], 42);
+        assert_eq!(value["failure"]["retry_pressure_accounted"], true);
         assert_eq!(value["failure"]["retry_decision"], "retry_credential");
         assert!(value["failure"]["retry_decision_reason"].is_null());
         assert!(value.get("credential_id").is_none());
         assert!(value["failure"].get("upstream_code").is_none());
         assert!(value["failure"].get("upstream_limit_type").is_none());
         assert!(!value.to_string().contains("sk-"));
+    }
+
+    #[test]
+    fn routing_telemetry_buffer_counts_retry_pressure_from_bounded_window() {
+        let mut buffer = RoutingTelemetryBuffer::new(1);
+        buffer.push(RoutingTelemetry::UpstreamFailureObserved {
+            request_id: "req-1".to_string(),
+            channel_id: "channel-a".to_string(),
+            failure: Box::new(test_failure_telemetry()),
+        });
+        let mut terminal = test_failure_telemetry();
+        terminal.directive = "return_error".to_string();
+        terminal.retry_decision = "return_current_error".to_string();
+        terminal.denial_reason = Some("attempt_limit_reached".to_string());
+        terminal.retry_decision_reason = Some("attempt_limit_reached".to_string());
+        terminal.duplicate_charge_risk = "none".to_string();
+        buffer.push(RoutingTelemetry::UpstreamFailureObserved {
+            request_id: "req-2".to_string(),
+            channel_id: "channel-a".to_string(),
+            failure: Box::new(terminal),
+        });
+
+        let counters = buffer.retry_pressure_snapshot();
+        assert_eq!(buffer.snapshot().len(), 1);
+        assert_eq!(counters.by_directive.retry_credential, 0);
+        assert_eq!(counters.by_directive.return_error, 1);
+        assert_eq!(
+            counters.by_denial_reason.get("attempt_limit_reached"),
+            Some(&1)
+        );
+        assert_eq!(counters.by_duplicate_charge_risk.unknown, 0);
+        assert_eq!(counters.by_duplicate_charge_risk.none, 1);
+    }
+
+    #[test]
+    fn routing_telemetry_buffer_skips_unaccounted_retry_pressure_events() {
+        let mut buffer = RoutingTelemetryBuffer::new(2);
+        let mut unaccounted = test_failure_telemetry();
+        unaccounted.failure_source = "local_transport".to_string();
+        unaccounted.directive = "return_error".to_string();
+        unaccounted.retry_decision = "return_current_error".to_string();
+        unaccounted.denial_reason = Some("partial_output_started".to_string());
+        unaccounted.retry_decision_reason = Some("partial_output_started".to_string());
+        unaccounted.retry_pressure_accounted = false;
+
+        buffer.push(RoutingTelemetry::UpstreamFailureObserved {
+            request_id: "req-1".to_string(),
+            channel_id: "channel-a".to_string(),
+            failure: Box::new(unaccounted),
+        });
+
+        let events = buffer.snapshot();
+        let counters = buffer.retry_pressure_snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(counters.by_directive.return_error, 0);
+        assert_eq!(
+            counters.by_denial_reason.get("partial_output_started"),
+            None
+        );
+        assert_eq!(counters.by_duplicate_charge_risk.none, 0);
     }
 
     #[test]
@@ -1420,6 +1578,10 @@ mod tests {
 
     fn test_failure_telemetry() -> UpstreamFailureTelemetry {
         UpstreamFailureTelemetry {
+            public_model: Some("gpt-test".to_string()),
+            credential_id_hash: "hash-a".to_string(),
+            attempt: 2,
+            failure_source: "upstream_transaction".to_string(),
             failure_kind: "rate_limited".to_string(),
             failure_scope: "credential".to_string(),
             retryable: true,
@@ -1430,6 +1592,11 @@ mod tests {
             adaptation_rule_id: Some("rule-a".to_string()),
             retry_after_source: Some("delta_seconds".to_string()),
             cooldown_seconds: Some(30),
+            directive: "retry_credential".to_string(),
+            denial_reason: None,
+            duplicate_charge_risk: "unknown".to_string(),
+            effective_deadline_remaining_ms: Some(42),
+            retry_pressure_accounted: true,
             retry_decision: "retry_credential".to_string(),
             retry_decision_reason: None,
         }
