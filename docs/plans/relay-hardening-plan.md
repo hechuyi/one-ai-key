@@ -96,12 +96,12 @@ OpenTelemetry contributes the event-contract lesson: events need stable names, b
 
 **Purpose:** create the security, health, audit, config-validation, local-build, and release gates that every later phase depends on.
 
-**Likely files:** `src/config.rs`, `src/auth.rs`, `src/main.rs`, `src/events.rs`, `src/management_runtime.rs`, `src/management_alerts.rs`, `docs/architecture.md`, `README.md`, `scripts/local-ci.sh`, `scripts/build-release-x86_64-linux.sh`.
+**Likely files:** `src/config.rs`, `src/auth.rs`, `src/main.rs`, `src/events.rs`, `src/management_runtime.rs`, `src/management_alerts.rs`, `docs/architecture.md`, `docs/release-build.md`, `README.md`, `scripts/local-ci.sh`, `scripts/build-release-x86_64-linux-docker.sh`, `scripts/build-release-x86_64-linux.sh`.
 
 ### 0A. Local Build And Release Harness
 
 - [ ] Add or standardize `scripts/local-ci.sh` as the canonical local verification entrypoint. It must run `cargo fmt -- --check`, `cargo check --locked`, `cargo clippy --locked -- -D warnings`, and `cargo test --locked`.
-- [ ] Add or standardize `scripts/build-release-x86_64-linux.sh` as the canonical release-artifact build entrypoint. It must run in the local x86_64 NixOS container, produce the binary artifact locally, and write a SHA256 file.
+- [ ] Add or standardize `scripts/build-release-x86_64-linux-docker.sh` as the canonical host-side release-artifact build entrypoint. It must enter the local x86_64 Linux Nix container, produce the binary artifact locally, and write a SHA256 file. `scripts/build-release-x86_64-linux.sh` is the guarded container-side entrypoint, not the host release gate.
 - [ ] If the local x86_64 NixOS container is not available, the phase is blocked. Do not SSH to a server, use a remote builder, or declare a phase complete from host-only tests.
 - [ ] Secret-backed integration tests must read ignored local config or env vars and must skip with a clear message when absent. They must not hardcode keys.
 
@@ -334,8 +334,13 @@ Every phase must run:
 
 ```bash
 scripts/local-ci.sh
-scripts/build-release-x86_64-linux.sh
+scripts/build-release-x86_64-linux-docker.sh
 ```
+
+The Docker wrapper is the host-side release gate. It enters the local x86_64
+Linux Nix container and calls `scripts/build-release-x86_64-linux.sh` there.
+Do not run the inner script on the macOS host, and do not replace this gate
+with a server build.
 
 Until Phase 0 creates those scripts, the equivalent manual commands are:
 
