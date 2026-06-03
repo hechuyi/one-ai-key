@@ -45,6 +45,46 @@ pub struct ManagementEventActor {
     pub role: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ManagementAuditEvent {
+    pub kind: String,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub channel_id: String,
+    pub credential_id: String,
+    pub outcome: String,
+    pub request_id: Option<String>,
+    pub generation: Option<u64>,
+    pub reason_code: String,
+    pub actor: Option<ManagementEventActor>,
+}
+
+impl ManagementAuditEvent {
+    pub fn applied(
+        kind: impl Into<String>,
+        resource_type: impl Into<String>,
+        resource_id: impl Into<String>,
+        reason_code: impl Into<String>,
+        actor: Option<ManagementEventActor>,
+    ) -> Self {
+        let kind = kind.into();
+        Self {
+            action: kind.clone(),
+            kind,
+            resource_type: resource_type.into(),
+            resource_id: resource_id.into(),
+            channel_id: String::new(),
+            credential_id: String::new(),
+            outcome: "applied".to_string(),
+            request_id: None,
+            generation: None,
+            reason_code: reason_code.into(),
+            actor,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainEvent {
     Expired {
@@ -640,6 +680,15 @@ impl EventLog {
         .await
     }
 
+    pub async fn record_audit_event(&self, audit: ManagementAuditEvent) -> anyhow::Result<()> {
+        let log = self.clone();
+        tokio::task::spawn_blocking(move || {
+            log.apply_record_delay();
+            log.record_audit_event_now(audit)
+        })
+        .await?
+    }
+
     async fn record_event_transaction<T, F>(
         &self,
         kind: impl Into<String>,
@@ -696,29 +745,66 @@ impl EventLog {
         _reason: String,
         actor: Option<ManagementEventActor>,
     ) -> anyhow::Result<()> {
-        self.apply_append_delay();
-        let mut inner = self.inner.lock().unwrap();
-        inner.next_id += 1;
-        let id = inner.next_id;
         let kind = kind.into();
         let reason_code = management_event_reason_code(&kind);
         let (resource_type, resource_id) =
             management_event_resource(&kind, &channel_id, &credential_id);
-        let event = ManagementEvent {
-            id,
-            created_at_unix_seconds: current_unix_seconds(),
+        self.record_audit_event_now(ManagementAuditEvent {
             action: kind.clone(),
+            kind,
             resource_type,
             resource_id,
+            channel_id,
+            credential_id,
             outcome: "applied".to_string(),
             request_id: None,
             generation: None,
-            kind,
-            channel_id,
-            credential_id,
-            reason: reason_code.clone(),
             reason_code,
             actor,
+        })
+    }
+
+    fn record_audit_event_now(&self, audit: ManagementAuditEvent) -> anyhow::Result<()> {
+        self.apply_append_delay();
+        let mut inner = self.inner.lock().unwrap();
+        inner.next_id += 1;
+        let id = inner.next_id;
+        let reason_code = if audit.reason_code.is_empty() {
+            management_event_reason_code(&audit.kind)
+        } else {
+            audit.reason_code
+        };
+        let event = ManagementEvent {
+            id,
+            created_at_unix_seconds: current_unix_seconds(),
+            action: if audit.action.is_empty() {
+                audit.kind.clone()
+            } else {
+                audit.action
+            },
+            resource_type: if audit.resource_type.is_empty() {
+                management_event_resource(&audit.kind, &audit.channel_id, &audit.credential_id).0
+            } else {
+                audit.resource_type
+            },
+            resource_id: if audit.resource_id.is_empty() {
+                management_event_resource(&audit.kind, &audit.channel_id, &audit.credential_id).1
+            } else {
+                audit.resource_id
+            },
+            outcome: if audit.outcome.is_empty() {
+                "applied".to_string()
+            } else {
+                audit.outcome
+            },
+            request_id: audit.request_id,
+            generation: audit.generation,
+            kind: audit.kind,
+            channel_id: audit.channel_id,
+            credential_id: audit.credential_id,
+            reason: reason_code.clone(),
+            reason_code,
+            actor: audit.actor,
         };
         if let Some(path) = &self.path {
             if let Some(parent) = path.parent() {
@@ -825,6 +911,10 @@ fn management_event_reason_code(kind: &str) -> String {
         "credential_cooldown_cleared" => "manual_clear_cooldown",
         "channel_disabled" => "manual_channel_disable",
         "channel_enabled" => "manual_channel_enable",
+        "client_token_created" => "manual_client_token_create",
+        "client_token_scope_updated" => "manual_client_token_scope_update",
+        "client_token_disabled" => "manual_client_token_disable",
+        "client_token_enabled" => "manual_client_token_enable",
         other => other,
     }
     .to_string()
@@ -837,6 +927,8 @@ fn management_event_resource(
 ) -> (String, String) {
     if kind.starts_with("credential_") {
         ("credential".to_string(), credential_id.to_string())
+    } else if kind.starts_with("client_token_") {
+        ("client_token".to_string(), channel_id.to_string())
     } else if kind.starts_with("channel_") {
         ("channel".to_string(), channel_id.to_string())
     } else {

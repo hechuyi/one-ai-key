@@ -10448,6 +10448,21 @@ pools:
         assert_eq!(created["token"]["name"], "created-client");
         assert_eq!(created["token"]["enabled"], true);
 
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["events"][0]["kind"], "client_token_created");
+        assert_eq!(events["events"][0]["action"], "client_token_created");
+        assert_eq!(events["events"][0]["resource_type"], "client_token");
+        assert_eq!(events["events"][0]["resource_id"], created["token"]["id"]);
+        assert_eq!(events["events"][0]["outcome"], "applied");
+        assert_eq!(
+            events["events"][0]["reason_code"],
+            "manual_client_token_create"
+        );
+        assert_eq!(events["events"][0]["actor"]["role"], "admin");
+        assert!(!events
+            .to_string()
+            .contains(fixture_created_client_token().as_str()));
+
         let forwarded = app
             .oneshot(
                 Request::builder()
@@ -10517,7 +10532,21 @@ pools:
             .unwrap();
         assert_eq!(disable.status(), StatusCode::OK);
 
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["events"][0]["kind"], "client_token_created");
+        assert_eq!(events["events"][1]["kind"], "client_token_disabled");
+        assert_eq!(events["events"][1]["resource_type"], "client_token");
+        assert_eq!(events["events"][1]["resource_id"], token_id);
+        assert_eq!(
+            events["events"][1]["reason_code"],
+            "manual_client_token_disable"
+        );
+        assert!(!events
+            .to_string()
+            .contains(fixture_temporary_client_token().as_str()));
+
         let rejected = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -10535,6 +10564,33 @@ pools:
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let enable = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/management/client-tokens/{token_id}/enable"))
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enable.status(), StatusCode::OK);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["events"][2]["kind"], "client_token_enabled");
+        assert_eq!(events["events"][2]["resource_type"], "client_token");
+        assert_eq!(events["events"][2]["resource_id"], token_id);
+        assert_eq!(
+            events["events"][2]["reason_code"],
+            "manual_client_token_enable"
+        );
+        assert!(!events
+            .to_string()
+            .contains(fixture_temporary_client_token().as_str()));
     }
 
     #[tokio::test]
@@ -10614,6 +10670,19 @@ pools:
         assert_eq!(updated["token"]["allowed_model_groups"][0], "gpt-after");
         assert_eq!(updated["token"]["allowed_channels"][0], "test");
 
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["events"][0]["kind"], "client_token_created");
+        assert_eq!(events["events"][1]["kind"], "client_token_scope_updated");
+        assert_eq!(events["events"][1]["resource_type"], "client_token");
+        assert_eq!(events["events"][1]["resource_id"], token_id);
+        assert_eq!(
+            events["events"][1]["reason_code"],
+            "manual_client_token_scope_update"
+        );
+        assert!(!events
+            .to_string()
+            .contains(fixture_scoped_client_token().as_str()));
+
         let rejected_old_scope = app
             .clone()
             .oneshot(
@@ -10652,6 +10721,99 @@ pools:
             .await
             .unwrap();
         assert_eq!(forwarded_new_scope.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn failed_event_write_does_not_create_client_token() {
+        let blocking_parent = temp_keys_file("not a directory\n");
+        let event_log_path = blocking_parent.join("events.jsonl");
+        let state = test_state_with_api_base_and_event_log_path(
+            "https://example.com/v1",
+            Some(event_log_path),
+        );
+        let app = app(state.clone());
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/client-tokens")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "audit-failure-client",
+                            "token": fixture_temporary_client_token()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let tokens = management_response_json(&app, "/management/client-tokens").await;
+        assert!(tokens["client_tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|token| token["name"] != "audit-failure-client"));
+        assert!(state
+            .client_tokens
+            .read()
+            .unwrap()
+            .iter()
+            .all(|token| token.name != "audit-failure-client"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_client_token_create_does_not_emit_applied_audit() {
+        let state = test_state_with_api_base("https://example.com/v1");
+        let app = app(state);
+        let body = serde_json::json!({
+            "name": "duplicate-client",
+            "token": fixture_temporary_client_token()
+        })
+        .to_string();
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/client-tokens")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let duplicate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/client-tokens")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 1);
+        assert_eq!(events["events"][0]["kind"], "client_token_created");
+        assert!(!events
+            .to_string()
+            .contains(fixture_temporary_client_token().as_str()));
     }
 
     #[tokio::test]

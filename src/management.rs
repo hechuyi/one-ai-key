@@ -281,6 +281,7 @@ pub async fn create_client_token(
     }
     match create_client_token_response_for_state(
         &state,
+        _actor,
         payload.name,
         payload.token,
         payload.allowed_model_groups,
@@ -312,6 +313,7 @@ pub async fn update_client_token_scope(
     }
     match update_client_token_scope_response_for_state(
         &state,
+        _actor,
         &id,
         payload.allowed_model_groups,
         payload.allowed_channels,
@@ -334,7 +336,7 @@ pub async fn disable_client_token(
         Err(resp) => return *resp,
     };
     let _actor = management_actor(&principal);
-    match set_client_token_enabled_response_for_state(&state, &id, false).await {
+    match set_client_token_enabled_response_for_state(&state, _actor, &id, false).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
@@ -351,7 +353,7 @@ pub async fn enable_client_token(
         Err(resp) => return *resp,
     };
     let _actor = management_actor(&principal);
-    match set_client_token_enabled_response_for_state(&state, &id, true).await {
+    match set_client_token_enabled_response_for_state(&state, _actor, &id, true).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }

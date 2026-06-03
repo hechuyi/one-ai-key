@@ -4,7 +4,8 @@ use serde::Serialize;
 
 use crate::{
     client_token_store::{ClientTokenCreate, ClientTokenScopeUpdate},
-    config::ResolvedClientToken,
+    config::{hash_token, stable_id, ResolvedClientToken},
+    events::{ManagementAuditEvent, ManagementEventActor},
     management_errors::{client_token_store_error, ManagementServiceError},
     state::AppState,
 };
@@ -32,12 +33,30 @@ pub fn runtime_client_tokens_response(state: &AppState) -> ClientTokensResponse 
 
 pub async fn create_client_token_response_for_state(
     state: &AppState,
+    actor: ManagementEventActor,
     name: String,
     token: String,
     allowed_model_groups: Vec<String>,
     allowed_channels: Vec<String>,
 ) -> Result<ClientTokenMutationResponse, ManagementServiceError> {
     let create = client_token_create(state, name, token, allowed_model_groups, allowed_channels)?;
+    let token_id = stable_id("client", create.name.trim());
+    let token_hash = hash_token(create.token.trim());
+    if runtime_client_token_exists(state, &token_id)
+        || runtime_client_token_hash_exists(state, &token_hash)
+    {
+        return Err(ManagementServiceError::Conflict(
+            "client token already exists".to_string(),
+        ));
+    }
+    record_client_token_audit(
+        state,
+        actor,
+        "client_token_created",
+        &token_id,
+        "manual_client_token_create",
+    )
+    .await?;
     let created = state
         .client_token_store
         .create_token(create)
@@ -49,9 +68,21 @@ pub async fn create_client_token_response_for_state(
 
 pub async fn set_client_token_enabled_response_for_state(
     state: &AppState,
+    actor: ManagementEventActor,
     token_id: &str,
     enabled: bool,
 ) -> Result<ClientTokenMutationResponse, ManagementServiceError> {
+    if !runtime_client_token_exists(state, token_id) {
+        return Err(ManagementServiceError::NotFound(
+            "unknown client token".to_string(),
+        ));
+    }
+    let (kind, reason_code) = if enabled {
+        ("client_token_enabled", "manual_client_token_enable")
+    } else {
+        ("client_token_disabled", "manual_client_token_disable")
+    };
+    record_client_token_audit(state, actor, kind, token_id, reason_code).await?;
     let updated = state
         .client_token_store
         .set_enabled(token_id.to_string(), enabled)
@@ -63,11 +94,25 @@ pub async fn set_client_token_enabled_response_for_state(
 
 pub async fn update_client_token_scope_response_for_state(
     state: &AppState,
+    actor: ManagementEventActor,
     token_id: &str,
     allowed_model_groups: Option<Vec<String>>,
     allowed_channels: Option<Vec<String>>,
 ) -> Result<ClientTokenMutationResponse, ManagementServiceError> {
     let scope_update = client_token_scope_update(state, allowed_model_groups, allowed_channels)?;
+    if !runtime_client_token_exists(state, token_id) {
+        return Err(ManagementServiceError::NotFound(
+            "unknown client token".to_string(),
+        ));
+    }
+    record_client_token_audit(
+        state,
+        actor,
+        "client_token_scope_updated",
+        token_id,
+        "manual_client_token_scope_update",
+    )
+    .await?;
     let updated = state
         .client_token_store
         .update_scope(token_id.to_string(), scope_update)
@@ -75,6 +120,47 @@ pub async fn update_client_token_scope_response_for_state(
         .map_err(client_token_store_error)?;
     replace_runtime_client_token(state, updated.clone());
     Ok(client_token_mutation_response(&updated))
+}
+
+fn runtime_client_token_exists(state: &AppState, token_id: &str) -> bool {
+    state
+        .client_tokens
+        .read()
+        .expect("client token registry lock poisoned")
+        .iter()
+        .any(|token| token.id == token_id)
+}
+
+fn runtime_client_token_hash_exists(state: &AppState, token_hash: &str) -> bool {
+    state
+        .client_tokens
+        .read()
+        .expect("client token registry lock poisoned")
+        .iter()
+        .any(|token| token.token_hash == token_hash)
+}
+
+async fn record_client_token_audit(
+    state: &AppState,
+    actor: ManagementEventActor,
+    kind: &'static str,
+    token_id: &str,
+    reason_code: &'static str,
+) -> Result<(), ManagementServiceError> {
+    state
+        .events
+        .record_audit_event(ManagementAuditEvent::applied(
+            kind,
+            "client_token",
+            token_id,
+            reason_code,
+            Some(actor),
+        ))
+        .await
+        .map_err(|err| ManagementServiceError::EventAppendFailed {
+            message: err.to_string(),
+            stale_history_id: None,
+        })
 }
 
 pub fn replace_runtime_client_token(state: &AppState, updated: ResolvedClientToken) {
