@@ -1,5 +1,6 @@
 # Build outputs.
 /target/
+/dist/
 /rust_out
 
 # Runtime state and local databases.
