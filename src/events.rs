@@ -5,18 +5,35 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(test)]
 use std::time::Duration;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManagementEvent {
     pub id: u64,
+    #[serde(default)]
+    pub created_at_unix_seconds: u64,
     pub kind: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub resource_type: String,
+    #[serde(default)]
+    pub resource_id: String,
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub generation: Option<u64>,
     pub channel_id: String,
     pub credential_id: String,
     pub reason: String,
+    #[serde(default)]
+    pub reason_code: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<ManagementEventActor>,
 }
@@ -173,53 +190,102 @@ impl RoutingTelemetryBuffer {
 }
 
 impl ManagementEvent {
+    pub fn audit_action(&self) -> String {
+        if self.action.is_empty() {
+            self.kind.clone()
+        } else {
+            self.action.clone()
+        }
+    }
+
+    pub fn audit_resource_type(&self) -> String {
+        if self.resource_type.is_empty() {
+            management_event_resource(&self.kind, &self.channel_id, &self.credential_id).0
+        } else {
+            self.resource_type.clone()
+        }
+    }
+
+    pub fn audit_resource_id(&self) -> String {
+        if self.resource_id.is_empty() {
+            management_event_resource(&self.kind, &self.channel_id, &self.credential_id).1
+        } else {
+            self.resource_id.clone()
+        }
+    }
+
+    pub fn audit_outcome(&self) -> String {
+        if self.outcome.is_empty() {
+            "applied".to_string()
+        } else {
+            self.outcome.clone()
+        }
+    }
+
+    pub fn audit_reason_code(&self) -> String {
+        if self.reason_code.is_empty() {
+            management_event_reason_code(&self.kind)
+        } else {
+            self.reason_code.clone()
+        }
+    }
+
+    fn replay_reason(&self) -> String {
+        if self.reason_code.is_empty() {
+            self.reason.clone()
+        } else {
+            self.reason_code.clone()
+        }
+    }
+
     pub fn to_domain_event(&self) -> Option<DomainEvent> {
+        let reason = self.replay_reason();
         match self.kind.as_str() {
             "credential_expired" => Some(DomainEvent::Expired {
                 id: self.id,
                 channel_id: self.channel_id.clone(),
                 credential_id: self.credential_id.clone(),
-                reason: self.reason.clone(),
+                reason: reason.clone(),
             }),
             "credential_quota_exhausted" => Some(DomainEvent::QuotaExhausted {
                 id: self.id,
                 channel_id: self.channel_id.clone(),
                 credential_id: self.credential_id.clone(),
-                reason: self.reason.clone(),
+                reason: reason.clone(),
             }),
             "credential_restored" => Some(DomainEvent::Restored {
                 id: self.id,
                 channel_id: self.channel_id.clone(),
                 credential_id: self.credential_id.clone(),
-                reason: self.reason.clone(),
+                reason: reason.clone(),
             }),
             "credential_disabled" => Some(DomainEvent::Disabled {
                 id: self.id,
                 channel_id: self.channel_id.clone(),
                 credential_id: self.credential_id.clone(),
-                reason: self.reason.clone(),
+                reason: reason.clone(),
             }),
             "credential_enabled" => Some(DomainEvent::Enabled {
                 id: self.id,
                 channel_id: self.channel_id.clone(),
                 credential_id: self.credential_id.clone(),
-                reason: self.reason.clone(),
+                reason: reason.clone(),
             }),
             "credential_cooldown_cleared" => Some(DomainEvent::CooldownCleared {
                 id: self.id,
                 channel_id: self.channel_id.clone(),
                 credential_id: self.credential_id.clone(),
-                reason: self.reason.clone(),
+                reason: reason.clone(),
             }),
             "channel_disabled" => Some(DomainEvent::ChannelDisabled {
                 id: self.id,
                 channel_id: self.channel_id.clone(),
-                reason: self.reason.clone(),
+                reason: reason.clone(),
             }),
             "channel_enabled" => Some(DomainEvent::ChannelEnabled {
                 id: self.id,
                 channel_id: self.channel_id.clone(),
-                reason: self.reason.clone(),
+                reason,
             }),
             _ => None,
         }
@@ -627,19 +693,31 @@ impl EventLog {
         kind: impl Into<String>,
         channel_id: String,
         credential_id: String,
-        reason: String,
+        _reason: String,
         actor: Option<ManagementEventActor>,
     ) -> anyhow::Result<()> {
         self.apply_append_delay();
         let mut inner = self.inner.lock().unwrap();
         inner.next_id += 1;
         let id = inner.next_id;
+        let kind = kind.into();
+        let reason_code = management_event_reason_code(&kind);
+        let (resource_type, resource_id) =
+            management_event_resource(&kind, &channel_id, &credential_id);
         let event = ManagementEvent {
             id,
-            kind: kind.into(),
+            created_at_unix_seconds: current_unix_seconds(),
+            action: kind.clone(),
+            resource_type,
+            resource_id,
+            outcome: "applied".to_string(),
+            request_id: None,
+            generation: None,
+            kind,
             channel_id,
             credential_id,
-            reason,
+            reason: reason_code.clone(),
+            reason_code,
             actor,
         };
         if let Some(path) = &self.path {
@@ -730,6 +808,42 @@ impl EventLog {
     }
 }
 
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn management_event_reason_code(kind: &str) -> String {
+    match kind {
+        "credential_expired" => "manual_expire",
+        "credential_quota_exhausted" => "manual_quota_exhaust",
+        "credential_restored" => "manual_restore",
+        "credential_disabled" => "manual_disable",
+        "credential_enabled" => "manual_enable",
+        "credential_cooldown_cleared" => "manual_clear_cooldown",
+        "channel_disabled" => "manual_channel_disable",
+        "channel_enabled" => "manual_channel_enable",
+        other => other,
+    }
+    .to_string()
+}
+
+fn management_event_resource(
+    kind: &str,
+    channel_id: &str,
+    credential_id: &str,
+) -> (String, String) {
+    if kind.starts_with("credential_") {
+        ("credential".to_string(), credential_id.to_string())
+    } else if kind.starts_with("channel_") {
+        ("channel".to_string(), channel_id.to_string())
+    } else {
+        ("management".to_string(), channel_id.to_string())
+    }
+}
+
 fn bounded_event_window(
     events: Vec<ManagementEvent>,
     window_capacity: usize,
@@ -807,9 +921,85 @@ mod tests {
         assert_eq!(events[0].kind, "credential_expired");
         assert_eq!(events[0].channel_id, "channel-a");
         assert_eq!(events[0].credential_id, "cred-a");
-        assert_eq!(events[0].reason, "manual");
+        assert_eq!(events[0].reason, "manual_expire");
+        assert_eq!(events[0].reason_code, "manual_expire");
         assert_eq!(events[1].kind, "credential_restored");
-        assert_eq!(events[1].reason, "manual restore");
+        assert_eq!(events[1].reason, "manual_restore");
+        assert_eq!(events[1].reason_code, "manual_restore");
+    }
+
+    #[tokio::test]
+    async fn event_log_writes_stable_audit_schema_without_freeform_reason() {
+        let mut path = std::env::temp_dir();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("key-pool-router-audit-schema-{suffix}.jsonl"));
+
+        let log = EventLog::open(Some(path.clone())).unwrap();
+        log.record_credential_expired_transaction(
+            ManagementEventActor {
+                id: "principal-admin".to_string(),
+                name: "admin".to_string(),
+                role: "admin".to_string(),
+            },
+            "channel-a",
+            "cred-a",
+            "freeform operator note",
+            |pending| {
+                pending.append()?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("freeform operator note"));
+        let value = serde_json::from_str::<serde_json::Value>(raw.lines().next().unwrap()).unwrap();
+        assert!(value["created_at_unix_seconds"].as_u64().unwrap() > 0);
+        assert_eq!(value["actor"]["id"], "principal-admin");
+        assert_eq!(value["actor"]["role"], "admin");
+        assert_eq!(value["action"], "credential_expired");
+        assert_eq!(value["resource_type"], "credential");
+        assert_eq!(value["resource_id"], "cred-a");
+        assert_eq!(value["outcome"], "applied");
+        assert_eq!(value["reason_code"], "manual_expire");
+        assert_eq!(value["reason"], "manual_expire");
+        assert!(value.get("request_id").is_some());
+        assert!(value.get("generation").is_some());
+    }
+
+    #[test]
+    fn event_log_replays_legacy_records_without_audit_schema_fields() {
+        let mut path = std::env::temp_dir();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("key-pool-router-legacy-audit-{suffix}.jsonl"));
+        fs::write(
+            &path,
+            r#"{"id":7,"kind":"credential_expired","channel_id":"channel-a","credential_id":"cred-a","reason":"legacy operator reason"}"#,
+        )
+        .unwrap();
+
+        let reopened = EventLog::open(Some(path)).unwrap();
+        let events = reopened.snapshot_blocking();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].created_at_unix_seconds, 0);
+        assert_eq!(events[0].reason_code, "");
+        assert_eq!(
+            events[0].to_domain_event(),
+            Some(DomainEvent::Expired {
+                id: 7,
+                channel_id: "channel-a".to_string(),
+                credential_id: "cred-a".to_string(),
+                reason: "legacy operator reason".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -882,7 +1072,7 @@ mod tests {
 
         assert_eq!(total, 3);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].reason, "two");
+        assert_eq!(events[0].reason, "manual_restore");
     }
 
     #[test]
@@ -900,7 +1090,7 @@ mod tests {
         assert_eq!(total, 3);
         assert_eq!(log.len(), 3);
         let reasons: Vec<&str> = events.iter().map(|event| event.reason.as_str()).collect();
-        assert_eq!(reasons, vec!["two", "three"]);
+        assert_eq!(reasons, vec!["manual_restore", "manual_expire"]);
     }
 
     #[test]
@@ -927,7 +1117,10 @@ mod tests {
             .iter()
             .map(|event| event.reason.as_str())
             .collect();
-        assert_eq!(reasons, vec!["one", "two", "three"]);
+        assert_eq!(
+            reasons,
+            vec!["manual_expire", "manual_restore", "manual_expire"]
+        );
     }
 
     #[test]
@@ -943,6 +1136,7 @@ mod tests {
                 name: "local-admin".to_string(),
                 role: "admin".to_string(),
             }),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -965,6 +1159,7 @@ mod tests {
             credential_id: "cred-a".to_string(),
             reason: "quota evidence".to_string(),
             actor: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -987,6 +1182,7 @@ mod tests {
             credential_id: "cred-a".to_string(),
             reason: "manual reset".to_string(),
             actor: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -1009,6 +1205,7 @@ mod tests {
             credential_id: "cred-a".to_string(),
             reason: "audit only".to_string(),
             actor: None,
+            ..Default::default()
         };
 
         assert_eq!(event.to_domain_event(), None);

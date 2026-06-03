@@ -10170,6 +10170,12 @@ pools:
             .unwrap();
         assert_eq!(disabled.status(), StatusCode::OK);
 
+        let raw_event_log = fs::read_to_string(&event_log_path).unwrap();
+        assert!(!raw_event_log.contains("maintenance"));
+        let event = serde_json::from_str::<Value>(raw_event_log.lines().next().unwrap()).unwrap();
+        assert_eq!(event["reason"], "manual_channel_disable");
+        assert_eq!(event["reason_code"], "manual_channel_disable");
+
         let replayed_disabled = test_state_with_keys_api_base_and_event_log_path(
             "upstream-key\n",
             "https://example.com/v1",
@@ -10184,7 +10190,7 @@ pools:
                 .lock()
                 .unwrap(),
             ChannelHealth::Disabled {
-                reason: "maintenance".to_string()
+                reason: "manual_channel_disable".to_string()
             }
         );
 
@@ -18699,7 +18705,8 @@ pools:
         assert_eq!(event["kind"], "credential_expired");
         assert_eq!(event["channel_id"], "test");
         assert_eq!(event["credential_id"], credential_id);
-        assert_eq!(event["reason"], "manual test");
+        assert_eq!(event["reason"], "manual_expire");
+        assert_eq!(event["reason_code"], "manual_expire");
         assert_eq!(event["actor"]["name"], "local-admin");
         assert_eq!(event["actor"]["role"], "admin");
 
@@ -18758,7 +18765,8 @@ pools:
         let events = serde_json::from_str::<Value>(&events_body).unwrap();
         assert_eq!(events["events"][1]["kind"], "credential_restored");
         assert_eq!(events["events"][1]["credential_id"], credential_id);
-        assert_eq!(events["events"][1]["reason"], "manual restore");
+        assert_eq!(events["events"][1]["reason"], "manual_restore");
+        assert_eq!(events["events"][1]["reason_code"], "manual_restore");
         assert_eq!(events["events"][1]["actor"]["name"], "local-admin");
         assert_eq!(events["events"][1]["actor"]["role"], "admin");
     }
@@ -19042,11 +19050,14 @@ pools:
         let events = serde_json::from_str::<Value>(&events_body).unwrap();
         let event = &events["events"][0];
         assert_eq!(event["kind"], "credential_expired");
+        assert_eq!(event["action"], "credential_expired");
+        assert_eq!(event["resource_type"], "credential");
+        assert_eq!(event["resource_id"], credential_id);
+        assert_eq!(event["outcome"], "applied");
+        assert!(event["created_at_unix_seconds"].as_u64().unwrap() > 0);
         assert_eq!(event["credential_id"], credential_id);
-        assert_eq!(
-            event["reason"],
-            "手动 manual key rotation token expired token=[redacted] token = [redacted] api_key: [redacted] key [redacted] from path=[redacted-path] [redacted-path] [redacted-path] [redacted-path] [redacted-path] [redacted-path] [redacted-path] [redacted-path] Authorization: Bearer [redacted] Authorization:Bearer [redacted] Authorization: [redacted] api_key=[redacted]"
-        );
+        assert_eq!(event["reason"], "manual_expire");
+        assert_eq!(event["reason_code"], "manual_expire");
         assert_eq!(event["actor"]["name"], "local-admin");
 
         let credentials_response = app
