@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -179,6 +179,8 @@ struct RuntimeSnapshotSample {
     serving_channels: usize,
     credential_set_blocking_alerts: usize,
     operator_input_alerts: usize,
+    credential_sets_without_spare: usize,
+    channels_cooling_down: usize,
 }
 
 #[derive(Debug)]
@@ -195,6 +197,8 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
     let mut serving_channels = 0;
     let mut operator_input_alerts = 0usize;
     let mut credential_set_blocking_alerts = 0usize;
+    let mut credential_sets_without_spare = 0usize;
+    let mut channels_cooling_down = 0usize;
 
     for topology in state.runtime_catalogs.credential_set_topologies() {
         for channel_id in topology.channel_ids {
@@ -208,6 +212,9 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
             }
             if sample.readiness.blocking {
                 credential_set_blocking_alerts += 1;
+            }
+            if sample.counts.available < 2 {
+                credential_sets_without_spare += 1;
             }
             break;
         }
@@ -225,6 +232,12 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
             .lock()
             .expect("channel health mutex poisoned")
             .clone();
+        if matches!(
+            health,
+            ChannelHealth::CoolingDown { until, .. } if Instant::now() < until
+        ) {
+            channels_cooling_down += 1;
+        }
         if !health.is_available_for_routing() && !matches!(health, ChannelHealth::Degraded { .. }) {
             continue;
         }
@@ -263,6 +276,8 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
         serving_channels,
         credential_set_blocking_alerts,
         operator_input_alerts,
+        credential_sets_without_spare,
+        channels_cooling_down,
     }
 }
 
@@ -415,6 +430,71 @@ pub async fn readiness_response(state: &AppState) -> ReadinessResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ServingHealthResponse {
+    pub status: &'static str,
+    pub serving: bool,
+    pub serving_channels: usize,
+    pub blocking_alerts: usize,
+    pub blocking_reasons: Vec<&'static str>,
+}
+
+pub async fn serving_health_response(state: &AppState) -> ServingHealthResponse {
+    let sample = collect_runtime_snapshot(state).await;
+    let serving_channels = sample.serving_channels;
+    let credential_set_blocking_alerts = sample.credential_set_blocking_alerts;
+    let RuntimeReadinessProjection {
+        status,
+        blocking_alerts,
+    } = runtime_readiness_projection(serving_channels, credential_set_blocking_alerts);
+    let mut blocking_reasons = Vec::new();
+    if serving_channels == 0 {
+        blocking_reasons.push("no_serving_channels");
+    }
+    if credential_set_blocking_alerts > 0 {
+        blocking_reasons.push("credential_set_blocking_alerts");
+    }
+    ServingHealthResponse {
+        status,
+        serving: serving_channels > 0,
+        serving_channels,
+        blocking_alerts,
+        blocking_reasons,
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResilienceHealthResponse {
+    pub status: &'static str,
+    pub operator_input_alerts: usize,
+    pub credential_sets_without_spare: usize,
+    pub channels_cooling_down: usize,
+    pub response_filter_alerts: usize,
+}
+
+pub async fn resilience_health_response(state: &AppState) -> ResilienceHealthResponse {
+    let sample = collect_runtime_snapshot(state).await;
+    let response_filter_alerts = 0usize;
+    let status = if sample.serving_channels == 0 || sample.credential_set_blocking_alerts > 0 {
+        "blocked"
+    } else if sample.operator_input_alerts > 0
+        || sample.credential_sets_without_spare > 0
+        || sample.channels_cooling_down > 0
+        || response_filter_alerts > 0
+    {
+        "degraded"
+    } else {
+        "ok"
+    };
+    ResilienceHealthResponse {
+        status,
+        operator_input_alerts: sample.operator_input_alerts,
+        credential_sets_without_spare: sample.credential_sets_without_spare,
+        channels_cooling_down: sample.channels_cooling_down,
+        response_filter_alerts,
+    }
+}
+
+#[derive(Debug, Serialize)]
 pub struct RequestLimits {
     pub max_request_body_bytes: usize,
     pub max_model_catalog_body_bytes: usize,
@@ -461,10 +541,25 @@ mod tests {
         let readiness_body = item_body(
             source,
             "pub async fn readiness_response",
+            "\n#[derive(Debug, Serialize)]\npub struct ServingHealthResponse",
+        );
+        let serving_health_body = item_body(
+            source,
+            "pub async fn serving_health_response",
+            "\n#[derive(Debug, Serialize)]\npub struct ResilienceHealthResponse",
+        );
+        let resilience_health_body = item_body(
+            source,
+            "pub async fn resilience_health_response",
             "\n#[derive(Debug, Serialize)]\npub struct RequestLimits",
         );
 
-        for body in [runtime_body, readiness_body] {
+        for body in [
+            runtime_body,
+            readiness_body,
+            serving_health_body,
+            resilience_health_body,
+        ] {
             assert!(body.contains("collect_runtime_snapshot(state).await"));
             for forbidden_token in [
                 "CredentialSetSnapshotCache::default()",

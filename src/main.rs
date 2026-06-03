@@ -324,6 +324,16 @@ const MANAGEMENT_ROUTE_SPECS: &[ManagementRouteSpec] = &[
         minimum_role: ManagementRole::Readonly,
     },
     ManagementRouteSpec {
+        method: "GET",
+        path: "/management/health/serving",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/health/resilience",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
         method: "POST",
         path: "/management/runtime/reload",
         minimum_role: ManagementRole::Admin,
@@ -707,6 +717,14 @@ fn app_without_test_peer_default(state: AppState) -> Router {
             get(management::routing_preview),
         )
         .route("/management/runtime", get(management::runtime))
+        .route(
+            "/management/health/serving",
+            get(management::serving_health),
+        )
+        .route(
+            "/management/health/resilience",
+            get(management::resilience_health),
+        )
         .route(
             "/management/runtime/reload",
             post(management::reload_runtime),
@@ -4924,6 +4942,10 @@ pools:
             "pub async fn runtime_response_for_state",
             "pub struct ReadinessResponse",
             "pub async fn readiness_response",
+            "pub struct ServingHealthResponse",
+            "pub async fn serving_health_response",
+            "pub struct ResilienceHealthResponse",
+            "pub async fn resilience_health_response",
             "pub struct RuntimeReloadResponse",
             "pub struct RuntimeReloadResponseParts",
             "pub fn runtime_reload_response",
@@ -5162,7 +5184,7 @@ pools:
             .find("pub async fn readiness")
             .expect("readiness handler exists");
         let readiness_handler_end = management_source[readiness_handler_start..]
-            .find("\npub async fn routing_telemetry")
+            .find("\npub async fn serving_health")
             .map(|offset| readiness_handler_start + offset)
             .expect("next management handler exists");
         let readiness_handler_body =
@@ -5170,11 +5192,47 @@ pools:
         assert!(readiness_handler_body.contains("readiness_response(&state).await"));
         assert!(!readiness_handler_body.contains("ManagementService::new"));
 
+        let serving_health_handler_start = management_source
+            .find("pub async fn serving_health")
+            .expect("serving health handler exists");
+        let serving_health_handler_end = management_source[serving_health_handler_start..]
+            .find("\npub async fn resilience_health")
+            .map(|offset| serving_health_handler_start + offset)
+            .expect("next management handler exists");
+        let serving_health_handler_body =
+            &management_source[serving_health_handler_start..serving_health_handler_end];
+        assert!(serving_health_handler_body.contains("serving_health_response(&state).await"));
+        assert!(serving_health_handler_body.contains("StatusCode::SERVICE_UNAVAILABLE"));
+        assert!(!serving_health_handler_body.contains("collect_runtime_snapshot"));
+        assert!(!serving_health_handler_body.contains("CredentialSetSnapshotCache::default()"));
+        assert!(!serving_health_handler_body.contains("snapshot_for("));
+        assert!(!serving_health_handler_body.contains(".registry_store"));
+        assert!(!serving_health_handler_body.contains(".current_version()"));
+        assert!(!serving_health_handler_body.contains("ManagementService::new"));
+
+        let resilience_health_handler_start = management_source
+            .find("pub async fn resilience_health")
+            .expect("resilience health handler exists");
+        let resilience_health_handler_end = management_source[resilience_health_handler_start..]
+            .find("\npub async fn routing_telemetry")
+            .map(|offset| resilience_health_handler_start + offset)
+            .expect("next management handler exists");
+        let resilience_health_handler_body =
+            &management_source[resilience_health_handler_start..resilience_health_handler_end];
+        assert!(resilience_health_handler_body.contains("resilience_health_response(&state).await"));
+        assert!(!resilience_health_handler_body.contains("StatusCode::SERVICE_UNAVAILABLE"));
+        assert!(!resilience_health_handler_body.contains("collect_runtime_snapshot"));
+        assert!(!resilience_health_handler_body.contains("CredentialSetSnapshotCache::default()"));
+        assert!(!resilience_health_handler_body.contains("snapshot_for("));
+        assert!(!resilience_health_handler_body.contains(".registry_store"));
+        assert!(!resilience_health_handler_body.contains(".current_version()"));
+        assert!(!resilience_health_handler_body.contains("ManagementService::new"));
+
         let readiness_response_start = runtime_source
             .find("pub async fn readiness_response")
             .expect("readiness response projection exists");
         let readiness_response_end = runtime_source[readiness_response_start..]
-            .find("#[derive(Debug, Serialize)]\npub struct RequestLimits")
+            .find("#[derive(Debug, Serialize)]\npub struct ServingHealthResponse")
             .map(|offset| readiness_response_start + offset)
             .expect("next runtime item exists");
         let readiness_response_body =
@@ -5201,6 +5259,63 @@ pools:
         }
         assert!(!readiness_response_body.contains("operational_state.needs_operator_input"));
         assert!(!readiness_response_body.contains("operational_state.accepting_requests"));
+
+        for (start_marker, end_marker, expected_tokens) in [
+            (
+                "pub async fn serving_health_response",
+                "\n#[derive(Debug, Serialize)]\npub struct ResilienceHealthResponse",
+                vec![
+                    "collect_runtime_snapshot(state).await",
+                    "runtime_readiness_projection(serving_channels, credential_set_blocking_alerts)",
+                    "blocking_reasons",
+                    "no_serving_channels",
+                    "credential_set_blocking_alerts",
+                ],
+            ),
+            (
+                "pub async fn resilience_health_response",
+                "\n#[derive(Debug, Serialize)]\npub struct RequestLimits",
+                vec![
+                    "collect_runtime_snapshot(state).await",
+                    "credential_sets_without_spare",
+                    "channels_cooling_down",
+                    "response_filter_alerts",
+                    "\"blocked\"",
+                    "\"degraded\"",
+                    "\"ok\"",
+                ],
+            ),
+        ] {
+            let response_start = runtime_source
+                .find(start_marker)
+                .unwrap_or_else(|| panic!("{start_marker} exists"));
+            let response_end = runtime_source[response_start..]
+                .find(end_marker)
+                .map(|offset| response_start + offset)
+                .unwrap_or_else(|| panic!("{end_marker} follows {start_marker}"));
+            let response_body = &runtime_source[response_start..response_end];
+            for expected_token in expected_tokens {
+                assert!(
+                    response_body.contains(expected_token),
+                    "{start_marker} must contain {expected_token}"
+                );
+            }
+            for forbidden_token in [
+                "CredentialSetSnapshotCache::default()",
+                "BTreeSet::new()",
+                "add_counts_once(",
+                "snapshot_for(",
+                ".lock()",
+                ".read()",
+                ".registry_store",
+                ".current_version()",
+            ] {
+                assert!(
+                    !response_body.contains(forbidden_token),
+                    "{start_marker} must consume sampled runtime state, not {forbidden_token}"
+                );
+            }
+        }
 
         let reload_handler_start = management_source
             .find("pub async fn reload_runtime")
@@ -9647,6 +9762,16 @@ pools:
                 ManagementRole::Readonly,
             ),
             ("GET", "/management/runtime", ManagementRole::Readonly),
+            (
+                "GET",
+                "/management/health/serving",
+                ManagementRole::Readonly,
+            ),
+            (
+                "GET",
+                "/management/health/resilience",
+                ManagementRole::Readonly,
+            ),
             ("POST", "/management/runtime/reload", ManagementRole::Admin),
             ("GET", "/management/alerts", ManagementRole::Readonly),
             ("GET", "/management/channels/:id", ManagementRole::Readonly),
@@ -9838,6 +9963,26 @@ pools:
                 "/management/credential-sets/test-credentials/credentials/import",
                 Some(fixture_operator_management_token()),
                 Body::from(r#"{"keys":["operator-import-key"],"batch_id":"role-gate"}"#)
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            management_role_matrix_response(
+                "GET",
+                "/management/health/serving",
+                Some(fixture_readonly_management_token()),
+                Body::empty()
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            management_role_matrix_response(
+                "GET",
+                "/management/health/resilience",
+                Some(fixture_readonly_management_token()),
+                Body::empty()
             )
             .await,
             StatusCode::OK
@@ -18614,6 +18759,189 @@ pools:
         );
         assert_eq!(runtime["request_limits"]["max_route_candidates"], 16);
         assert_eq!(runtime["timeout_seconds"]["connect"], 10);
+    }
+
+    #[tokio::test]
+    async fn management_health_serving_returns_ok_when_a_channel_can_serve_requests() {
+        let response = app(management_role_matrix_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/management/health/serving")
+                    .header(
+                        header::AUTHORIZATION,
+                        bearer_for(&fixture_readonly_management_token()),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let health = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(health["status"], "ready");
+        assert_eq!(health["serving"], true);
+        assert_eq!(health["serving_channels"], 1);
+        assert_eq!(health["blocking_alerts"], 0);
+        assert_eq!(health["blocking_reasons"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn management_health_serving_returns_service_unavailable_when_no_serving_channel() {
+        let state = management_role_matrix_state();
+        let credential_id = {
+            let channel = state.channels.get("test").unwrap();
+            let pool = channel.pool.lock().await;
+            pool.credential_snapshots()[0].id.clone()
+        };
+        {
+            let channel = state.channels.get("test").unwrap();
+            channel
+                .pool
+                .lock()
+                .await
+                .disable_credential_by_id(
+                    &crate::credentials::CredentialId(credential_id),
+                    "operator rotation",
+                )
+                .unwrap();
+        }
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/management/health/serving")
+                    .header(
+                        header::AUTHORIZATION,
+                        bearer_for(&fixture_readonly_management_token()),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let health = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(health["status"], "not_ready");
+        assert_eq!(health["serving"], false);
+        assert_eq!(health["serving_channels"], 0);
+        assert_eq!(health["blocking_alerts"], 1);
+        assert_eq!(
+            health["blocking_reasons"],
+            serde_json::json!(["no_serving_channels", "credential_set_blocking_alerts"])
+        );
+    }
+
+    #[tokio::test]
+    async fn management_health_resilience_always_returns_ok_after_auth_even_when_blocked() {
+        let state = management_role_matrix_state();
+        let credential_id = {
+            let channel = state.channels.get("test").unwrap();
+            let pool = channel.pool.lock().await;
+            pool.credential_snapshots()[0].id.clone()
+        };
+        {
+            let channel = state.channels.get("test").unwrap();
+            channel
+                .pool
+                .lock()
+                .await
+                .disable_credential_by_id(
+                    &crate::credentials::CredentialId(credential_id),
+                    "operator rotation",
+                )
+                .unwrap();
+        }
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/management/health/resilience")
+                    .header(
+                        header::AUTHORIZATION,
+                        bearer_for(&fixture_readonly_management_token()),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let health = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(health["status"], "blocked");
+        assert_eq!(health["operator_input_alerts"], 1);
+        assert_eq!(health["credential_sets_without_spare"], 1);
+        assert_eq!(health["channels_cooling_down"], 0);
+        assert_eq!(health["response_filter_alerts"], 0);
+    }
+
+    #[tokio::test]
+    async fn management_health_resilience_reports_without_spare_and_cooling_down_counts() {
+        let mut config = test_config_with_api_base("https://example.com/v1");
+        let management = config.management.as_mut().unwrap();
+        management.principals = vec![ManagementPrincipalConfig {
+            name: "readonly-fixture".to_string(),
+            token: fixture_readonly_management_token(),
+            role: ManagementRole::Readonly,
+            enabled: true,
+        }];
+        config.credential_sets = credential_sets_from_files([(
+            "test-credentials",
+            temp_keys_file("upstream-key-a\nupstream-key-b\n"),
+        )]);
+        let store_path = temp_sqlite_path("management-health-resilience-counts");
+        let repository = SqliteCredentialRepository::open(&store_path).unwrap();
+        let state = AppState::new(
+            config
+                .resolve_with_credential_repository_and_store_path(&repository, Some(store_path))
+                .unwrap(),
+        )
+        .unwrap();
+        let credential_id = {
+            let channel = state.channels.get("test").unwrap();
+            let pool = channel.pool.lock().await;
+            pool.credential_snapshots()[0].id.clone()
+        };
+        {
+            let channel = state.channels.get("test").unwrap();
+            channel.pool.lock().await.apply_credential_cooldown_until(
+                &crate::credentials::CredentialId(credential_id),
+                Instant::now() + Duration::from_secs(60),
+                "setup cooldown",
+            );
+            *channel.health.lock().unwrap() = ChannelHealth::CoolingDown {
+                until: Instant::now() + Duration::from_secs(60),
+                reason: "setup cooldown".to_string(),
+            };
+        }
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/management/health/resilience")
+                    .header(
+                        header::AUTHORIZATION,
+                        bearer_for(&fixture_readonly_management_token()),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let health = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(health["status"], "blocked");
+        assert_eq!(health["operator_input_alerts"], 1);
+        assert_eq!(health["credential_sets_without_spare"], 1);
+        assert_eq!(health["channels_cooling_down"], 1);
+        assert_eq!(health["response_filter_alerts"], 0);
     }
 
     #[tokio::test]

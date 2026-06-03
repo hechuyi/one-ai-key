@@ -67,8 +67,8 @@ use crate::{
     },
     management_routing::{model_routes_response, routing_preview_for_model},
     management_runtime::{
-        readiness_response, reload_runtime as reload_runtime_state,
-        routing_telemetry_snapshot_response, runtime_response_for_state,
+        readiness_response, reload_runtime as reload_runtime_state, resilience_health_response,
+        routing_telemetry_snapshot_response, runtime_response_for_state, serving_health_response,
     },
     model_discovery,
     state::AppState,
@@ -1361,6 +1361,31 @@ pub async fn readiness(State(state): State<AppState>) -> Response {
     } else {
         Json(readiness).into_response()
     }
+}
+
+pub async fn serving_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match authorize_management(&state, &headers) {
+        Ok(principal) => principal,
+        Err(resp) => return *resp,
+    };
+    let _principal_context = (&principal.id, &principal.name, &principal.role);
+
+    let response = serving_health_response(&state).await;
+    if response.serving {
+        Json(response).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(response)).into_response()
+    }
+}
+
+pub async fn resilience_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match authorize_management(&state, &headers) {
+        Ok(principal) => principal,
+        Err(resp) => return *resp,
+    };
+    let _principal_context = (&principal.id, &principal.name, &principal.role);
+
+    Json(resilience_health_response(&state).await).into_response()
 }
 
 pub async fn routing_telemetry(
