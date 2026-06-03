@@ -6,6 +6,7 @@ use crate::{
         AccountConfig, ModelRouteConfig, PolicyProfileConfig, PoolConfig, ProviderConfig,
         ResolvedConfig, RoutingProfileConfig,
     },
+    events::{ManagementAuditEvent, ManagementEventActor},
     management_errors::{registry_store_error, ManagementServiceError},
     registry::RegistryDocument,
     registry_store::{
@@ -112,6 +113,56 @@ pub async fn apply_staged_registry_mutation(
     ))
 }
 
+pub async fn apply_audited_staged_registry_mutation(
+    state: &AppState,
+    actor: ManagementEventActor,
+    command: RegistryCommand,
+    audit: RegistryMutationAudit,
+) -> Result<RegistryMutationStatus, ManagementServiceError> {
+    let expected_registry_version = state
+        .registry_store
+        .current_version()
+        .await
+        .map_err(registry_store_error)?
+        .ok_or_else(|| {
+            ManagementServiceError::Conflict(
+                "registry persistence requires a writable registry store".to_string(),
+            )
+        })?
+        + 1;
+    state
+        .events
+        .record_audit_event(ManagementAuditEvent {
+            kind: audit.kind.to_string(),
+            action: audit.kind.to_string(),
+            resource_type: audit.resource_type.to_string(),
+            resource_id: audit.resource_id,
+            channel_id: String::new(),
+            credential_id: String::new(),
+            outcome: "applied".to_string(),
+            request_id: None,
+            generation: Some(expected_registry_version),
+            reason_code: audit.reason_code.to_string(),
+            actor: Some(actor),
+        })
+        .await
+        .map_err(|err| ManagementServiceError::EventAppendFailed {
+            message: err.to_string(),
+            stale_history_id: None,
+        })?;
+    apply_staged_registry_mutation(state, command)
+        .await
+        .map_err(registry_store_error)
+}
+
+#[derive(Debug)]
+pub struct RegistryMutationAudit {
+    pub kind: &'static str,
+    pub resource_type: &'static str,
+    pub resource_id: String,
+    pub reason_code: &'static str,
+}
+
 pub async fn staged_model_routes_for_state(
     state: &AppState,
 ) -> Result<(u64, HashMap<String, ModelRouteConfig>), ManagementServiceError> {
@@ -160,15 +211,33 @@ pub async fn apply_staged_model_route_batch_for_state(
 
 pub async fn registry_provider_enabled_response_for_state(
     state: &AppState,
+    actor: ManagementEventActor,
     provider_id: &str,
     enabled: bool,
 ) -> Result<RegistryProviderMutationResponse, ManagementServiceError> {
-    let status = apply_staged_registry_mutation(
+    let (kind, reason_code) = if enabled {
+        (
+            "registry_provider_enabled",
+            "manual_registry_provider_enable",
+        )
+    } else {
+        (
+            "registry_provider_disabled",
+            "manual_registry_provider_disable",
+        )
+    };
+    let status = apply_audited_staged_registry_mutation(
         state,
+        actor,
         set_registry_provider_enabled_command(provider_id, enabled),
+        RegistryMutationAudit {
+            kind,
+            resource_type: "registry_provider",
+            resource_id: provider_id.to_string(),
+            reason_code,
+        },
     )
-    .await
-    .map_err(registry_store_error)?;
+    .await?;
     Ok(registry_provider_mutation_response(
         provider_id,
         enabled,
@@ -178,29 +247,51 @@ pub async fn registry_provider_enabled_response_for_state(
 
 pub async fn registry_provider_upsert_response_for_state(
     state: &AppState,
+    actor: ManagementEventActor,
     provider_id: &str,
     provider: ProviderConfig,
 ) -> Result<RegistryProviderUpsertResponse, ManagementServiceError> {
-    let status = apply_staged_registry_mutation(
+    let status = apply_audited_staged_registry_mutation(
         state,
+        actor,
         upsert_registry_provider_command(provider_id, provider),
+        RegistryMutationAudit {
+            kind: "registry_provider_upserted",
+            resource_type: "registry_provider",
+            resource_id: provider_id.to_string(),
+            reason_code: "manual_registry_provider_upsert",
+        },
     )
-    .await
-    .map_err(registry_store_error)?;
+    .await?;
     Ok(registry_provider_upsert_response(provider_id, status))
 }
 
 pub async fn registry_account_enabled_response_for_state(
     state: &AppState,
+    actor: ManagementEventActor,
     account_id: &str,
     enabled: bool,
 ) -> Result<RegistryAccountMutationResponse, ManagementServiceError> {
-    let status = apply_staged_registry_mutation(
+    let (kind, reason_code) = if enabled {
+        ("registry_account_enabled", "manual_registry_account_enable")
+    } else {
+        (
+            "registry_account_disabled",
+            "manual_registry_account_disable",
+        )
+    };
+    let status = apply_audited_staged_registry_mutation(
         state,
+        actor,
         set_registry_account_enabled_command(account_id, enabled),
+        RegistryMutationAudit {
+            kind,
+            resource_type: "registry_account",
+            resource_id: account_id.to_string(),
+            reason_code,
+        },
     )
-    .await
-    .map_err(registry_store_error)?;
+    .await?;
     Ok(registry_account_mutation_response(
         account_id, enabled, status,
     ))
@@ -208,27 +299,51 @@ pub async fn registry_account_enabled_response_for_state(
 
 pub async fn registry_account_upsert_response_for_state(
     state: &AppState,
+    actor: ManagementEventActor,
     account_id: &str,
     account: AccountConfig,
 ) -> Result<RegistryAccountUpsertResponse, ManagementServiceError> {
-    let status =
-        apply_staged_registry_mutation(state, upsert_registry_account_command(account_id, account))
-            .await
-            .map_err(registry_store_error)?;
+    let status = apply_audited_staged_registry_mutation(
+        state,
+        actor,
+        upsert_registry_account_command(account_id, account),
+        RegistryMutationAudit {
+            kind: "registry_account_upserted",
+            resource_type: "registry_account",
+            resource_id: account_id.to_string(),
+            reason_code: "manual_registry_account_upsert",
+        },
+    )
+    .await?;
     Ok(registry_account_upsert_response(account_id, status))
 }
 
 pub async fn registry_channel_enabled_response_for_state(
     state: &AppState,
+    actor: ManagementEventActor,
     channel_id: &str,
     enabled: bool,
 ) -> Result<RegistryChannelMutationResponse, ManagementServiceError> {
-    let status = apply_staged_registry_mutation(
+    let (kind, reason_code) = if enabled {
+        ("registry_channel_enabled", "manual_registry_channel_enable")
+    } else {
+        (
+            "registry_channel_disabled",
+            "manual_registry_channel_disable",
+        )
+    };
+    let status = apply_audited_staged_registry_mutation(
         state,
+        actor,
         set_registry_channel_enabled_command(channel_id, enabled),
+        RegistryMutationAudit {
+            kind,
+            resource_type: "registry_channel",
+            resource_id: channel_id.to_string(),
+            reason_code,
+        },
     )
-    .await
-    .map_err(registry_store_error)?;
+    .await?;
     Ok(registry_channel_mutation_response(
         channel_id, enabled, status,
     ))
@@ -236,41 +351,64 @@ pub async fn registry_channel_enabled_response_for_state(
 
 pub async fn registry_channel_upsert_response_for_state(
     state: &AppState,
+    actor: ManagementEventActor,
     channel_id: &str,
     channel: PoolConfig,
 ) -> Result<RegistryChannelUpsertResponse, ManagementServiceError> {
-    let status =
-        apply_staged_registry_mutation(state, upsert_registry_channel_command(channel_id, channel))
-            .await
-            .map_err(registry_store_error)?;
+    let status = apply_audited_staged_registry_mutation(
+        state,
+        actor,
+        upsert_registry_channel_command(channel_id, channel),
+        RegistryMutationAudit {
+            kind: "registry_channel_upserted",
+            resource_type: "registry_channel",
+            resource_id: channel_id.to_string(),
+            reason_code: "manual_registry_channel_upsert",
+        },
+    )
+    .await?;
     Ok(registry_channel_upsert_response(channel_id, status))
 }
 
 pub async fn registry_model_route_upsert_response_for_state(
     state: &AppState,
+    actor: ManagementEventActor,
     public_model: &str,
     route: ModelRouteConfig,
 ) -> Result<RegistryModelRouteMutationResponse, ManagementServiceError> {
-    let status = apply_staged_registry_mutation(
+    let status = apply_audited_staged_registry_mutation(
         state,
+        actor,
         upsert_registry_model_route_command(public_model, route),
+        RegistryMutationAudit {
+            kind: "registry_model_route_upserted",
+            resource_type: "registry_model_route",
+            resource_id: public_model.to_string(),
+            reason_code: "manual_registry_model_route_upsert",
+        },
     )
-    .await
-    .map_err(registry_store_error)?;
+    .await?;
     Ok(registry_model_route_mutation_response(public_model, status))
 }
 
 pub async fn registry_policy_profile_upsert_response_for_state(
     state: &AppState,
+    actor: ManagementEventActor,
     profile_id: &str,
     profile: PolicyProfileConfig,
 ) -> Result<RegistryPolicyProfileMutationResponse, ManagementServiceError> {
-    let status = apply_staged_registry_mutation(
+    let status = apply_audited_staged_registry_mutation(
         state,
+        actor,
         upsert_registry_policy_profile_command(profile_id, profile),
+        RegistryMutationAudit {
+            kind: "registry_policy_profile_upserted",
+            resource_type: "registry_policy_profile",
+            resource_id: profile_id.to_string(),
+            reason_code: "manual_registry_policy_profile_upsert",
+        },
     )
-    .await
-    .map_err(registry_store_error)?;
+    .await?;
     Ok(registry_policy_profile_mutation_response(
         profile_id, status,
     ))
@@ -278,15 +416,22 @@ pub async fn registry_policy_profile_upsert_response_for_state(
 
 pub async fn registry_routing_profile_upsert_response_for_state(
     state: &AppState,
+    actor: ManagementEventActor,
     profile_id: &str,
     profile: RoutingProfileConfig,
 ) -> Result<RegistryRoutingProfileMutationResponse, ManagementServiceError> {
-    let status = apply_staged_registry_mutation(
+    let status = apply_audited_staged_registry_mutation(
         state,
+        actor,
         upsert_registry_routing_profile_command(profile_id, profile),
+        RegistryMutationAudit {
+            kind: "registry_routing_profile_upserted",
+            resource_type: "registry_routing_profile",
+            resource_id: profile_id.to_string(),
+            reason_code: "manual_registry_routing_profile_upsert",
+        },
     )
-    .await
-    .map_err(registry_store_error)?;
+    .await?;
     Ok(registry_routing_profile_mutation_response(
         profile_id, status,
     ))

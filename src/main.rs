@@ -7737,11 +7737,44 @@ pools:
         serde_json::from_slice::<Value>(&body).unwrap()
     }
 
+    fn assert_management_event(
+        events: &Value,
+        index: usize,
+        kind: &str,
+        resource_type: &str,
+        resource_id: &str,
+        generation: u64,
+        reason_code: &str,
+    ) {
+        let event = &events["events"][index];
+        assert_eq!(event["kind"], kind);
+        assert_eq!(event["action"], kind);
+        assert_eq!(event["resource_type"], resource_type);
+        assert_eq!(event["resource_id"], resource_id);
+        assert_eq!(event["outcome"], "applied");
+        assert_eq!(event["generation"], generation);
+        assert_eq!(event["reason_code"], reason_code);
+    }
+
     fn registry_provider_fixture() -> (Router, PathBuf) {
         registry_provider_fixture_with_channel_enabled(true)
     }
 
+    fn registry_provider_fixture_with_event_log_path(event_log_path: PathBuf) -> (Router, PathBuf) {
+        registry_provider_fixture_with_channel_enabled_and_event_log_path(
+            true,
+            Some(event_log_path),
+        )
+    }
+
     fn registry_provider_fixture_with_channel_enabled(channel_enabled: bool) -> (Router, PathBuf) {
+        registry_provider_fixture_with_channel_enabled_and_event_log_path(channel_enabled, None)
+    }
+
+    fn registry_provider_fixture_with_channel_enabled_and_event_log_path(
+        channel_enabled: bool,
+        event_log_path: Option<PathBuf>,
+    ) -> (Router, PathBuf) {
         let keys_file = temp_keys_file("upstream-key\n");
         let credential_store_path = temp_sqlite_path("registry-provider-credentials");
         let registry_store_path = temp_sqlite_path("registry-provider");
@@ -7758,7 +7791,7 @@ pools:
                 admin_token: fixture_admin_token(),
                 ip_allowlist: None,
                 principals: Vec::new(),
-                event_log_path: None,
+                event_log_path,
                 event_window_capacity: None,
             }),
             max_request_body_bytes: 1024 * 1024,
@@ -7866,6 +7899,19 @@ pools:
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
 
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["events"][0]["kind"], "registry_provider_disabled");
+        assert_eq!(events["events"][0]["action"], "registry_provider_disabled");
+        assert_eq!(events["events"][0]["resource_type"], "registry_provider");
+        assert_eq!(events["events"][0]["resource_id"], "relay");
+        assert_eq!(events["events"][0]["outcome"], "applied");
+        assert_eq!(events["events"][0]["generation"], 2);
+        assert_eq!(
+            events["events"][0]["reason_code"],
+            "manual_registry_provider_disable"
+        );
+        assert_eq!(events["events"][0]["actor"]["role"], "admin");
+
         let stored = SqliteRegistryStore::open(&registry_store_path)
             .unwrap()
             .load_registry_for_validation()
@@ -7898,6 +7944,16 @@ pools:
         );
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["events"][1]["kind"], "registry_provider_enabled");
+        assert_eq!(events["events"][1]["resource_type"], "registry_provider");
+        assert_eq!(events["events"][1]["resource_id"], "relay");
+        assert_eq!(events["events"][1]["generation"], 3);
+        assert_eq!(
+            events["events"][1]["reason_code"],
+            "manual_registry_provider_enable"
+        );
 
         let stored = SqliteRegistryStore::open(&registry_store_path)
             .unwrap()
@@ -8142,6 +8198,40 @@ pools:
     }
 
     #[tokio::test]
+    async fn failed_event_write_does_not_disable_registry_provider() {
+        let blocking_parent = temp_keys_file("not a directory\n");
+        let event_log_path = blocking_parent.join("events.jsonl");
+        let (app, registry_store_path) =
+            registry_provider_fixture_with_event_log_path(event_log_path);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/registry/providers/relay/disable")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let stored = SqliteRegistryStore::open(&registry_store_path)
+            .unwrap()
+            .load_registry_for_validation()
+            .unwrap();
+        assert!(stored.providers["relay"].enabled);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 0);
+
+        let runtime_providers = management_response_json(&app, "/management/providers").await;
+        assert_eq!(runtime_providers["providers"][0]["enabled"], true);
+    }
+
+    #[tokio::test]
     async fn management_registry_provider_disable_unknown_provider_returns_404() {
         let (app, _) = registry_provider_fixture();
 
@@ -8191,6 +8281,16 @@ pools:
         assert_eq!(body["registry_version"], 2);
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["events"][0]["kind"], "registry_provider_upserted");
+        assert_eq!(events["events"][0]["resource_type"], "registry_provider");
+        assert_eq!(events["events"][0]["resource_id"], "relay-secondary");
+        assert_eq!(events["events"][0]["generation"], 2);
+        assert_eq!(
+            events["events"][0]["reason_code"],
+            "manual_registry_provider_upsert"
+        );
 
         let stored = SqliteRegistryStore::open(&registry_store_path)
             .unwrap()
@@ -8296,6 +8396,17 @@ pools:
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
 
+        let events = management_response_json(&app, "/management/events").await;
+        assert_management_event(
+            &events,
+            0,
+            "registry_account_disabled",
+            "registry_account",
+            "relay-account",
+            2,
+            "manual_registry_account_disable",
+        );
+
         let stored = SqliteRegistryStore::open(&registry_store_path)
             .unwrap()
             .load_registry_for_validation()
@@ -8325,6 +8436,17 @@ pools:
         assert_eq!(body["registry_version"], 3);
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_management_event(
+            &events,
+            1,
+            "registry_account_enabled",
+            "registry_account",
+            "relay-account",
+            3,
+            "manual_registry_account_enable",
+        );
 
         let stored = SqliteRegistryStore::open(&registry_store_path)
             .unwrap()
@@ -8408,6 +8530,17 @@ pools:
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
 
+        let events = management_response_json(&app, "/management/events").await;
+        assert_management_event(
+            &events,
+            0,
+            "registry_account_upserted",
+            "registry_account",
+            "relay-secondary",
+            2,
+            "manual_registry_account_upsert",
+        );
+
         let stored = SqliteRegistryStore::open(&registry_store_path)
             .unwrap()
             .load_registry_for_validation()
@@ -8483,6 +8616,17 @@ pools:
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
 
+        let events = management_response_json(&app, "/management/events").await;
+        assert_management_event(
+            &events,
+            0,
+            "registry_channel_disabled",
+            "registry_channel",
+            "test",
+            2,
+            "manual_registry_channel_disable",
+        );
+
         let stored = SqliteRegistryStore::open(&registry_store_path)
             .unwrap()
             .load_registry_for_validation()
@@ -8514,6 +8658,17 @@ pools:
         assert_eq!(body["registry_version"], 3);
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_management_event(
+            &events,
+            1,
+            "registry_channel_enabled",
+            "registry_channel",
+            "test",
+            3,
+            "manual_registry_channel_enable",
+        );
 
         let stored = SqliteRegistryStore::open(&registry_store_path)
             .unwrap()
@@ -8600,6 +8755,17 @@ pools:
         assert_eq!(body["registry_version"], 2);
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_management_event(
+            &events,
+            0,
+            "registry_channel_upserted",
+            "registry_channel",
+            "secondary",
+            2,
+            "manual_registry_channel_upsert",
+        );
 
         let stored = SqliteRegistryStore::open(&registry_store_path)
             .unwrap()
@@ -8695,6 +8861,17 @@ pools:
         assert_eq!(body["registry_version"], 2);
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_management_event(
+            &events,
+            0,
+            "registry_model_route_upserted",
+            "registry_model_route",
+            "gpt-public",
+            2,
+            "manual_registry_model_route_upsert",
+        );
 
         let stored = SqliteRegistryStore::open(&registry_store_path)
             .unwrap()
@@ -8822,6 +8999,17 @@ pools:
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
 
+        let events = management_response_json(&app, "/management/events").await;
+        assert_management_event(
+            &events,
+            0,
+            "registry_policy_profile_upserted",
+            "registry_policy_profile",
+            "relay-cooldown",
+            2,
+            "manual_registry_policy_profile_upsert",
+        );
+
         let stored = SqliteRegistryStore::open(&registry_store_path)
             .unwrap()
             .load_registry_for_validation()
@@ -8913,6 +9101,17 @@ pools:
         assert_eq!(body["registry_version"], 2);
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_management_event(
+            &events,
+            0,
+            "registry_routing_profile_upserted",
+            "registry_routing_profile",
+            "default-routing",
+            2,
+            "manual_registry_routing_profile_upsert",
+        );
 
         let stored = SqliteRegistryStore::open(&registry_store_path)
             .unwrap()

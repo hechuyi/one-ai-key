@@ -378,8 +378,8 @@ pub async fn upsert_registry_provider(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match registry_provider_upsert_response_for_state(&state, &id, payload).await {
+    let actor = management_actor(&principal);
+    match registry_provider_upsert_response_for_state(&state, actor, &id, payload).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
@@ -394,8 +394,8 @@ pub async fn disable_registry_provider(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match registry_provider_enabled_response_for_state(&state, &id, false).await {
+    let actor = management_actor(&principal);
+    match registry_provider_enabled_response_for_state(&state, actor, &id, false).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
@@ -410,8 +410,8 @@ pub async fn enable_registry_provider(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match registry_provider_enabled_response_for_state(&state, &id, true).await {
+    let actor = management_actor(&principal);
+    match registry_provider_enabled_response_for_state(&state, actor, &id, true).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
@@ -436,8 +436,8 @@ pub async fn upsert_registry_account(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match registry_account_upsert_response_for_state(&state, &id, payload).await {
+    let actor = management_actor(&principal);
+    match registry_account_upsert_response_for_state(&state, actor, &id, payload).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
@@ -452,8 +452,8 @@ pub async fn disable_registry_account(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match registry_account_enabled_response_for_state(&state, &id, false).await {
+    let actor = management_actor(&principal);
+    match registry_account_enabled_response_for_state(&state, actor, &id, false).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
@@ -468,8 +468,8 @@ pub async fn enable_registry_account(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match registry_account_enabled_response_for_state(&state, &id, true).await {
+    let actor = management_actor(&principal);
+    match registry_account_enabled_response_for_state(&state, actor, &id, true).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
@@ -484,8 +484,8 @@ pub async fn disable_registry_channel(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match registry_channel_enabled_response_for_state(&state, &id, false).await {
+    let actor = management_actor(&principal);
+    match registry_channel_enabled_response_for_state(&state, actor, &id, false).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
@@ -501,8 +501,8 @@ pub async fn upsert_registry_channel(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match registry_channel_upsert_response_for_state(&state, &id, payload).await {
+    let actor = management_actor(&principal);
+    match registry_channel_upsert_response_for_state(&state, actor, &id, payload).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
@@ -517,8 +517,8 @@ pub async fn enable_registry_channel(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match registry_channel_enabled_response_for_state(&state, &id, true).await {
+    let actor = management_actor(&principal);
+    match registry_channel_enabled_response_for_state(&state, actor, &id, true).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
@@ -882,8 +882,9 @@ pub async fn upsert_registry_model_route(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match registry_model_route_upsert_response_for_state(&state, public_model, payload).await {
+    let actor = management_actor(&principal);
+    match registry_model_route_upsert_response_for_state(&state, actor, public_model, payload).await
+    {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
@@ -908,8 +909,8 @@ pub async fn upsert_registry_policy_profile(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match registry_policy_profile_upsert_response_for_state(&state, &id, payload).await {
+    let actor = management_actor(&principal);
+    match registry_policy_profile_upsert_response_for_state(&state, actor, &id, payload).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
@@ -950,8 +951,8 @@ pub async fn upsert_registry_routing_profile(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match registry_routing_profile_upsert_response_for_state(&state, &id, payload).await {
+    let actor = management_actor(&principal);
+    match registry_routing_profile_upsert_response_for_state(&state, actor, &id, payload).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),
     }
