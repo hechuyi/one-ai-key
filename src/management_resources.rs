@@ -11,7 +11,7 @@ use crate::{
         CredentialProbeSummaryRecord, CredentialSetId, CredentialStoreError, CredentialStoreHandle,
         KeyImportReport,
     },
-    events::ManagementEventActor,
+    events::{ManagementAuditEvent, ManagementEventActor},
     management_credential_sources::{
         key_import_status, key_import_status_for_pool, KeyImportStatus,
     },
@@ -145,31 +145,60 @@ fn channel_topology_for_id(
 
 pub async fn reset_channel_health_status(
     state: &AppState,
+    actor: ManagementEventActor,
     channel_id: &str,
 ) -> Result<PoolStatus, ManagementServiceError> {
     let pool_state = channel_pool_for_id(state, channel_id)?;
+    {
+        let _send_guard = pool_state.send_gate.write().await;
+        let _mutation_guard = pool_state.mutation_gate.lock().await;
+        let health = pool_state
+            .health
+            .lock()
+            .expect("channel health mutex poisoned");
+        if matches!(*health, ChannelHealth::Disabled { .. }) {
+            return Err(ManagementServiceError::Conflict(format!(
+                "channel {channel_id} is disabled; enable it explicitly"
+            )));
+        }
+    }
+    state
+        .events
+        .record_audit_event(ManagementAuditEvent {
+            kind: "channel_health_reset".to_string(),
+            action: "channel_health_reset".to_string(),
+            resource_type: "channel".to_string(),
+            resource_id: channel_id.to_string(),
+            channel_id: channel_id.to_string(),
+            credential_id: String::new(),
+            outcome: "applied".to_string(),
+            request_id: None,
+            generation: None,
+            reason_code: "manual_channel_health_reset".to_string(),
+            actor: Some(actor),
+        })
+        .await
+        .map_err(|err| ManagementServiceError::EventAppendFailed {
+            message: err.to_string(),
+            stale_history_id: None,
+        })?;
     let _send_guard = pool_state.send_gate.write().await;
     let _mutation_guard = pool_state.mutation_gate.lock().await;
-    let disabled = {
+    {
         let mut health = pool_state
             .health
             .lock()
             .expect("channel health mutex poisoned");
         if matches!(*health, ChannelHealth::Disabled { .. }) {
-            true
-        } else {
-            *health = ChannelHealth::Available;
-            pool_state
-                .channel_health_generation
-                .fetch_add(1, Ordering::AcqRel);
-            false
+            return Err(ManagementServiceError::Conflict(format!(
+                "channel {channel_id} is disabled; enable it explicitly"
+            )));
         }
-    };
-    if disabled {
-        return Err(ManagementServiceError::Conflict(format!(
-            "channel {channel_id} is disabled; enable it explicitly"
-        )));
+        *health = ChannelHealth::Available;
     }
+    pool_state
+        .channel_health_generation
+        .fetch_add(1, Ordering::AcqRel);
     pool_status_for_channel(state, channel_id).await
 }
 

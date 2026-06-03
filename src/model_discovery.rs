@@ -4,11 +4,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::{
     config::{ModelRouteConfig, ModelRouteTargetConfig},
     error::{ClassifiedFailure, FailureKind, FailureScope},
+    events::ManagementEventActor,
     management_errors::ManagementServiceError,
     management_registry::{
-        apply_staged_model_route_batch_for_state, existing_staged_registry_mutation_status,
+        apply_audited_staged_model_route_batch_for_state, existing_staged_registry_mutation_status,
         registry_mutation_status_fields, staged_model_routes_for_state,
-        staged_registry_mutation_status, RegistryMutationStatusFields,
+        staged_registry_mutation_status, RegistryMutationAudit, RegistryMutationStatusFields,
     },
     provider::ProviderAdapter,
     route_plan::ModelRoute,
@@ -189,6 +190,7 @@ pub async fn model_discovery_sync_plan(
 
 pub async fn model_discovery_sync_apply(
     state: &AppState,
+    actor: ManagementEventActor,
     channel_ids: Vec<String>,
 ) -> Result<ModelDiscoverySyncApplyResponse, ManagementServiceError> {
     let (expected_registry_version, staged_model_routes) =
@@ -217,9 +219,20 @@ pub async fn model_discovery_sync_apply(
         });
     }
 
-    let commit =
-        apply_staged_model_route_batch_for_state(state, expected_registry_version, changes.routes)
-            .await?;
+    let audit = RegistryMutationAudit {
+        kind: "registry_model_route_discovery_synced",
+        resource_type: "registry_model_route_batch",
+        resource_id: "model_discovery_sync_apply".to_string(),
+        reason_code: "model_discovery_sync_apply",
+    };
+    let commit = apply_audited_staged_model_route_batch_for_state(
+        state,
+        actor,
+        expected_registry_version,
+        changes.routes,
+        audit,
+    )
+    .await?;
 
     Ok(ModelDiscoverySyncApplyResponse {
         status: registry_mutation_status_fields(staged_registry_mutation_status(

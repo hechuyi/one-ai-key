@@ -151,8 +151,13 @@ pub async fn model_discovery_sync_apply(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match model_discovery::model_discovery_sync_apply(&state, payload.channel_ids).await {
+    match model_discovery::model_discovery_sync_apply(
+        &state,
+        management_actor(&principal),
+        payload.channel_ids,
+    )
+    .await
+    {
         Ok(applied) => Json(applied).into_response(),
         Err(err) => service_error(err),
     }
@@ -167,8 +172,8 @@ pub async fn reset_channel_health(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match reset_channel_health_status(&state, &id).await {
+    let actor = management_actor(&principal);
+    match reset_channel_health_status(&state, actor, &id).await {
         Ok(status) => Json(status).into_response(),
         Err(err) => service_error(err),
     }
@@ -649,9 +654,10 @@ pub async fn set_credential_set_credential_metadata(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
+    let actor = management_actor(&principal);
     match credential_operator_metadata_response_for_set(
         &state,
+        actor,
         &id,
         CredentialId(credential_id),
         request.label,
@@ -699,7 +705,7 @@ pub async fn probe_credential_set_credential(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
+    let actor = management_actor(&principal);
     let model = payload.model.trim().to_string();
     if model.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "model must not be empty");
@@ -735,6 +741,7 @@ pub async fn probe_credential_set_credential(
     let timeout = Duration::from_secs(payload.timeout_seconds.unwrap_or(10).clamp(1, 30));
     match probe_credential_response_for_command(
         &state,
+        actor,
         CredentialProbeCommand {
             credential_set_id: id,
             credential_id: CredentialId(credential_id),
@@ -852,11 +859,13 @@ pub async fn import_credential_set_credentials(
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _actor = management_actor(&principal);
+    let actor = management_actor(&principal);
     if payload.keys.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "keys must not be empty");
     }
-    match credential_import_response_for_set(&state, &id, payload.keys, payload.batch_id).await {
+    match credential_import_response_for_set(&state, actor, &id, payload.keys, payload.batch_id)
+        .await
+    {
         Ok(imported) => Json(imported).into_response(),
         Err(err) => service_error(err),
     }
@@ -1387,9 +1396,9 @@ pub async fn reload_runtime(State(state): State<AppState>, headers: HeaderMap) -
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
-    let _principal_context = (&principal.id, &principal.name, &principal.role);
+    let actor = management_actor(&principal);
 
-    match reload_runtime_state(&state).await {
+    match reload_runtime_state(&state, actor).await {
         Ok(runtime) => Json(runtime).into_response(),
         Err(err) => service_error(err),
     }

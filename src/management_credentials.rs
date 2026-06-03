@@ -19,7 +19,7 @@ use crate::credential_repository::{
     CredentialStoreError, CredentialStoreHandle, KeyImportReport,
 };
 use crate::credentials::{CredentialId, CredentialSnapshot, CredentialStateSnapshot};
-use crate::events::ManagementEventActor;
+use crate::events::{ManagementAuditEvent, ManagementEventActor};
 use crate::management_commands::{
     credential_mutation_response, credential_set_probe_apply_command,
     execute_credential_command_for_state, CredentialMutationResponse,
@@ -40,6 +40,30 @@ use crate::state::{AppState, PoolState};
 
 const CREDENTIAL_PROBE_FILTER_SCAN_PAGE_SIZE: usize = 256;
 const BULK_PROBE_APPLY_CANDIDATE_OFFSET: usize = 0;
+
+async fn record_credential_management_audit(
+    state: &AppState,
+    actor: ManagementEventActor,
+    kind: &'static str,
+    resource_type: &'static str,
+    resource_id: impl Into<String>,
+    reason_code: &'static str,
+) -> Result<(), ManagementServiceError> {
+    state
+        .events
+        .record_audit_event(ManagementAuditEvent::applied(
+            kind,
+            resource_type,
+            resource_id,
+            reason_code,
+            Some(actor),
+        ))
+        .await
+        .map_err(|err| ManagementServiceError::EventAppendFailed {
+            message: err.to_string(),
+            stale_history_id: None,
+        })
+}
 
 #[derive(Debug, Serialize)]
 pub struct CredentialImportsResponse {
@@ -777,6 +801,7 @@ pub async fn selected_credential_key_for_probe(
 
 pub async fn probe_credential_response_for_command(
     state: &AppState,
+    actor: ManagementEventActor,
     command: CredentialProbeCommand,
 ) -> Result<CredentialProbeResponse, ManagementServiceError> {
     let scope = credential_set_runtime_scope(state, &command.credential_set_id)?;
@@ -797,6 +822,15 @@ pub async fn probe_credential_response_for_command(
         max_error_body_bytes: state.max_error_body_bytes,
     })
     .await;
+    record_credential_management_audit(
+        state,
+        actor,
+        "credential_probe_recorded",
+        "credential",
+        input.credential_id.0.clone(),
+        "manual_credential_probe",
+    )
+    .await?;
     record_credential_probe_response(&state.credential_store, &scope.pool_state, input).await
 }
 
@@ -884,6 +918,7 @@ pub async fn apply_credential_import_to_runtime(
 
 pub async fn credential_import_response_for_set(
     state: &AppState,
+    actor: ManagementEventActor,
     credential_set_id: &str,
     keys: Vec<String>,
     batch_id: Option<String>,
@@ -894,6 +929,15 @@ pub async fn credential_import_response_for_set(
     let runtime_existing_secrets =
         runtime_existing_secrets_for_import(&scope.pool_state, &keys).await;
     let batch_id = batch_id.unwrap_or_else(|| "management-api".to_string());
+    record_credential_management_audit(
+        state,
+        actor,
+        "credential_set_credentials_imported",
+        "credential_set",
+        scope.credential_set_id.0.clone(),
+        "manual_credential_import",
+    )
+    .await?;
     let import = append_credential_import_for_set(
         &state.credential_store,
         credential_set_id,
@@ -1075,23 +1119,34 @@ pub async fn apply_latest_credential_probe_response_for_set(
     .await?;
     let mutation = match credential_set_probe_apply_command(
         plan.action,
-        actor,
+        actor.clone(),
         scope.credential_set_id.0.clone(),
         scope.canonical_channel_id.clone(),
         credential_id.clone(),
         reason.clone(),
     ) {
         Some(command) => Some(execute_credential_command_for_state(state, command).await?),
-        None if matches!(plan.action, CredentialProbeApplyActionStatus::Cooldown) => Some(
-            apply_probe_credential_cooldown(
-                &scope.pool_state,
-                scope.canonical_channel_id.clone(),
-                scope.credential_set_id.clone(),
-                credential_id.clone(),
-                reason,
+        None if matches!(plan.action, CredentialProbeApplyActionStatus::Cooldown) => {
+            record_credential_management_audit(
+                state,
+                actor,
+                "credential_cooldown_applied",
+                "credential",
+                credential_id.0.clone(),
+                "manual_apply_latest_probe_cooldown",
             )
-            .await?,
-        ),
+            .await?;
+            Some(
+                apply_probe_credential_cooldown(
+                    &scope.pool_state,
+                    scope.canonical_channel_id.clone(),
+                    scope.credential_set_id.clone(),
+                    credential_id.clone(),
+                    reason,
+                )
+                .await?,
+            )
+        }
         None => None,
     };
     Ok(credential_probe_apply_response(
@@ -1791,6 +1846,7 @@ pub async fn update_credential_operator_metadata_for_set(
 
 pub async fn credential_operator_metadata_response_for_set(
     state: &AppState,
+    actor: ManagementEventActor,
     credential_set_id: &str,
     credential_id: CredentialId,
     label: Option<String>,
@@ -1801,6 +1857,17 @@ pub async fn credential_operator_metadata_response_for_set(
         &scope.credential_set_id.0,
         &scope.pool_state,
         &credential_id,
+    )
+    .await?;
+    let label = normalize_operator_metadata_field(label, 120, "label")?;
+    let note = normalize_operator_metadata_field(note, 1000, "note")?;
+    record_credential_management_audit(
+        state,
+        actor,
+        "credential_metadata_updated",
+        "credential",
+        credential_id.0.clone(),
+        "manual_credential_metadata_update",
     )
     .await?;
     update_credential_operator_metadata_for_set(

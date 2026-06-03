@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::{
-    events::RoutingTelemetry,
+    events::{ManagementAuditEvent, ManagementEventActor, RoutingTelemetry},
     management_errors::{registry_store_error, ManagementServiceError},
     management_registry::resolve_staged_registry_document,
     management_status::{
@@ -327,6 +327,7 @@ pub fn runtime_reload_response(parts: RuntimeReloadResponseParts) -> RuntimeRelo
 
 pub async fn reload_runtime(
     state: &AppState,
+    actor: ManagementEventActor,
 ) -> Result<RuntimeReloadResponse, ManagementServiceError> {
     let staged_registry_version = state
         .registry_store
@@ -346,6 +347,26 @@ pub async fn reload_runtime(
     let validation_bootstrap = (*state.registry_validation_bootstrap).clone();
     let config = resolve_staged_registry_document(validation_bootstrap, staged_registry_document)
         .map_err(registry_store_error)?;
+    state
+        .events
+        .record_audit_event(ManagementAuditEvent {
+            kind: "runtime_reloaded".to_string(),
+            action: "runtime_reloaded".to_string(),
+            resource_type: "runtime".to_string(),
+            resource_id: "runtime".to_string(),
+            channel_id: String::new(),
+            credential_id: String::new(),
+            outcome: "applied".to_string(),
+            request_id: None,
+            generation: staged_registry_version,
+            reason_code: "manual_runtime_reload".to_string(),
+            actor: Some(actor),
+        })
+        .await
+        .map_err(|err| ManagementServiceError::EventAppendFailed {
+            message: err.to_string(),
+            stale_history_id: None,
+        })?;
     state
         .rebuild_runtime_from_resolved_config(config, staged_registry_version)
         .map_err(|err| {

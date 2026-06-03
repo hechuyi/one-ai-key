@@ -130,18 +130,30 @@ pub async fn apply_audited_staged_registry_mutation(
             )
         })?
         + 1;
+    record_registry_mutation_audit_event(state, actor, &audit, expected_registry_version).await?;
+    apply_staged_registry_mutation(state, command)
+        .await
+        .map_err(registry_store_error)
+}
+
+async fn record_registry_mutation_audit_event(
+    state: &AppState,
+    actor: ManagementEventActor,
+    audit: &RegistryMutationAudit,
+    generation: u64,
+) -> Result<(), ManagementServiceError> {
     state
         .events
         .record_audit_event(ManagementAuditEvent {
             kind: audit.kind.to_string(),
             action: audit.kind.to_string(),
             resource_type: audit.resource_type.to_string(),
-            resource_id: audit.resource_id,
+            resource_id: audit.resource_id.clone(),
             channel_id: String::new(),
             credential_id: String::new(),
             outcome: "applied".to_string(),
             request_id: None,
-            generation: Some(expected_registry_version),
+            generation: Some(generation),
             reason_code: audit.reason_code.to_string(),
             actor: Some(actor),
         })
@@ -149,10 +161,7 @@ pub async fn apply_audited_staged_registry_mutation(
         .map_err(|err| ManagementServiceError::EventAppendFailed {
             message: err.to_string(),
             stale_history_id: None,
-        })?;
-    apply_staged_registry_mutation(state, command)
-        .await
-        .map_err(registry_store_error)
+        })
 }
 
 #[derive(Debug)]
@@ -207,6 +216,18 @@ pub async fn apply_staged_model_route_batch_for_state(
     )
     .await
     .map_err(registry_store_error)
+}
+
+pub async fn apply_audited_staged_model_route_batch_for_state(
+    state: &AppState,
+    actor: ManagementEventActor,
+    expected_registry_version: u64,
+    routes: Vec<(String, ModelRouteConfig)>,
+    audit: RegistryMutationAudit,
+) -> Result<RegistryStoreCommit, ManagementServiceError> {
+    let audit_generation = expected_registry_version.saturating_add(1);
+    record_registry_mutation_audit_event(state, actor, &audit, audit_generation).await?;
+    apply_staged_model_route_batch_for_state(state, expected_registry_version, routes).await
 }
 
 pub async fn registry_provider_enabled_response_for_state(

@@ -5210,7 +5210,7 @@ pools:
             .map(|offset| reload_handler_start + offset)
             .expect("next management item exists");
         let reload_handler_body = &management_source[reload_handler_start..reload_handler_end];
-        assert!(reload_handler_body.contains("reload_runtime_state(&state).await"));
+        assert!(reload_handler_body.contains("reload_runtime_state(&state, actor).await"));
         assert!(!reload_handler_body.contains("ManagementService::new"));
         for token in [
             "load_registry_for_validation",
@@ -5882,7 +5882,7 @@ pools:
             (
                 "reset_channel_health",
                 "disable_channel",
-                &["reset_channel_health_status(&state, &id).await"],
+                &["reset_channel_health_status(&state, actor, &id).await"],
             ),
             (
                 "disable_channel",
@@ -6946,7 +6946,7 @@ pools:
         assert!(resource_source.contains("pub async fn reset_channel_health_status"));
         assert!(resource_source.contains("channel_pool_for_id(state, channel_id)?"));
         assert!(resource_source.contains("ChannelHealth::Available"));
-        assert!(body.contains("reset_channel_health_status(&state, &id).await"));
+        assert!(body.contains("reset_channel_health_status(&state, actor, &id).await"));
         for token in [
             "channel_pool_for_id",
             "send_gate.write()",
@@ -7243,12 +7243,29 @@ pools:
         test_state_with_keys_api_base_and_event_log_path("upstream-key\n", api_base, event_log_path)
     }
 
-    fn test_state_with_keys(keys: impl IntoIterator<Item = impl AsRef<str>>) -> AppState {
-        let mut contents = String::new();
-        for key in keys {
-            contents.push_str(key.as_ref());
-            contents.push('\n');
+    trait TestStateKeys {
+        fn into_key_file_contents(self) -> String;
+    }
+
+    impl TestStateKeys for &str {
+        fn into_key_file_contents(self) -> String {
+            self.to_string()
         }
+    }
+
+    impl<S: AsRef<str>, const N: usize> TestStateKeys for [S; N] {
+        fn into_key_file_contents(self) -> String {
+            let mut contents = String::new();
+            for key in self {
+                contents.push_str(key.as_ref());
+                contents.push('\n');
+            }
+            contents
+        }
+    }
+
+    fn test_state_with_keys(keys: impl TestStateKeys) -> AppState {
+        let contents = keys.into_key_file_contents();
         test_state_with_keys_api_base_and_event_log_path(&contents, "https://example.com/v1", None)
     }
 
@@ -7388,6 +7405,112 @@ pools:
             .unwrap(),
         )
         .unwrap())
+    }
+
+    fn model_discovery_sync_apply_registry_app(
+        api_base: &str,
+        keys: &str,
+        model_routes: HashMap<String, crate::config::ModelRouteConfig>,
+        event_log_path: Option<PathBuf>,
+        suffix: &str,
+    ) -> (Router, PathBuf) {
+        let keys_file = temp_keys_file(keys);
+        let credential_store_path =
+            temp_sqlite_path(&format!("model-discovery-sync-apply-{suffix}-credentials"));
+        let registry_store_path =
+            temp_sqlite_path(&format!("model-discovery-sync-apply-{suffix}-registry"));
+        let registry: RegistryDocument = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "test-client".to_string(),
+                token: fixture_client_token(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: fixture_admin_token(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: TimeoutConfig::default(),
+            routing: crate::config::RoutingConfig::default(),
+            default_pool: Some("primary".to_string()),
+            providers: HashMap::from([(
+                "relay".to_string(),
+                crate::config::ProviderConfig {
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    enabled: true,
+                },
+            )]),
+            accounts: HashMap::from([(
+                "primary-account".to_string(),
+                crate::config::AccountConfig {
+                    provider: "relay".to_string(),
+                    api_base: api_base.to_string(),
+                    auth_header: "Authorization".to_string(),
+                    auth_prefix: "Bearer ".to_string(),
+                    enabled: true,
+                },
+            )]),
+            credential_sets: credential_sets_from_files([("primary-credentials", keys_file)]),
+            model_routes,
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: HashMap::from([(
+                "default-routing".to_string(),
+                crate::config::RoutingProfileConfig {
+                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry:
+                        crate::config::SameRequestCredentialRetryConfig {
+                            enabled: false,
+                            max_retries: 0,
+                        },
+                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            pools: HashMap::from([(
+                "primary".to_string(),
+                PoolConfig {
+                    enabled: true,
+                    account: Some("primary-account".to_string()),
+                    policy_profile: None,
+                    routing_profile: Some("default-routing".to_string()),
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    api_base: api_base.to_string(),
+                    credential_set: "primary-credentials".to_string(),
+                    auth_header: "Authorization".to_string(),
+                    auth_prefix: "Bearer ".to_string(),
+                    error_rules: Default::default(),
+                },
+            )]),
+        }
+        .into_registry_document();
+        SqliteRegistryStore::bootstrap_from_document(&registry_store_path, registry.clone())
+            .unwrap();
+        let repository = SqliteCredentialRepository::open(&credential_store_path).unwrap();
+        let config = registry
+            .clone()
+            .resolve_with_credential_repository_and_store_path(
+                &repository,
+                Some(credential_store_path),
+            )
+            .unwrap();
+        (
+            app(AppState::new_with_registry_store_and_validation_bootstrap(
+                config,
+                RegistryStoreHandle::sqlite(&registry_store_path).unwrap(),
+                Some(registry),
+            )
+            .unwrap()),
+            registry_store_path,
+        )
     }
 
     fn read_only_test_state_with_api_base(api_base: &str) -> AppState {
@@ -8054,6 +8177,49 @@ pools:
 
         let providers = management_response_json(&app, "/management/providers").await;
         assert_eq!(providers["providers"][0]["enabled"], false);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["events"][1]["kind"], "runtime_reloaded");
+        assert_eq!(events["events"][1]["action"], "runtime_reloaded");
+        assert_eq!(events["events"][1]["resource_type"], "runtime");
+        assert_eq!(events["events"][1]["resource_id"], "runtime");
+        assert_eq!(events["events"][1]["outcome"], "applied");
+        assert_eq!(events["events"][1]["generation"], 2);
+        assert_eq!(events["events"][1]["reason_code"], "manual_runtime_reload");
+        assert_eq!(events["events"][1]["actor"]["name"], "local-admin");
+        assert_eq!(events["events"][1]["actor"]["role"], "admin");
+    }
+
+    #[tokio::test]
+    async fn failed_event_write_does_not_reload_runtime() {
+        let blocking_parent = temp_keys_file("not a directory\n");
+        let event_log_path = blocking_parent.join("events.jsonl");
+        let (app, _) = registry_provider_fixture_with_event_log_path(event_log_path);
+
+        let reload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/runtime/reload")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reload.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let after = management_response_json(&app, "/management/runtime").await;
+        assert_eq!(after["active_registry_version"], 1);
+        assert_eq!(after["staged_registry_version"], 1);
+        assert_eq!(after["runtime_reload_required"], false);
+
+        let providers = management_response_json(&app, "/management/providers").await;
+        assert_eq!(providers["providers"][0]["enabled"], true);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 0);
     }
 
     #[tokio::test]
@@ -10254,6 +10420,61 @@ pools:
             .unwrap()
             .clone();
         assert_eq!(health, ChannelHealth::Available);
+
+        let events = management_response_json(&app(state), "/management/events").await;
+        assert_eq!(events["events"][0]["kind"], "channel_health_reset");
+        assert_eq!(events["events"][0]["action"], "channel_health_reset");
+        assert_eq!(events["events"][0]["resource_type"], "channel");
+        assert_eq!(events["events"][0]["resource_id"], "test");
+        assert_eq!(events["events"][0]["outcome"], "applied");
+        assert_eq!(
+            events["events"][0]["reason_code"],
+            "manual_channel_health_reset"
+        );
+        assert_eq!(events["events"][0]["actor"]["name"], "local-admin");
+        assert_eq!(events["events"][0]["actor"]["role"], "admin");
+    }
+
+    #[tokio::test]
+    async fn failed_event_write_does_not_reset_channel_health() {
+        let blocking_parent = temp_keys_file("not a directory\n");
+        let event_log_path = blocking_parent.join("events.jsonl");
+        let state = test_state_with_api_base_and_event_log_path(
+            "https://example.com/v1",
+            Some(event_log_path),
+        );
+        let before_generation = {
+            let channel = state.channels.get("test").unwrap();
+            *channel.health.lock().unwrap() = ChannelHealth::CoolingDown {
+                until: Instant::now() + Duration::from_secs(60),
+                reason: "manual fixture".to_string(),
+            };
+            channel.channel_health_generation.load(Ordering::Acquire)
+        };
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/channels/test/reset-health")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let channel = state.channels.get("test").unwrap();
+        assert!(matches!(
+            *channel.health.lock().unwrap(),
+            ChannelHealth::CoolingDown { .. }
+        ));
+        assert_eq!(
+            channel.channel_health_generation.load(Ordering::Acquire),
+            before_generation
+        );
+        assert_eq!(state.events.len(), 0);
     }
 
     #[tokio::test]
@@ -10269,8 +10490,14 @@ pools:
         let gate = state.channels.get("test").unwrap().mutation_gate.clone();
         let guard = gate.lock().await;
         let state_for_task = state.clone();
-        let reset_task =
-            tokio::spawn(async move { reset_channel_health_status(&state_for_task, "test").await });
+        let actor = ManagementEventActor {
+            id: "admin".to_string(),
+            name: "local-admin".to_string(),
+            role: "admin".to_string(),
+        };
+        let reset_task = tokio::spawn(async move {
+            reset_channel_health_status(&state_for_task, actor, "test").await
+        });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -10284,6 +10511,46 @@ pools:
             .unwrap()
             .unwrap();
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn management_reset_health_does_not_hold_proxy_gates_while_event_append_waits() {
+        let mut state = test_state();
+        state.events = EventLog::with_append_delay(Duration::from_millis(250));
+        let pool_state = state.channels.get("test").unwrap().clone();
+        {
+            *pool_state.health.lock().unwrap() = ChannelHealth::CoolingDown {
+                until: Instant::now() + Duration::from_secs(60),
+                reason: "manual fixture".to_string(),
+            };
+        }
+        let actor = ManagementEventActor {
+            id: "admin".to_string(),
+            name: "local-admin".to_string(),
+            role: "admin".to_string(),
+        };
+        let state_for_task = state.clone();
+
+        let reset_task = tokio::spawn(async move {
+            reset_channel_health_status(&state_for_task, actor, "test").await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            pool_state.mutation_gate.try_lock().is_ok(),
+            "mutation gate is held while management event append is blocked"
+        );
+        assert!(
+            pool_state.send_gate.try_read().is_ok(),
+            "send gate write lock is held while management event append is blocked"
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(1), reset_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
+        assert_eq!(state.events.len(), 1);
     }
 
     #[tokio::test]
@@ -12462,6 +12729,188 @@ pools:
     }
 
     #[tokio::test]
+    async fn management_credential_metadata_update_records_audit_without_operator_text() {
+        let state = test_state_with_keys("upstream-key-a\n");
+        let app = app(state);
+        let credentials = management_response_json(
+            &app,
+            "/management/credential-sets/test-credentials/credentials",
+        )
+        .await;
+        let credential_id = credentials["credentials"][0]["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/management/credential-sets/test-credentials/credentials/{credential_id}/metadata"
+                    ))
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"label":"primary relay","note":"operator-only routing note"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 1);
+        assert_eq!(events["events"][0]["kind"], "credential_metadata_updated");
+        assert_eq!(events["events"][0]["action"], "credential_metadata_updated");
+        assert_eq!(events["events"][0]["resource_type"], "credential");
+        assert_eq!(events["events"][0]["resource_id"], credential_id);
+        assert_eq!(
+            events["events"][0]["reason_code"],
+            "manual_credential_metadata_update"
+        );
+        assert_eq!(events["events"][0]["actor"]["name"], "local-admin");
+        let events_text = events.to_string();
+        assert!(!events_text.contains("primary relay"));
+        assert!(!events_text.contains("operator-only routing note"));
+        assert!(!events_text.contains("upstream-key-a"));
+    }
+
+    #[tokio::test]
+    async fn failed_metadata_audit_write_does_not_update_credential_metadata() {
+        let blocking_parent = temp_keys_file("not a directory\n");
+        let event_log_path = blocking_parent.join("events.jsonl");
+        let state = test_state_with_keys_api_base_and_event_log_path(
+            "upstream-key-a\n",
+            "https://example.com/v1",
+            Some(event_log_path),
+        );
+        let app = app(state);
+        let credentials = management_response_json(
+            &app,
+            "/management/credential-sets/test-credentials/credentials",
+        )
+        .await;
+        let credential_id = credentials["credentials"][0]["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/management/credential-sets/test-credentials/credentials/{credential_id}/metadata"
+                    ))
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"label":"primary relay","note":"operator-only routing note"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = management_response_json(
+            &app,
+            &format!("/management/credential-sets/test-credentials/credentials/{credential_id}"),
+        )
+        .await;
+        assert!(detail["resource"]["label"].is_null());
+        assert!(detail["resource"]["note"].is_null());
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 0);
+    }
+
+    #[tokio::test]
+    async fn management_credential_import_records_audit_without_keys() {
+        let state = test_state_with_keys("upstream-key-a\n");
+        let app = app(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/credential-sets/test-credentials/credentials/import")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"keys":["upstream-key-b"],"batch_id":"manual-batch"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 1);
+        assert_eq!(
+            events["events"][0]["kind"],
+            "credential_set_credentials_imported"
+        );
+        assert_eq!(
+            events["events"][0]["action"],
+            "credential_set_credentials_imported"
+        );
+        assert_eq!(events["events"][0]["resource_type"], "credential_set");
+        assert_eq!(events["events"][0]["resource_id"], "test-credentials");
+        assert_eq!(
+            events["events"][0]["reason_code"],
+            "manual_credential_import"
+        );
+        let events_text = events.to_string();
+        assert!(!events_text.contains("upstream-key-a"));
+        assert!(!events_text.contains("upstream-key-b"));
+    }
+
+    #[tokio::test]
+    async fn failed_import_audit_write_does_not_add_store_or_runtime_credential() {
+        let blocking_parent = temp_keys_file("not a directory\n");
+        let event_log_path = blocking_parent.join("events.jsonl");
+        let state = test_state_with_keys_api_base_and_event_log_path(
+            "upstream-key-a\n",
+            "https://example.com/v1",
+            Some(event_log_path),
+        );
+        let app = app(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/credential-sets/test-credentials/credentials/import")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"keys":["upstream-key-b"],"batch_id":"manual-batch"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let credentials = management_response_json(
+            &app,
+            "/management/credential-sets/test-credentials/credentials",
+        )
+        .await;
+        assert_eq!(credentials["total_credentials"], 1);
+        let imports =
+            management_response_json(&app, "/management/credential-sets/test-credentials/imports")
+                .await;
+        assert_eq!(imports["imports"].as_array().unwrap().len(), 1);
+        assert_eq!(imports["imports"][0]["source_kind"], "file_bootstrap");
+        let runtime = management_response_json(&app, "/management/runtime").await;
+        assert_eq!(runtime["credentials"]["total"], 1);
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 0);
+    }
+
+    #[tokio::test]
     async fn management_probe_credential_records_success_without_leaking_secret() {
         let upstream = spawn_upstream(Router::new().route(
             "/v1/models/*model",
@@ -12601,6 +13050,77 @@ pools:
         assert_eq!(probes["probes"].as_array().unwrap().len(), 1);
         assert_eq!(probes["probes"][0]["outcome"], "success");
         assert!(!probes.to_string().contains("upstream-key-a"));
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 1);
+        assert_eq!(events["events"][0]["kind"], "credential_probe_recorded");
+        assert_eq!(events["events"][0]["action"], "credential_probe_recorded");
+        assert_eq!(events["events"][0]["resource_type"], "credential");
+        assert_eq!(events["events"][0]["resource_id"], credential_id);
+        assert_eq!(
+            events["events"][0]["reason_code"],
+            "manual_credential_probe"
+        );
+        let events_text = events.to_string();
+        assert!(!events_text.contains("upstream-key-a"));
+        assert!(!events_text.contains("vendor/probe-model"));
+    }
+
+    #[tokio::test]
+    async fn failed_probe_audit_write_does_not_persist_probe_result() {
+        let upstream = spawn_upstream(Router::new().route(
+            "/v1/models/probe-model",
+            get(|| async { Json(serde_json::json!({"id":"probe-model","object":"model"})) }),
+        ))
+        .await;
+        let blocking_parent = temp_keys_file("not a directory\n");
+        let event_log_path = blocking_parent.join("events.jsonl");
+        let state = test_state_with_keys_api_base_and_event_log_path(
+            "upstream-key-a\n",
+            &upstream,
+            Some(event_log_path),
+        );
+        let app = app(state);
+        let credentials = management_response_json(
+            &app,
+            "/management/credential-sets/test-credentials/credentials",
+        )
+        .await;
+        let credential_id = credentials["credentials"][0]["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/management/credential-sets/test-credentials/credentials/{credential_id}/probe"
+                    ))
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"probe-model","timeout_seconds":2}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let probes = management_response_json(
+            &app,
+            &format!(
+                "/management/credential-sets/test-credentials/credentials/{credential_id}/probes"
+            ),
+        )
+        .await;
+        assert_eq!(probes["probes"].as_array().unwrap().len(), 0);
+        let detail = management_response_json(
+            &app,
+            &format!("/management/credential-sets/test-credentials/credentials/{credential_id}"),
+        )
+        .await;
+        assert!(detail["latest_probe"].is_null());
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 0);
     }
 
     #[tokio::test]
@@ -13331,6 +13851,13 @@ pools:
         assert_eq!(after_runtime["active_registry_version"], 1);
         assert_eq!(after_runtime["staged_registry_version"], 2);
         assert_eq!(after_runtime["runtime_reload_required"], true);
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 1);
+        assert!(events["events"].as_array().unwrap().iter().all(|event| {
+            event["kind"] != "registry_model_route_discovery_synced"
+                && event["reason_code"] != "model_discovery_sync_apply"
+        }));
     }
 
     #[tokio::test]
@@ -13539,6 +14066,20 @@ pools:
             "primary"
         );
 
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 1);
+        assert_management_event(
+            &events,
+            0,
+            "registry_model_route_discovery_synced",
+            "registry_model_route_batch",
+            "model_discovery_sync_apply",
+            2,
+            "model_discovery_sync_apply",
+        );
+        assert_eq!(events["events"][0]["actor"]["role"], "admin");
+        assert_eq!(events["events"][0]["actor"]["name"], "local-admin");
+
         let after_runtime_routes = management_response_json(&app, "/management/model-routes").await;
         assert_eq!(after_runtime_routes, before_runtime_routes);
         let runtime = management_response_json(&app, "/management/runtime").await;
@@ -13563,6 +14104,57 @@ pools:
         let reloaded_routes = management_response_json(&app, "/management/model-routes").await;
         assert_eq!(reloaded_routes["routes"].as_array().unwrap().len(), 3);
         assert_eq!(reloaded_routes["routes"][0]["model"], "a-model");
+    }
+
+    #[tokio::test]
+    async fn management_model_discovery_sync_apply_event_append_failure_preserves_registry() {
+        let upstream = spawn_upstream(Router::new().route(
+            "/v1/models",
+            get(|| async {
+                Json(serde_json::json!({
+                    "object": "list",
+                    "data": [{"id": "audit-failure-model", "object": "model"}]
+                }))
+            }),
+        ))
+        .await;
+        let blocking_parent = temp_keys_file("not a directory\n");
+        let event_log_path = blocking_parent.join("events.jsonl");
+        let (app, registry_store_path) = model_discovery_sync_apply_registry_app(
+            &upstream,
+            "upstream-key-a\n",
+            HashMap::new(),
+            Some(event_log_path),
+            "audit-failure",
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/model-discovery/sync-apply")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"channel_ids":["primary"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let stored = SqliteRegistryStore::open(&registry_store_path)
+            .unwrap()
+            .load_registry_for_validation()
+            .unwrap();
+        assert!(stored.model_routes.is_empty());
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 0);
+        let runtime = management_response_json(&app, "/management/runtime").await;
+        assert_eq!(runtime["active_registry_version"], 1);
+        assert_eq!(runtime["staged_registry_version"], 1);
+        assert_eq!(runtime["runtime_reload_required"], false);
     }
 
     #[tokio::test]
@@ -15588,6 +16180,145 @@ pools:
             .unwrap();
         assert!((1..=15).contains(&remaining));
         assert!(!applied.to_string().contains("upstream-key-a"));
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 1);
+        assert_eq!(events["events"][0]["kind"], "credential_cooldown_applied");
+        assert_eq!(events["events"][0]["action"], "credential_cooldown_applied");
+        assert_eq!(events["events"][0]["resource_type"], "credential");
+        assert_eq!(events["events"][0]["resource_id"], credential_id);
+        assert_eq!(
+            events["events"][0]["reason_code"],
+            "manual_apply_latest_probe_cooldown"
+        );
+        assert!(!events.to_string().contains("upstream-key-a"));
+    }
+
+    #[tokio::test]
+    async fn failed_apply_latest_probe_cooldown_audit_write_does_not_enter_cooldown() {
+        let keys_file = temp_keys_file("upstream-key-a\n");
+        let db_path = temp_sqlite_path("credential-probe-cooldown-audit-fail");
+        let repository = SqliteCredentialRepository::open(&db_path).unwrap();
+        let blocking_parent = temp_keys_file("not a directory\n");
+        let event_log_path = blocking_parent.join("events.jsonl");
+        let app = app(AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: Some(event_log_path),
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("primary".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets: credential_sets_from_files([("shared-credentials", keys_file)]),
+                model_routes: HashMap::new(),
+                policy_profiles: HashMap::from([(
+                    "probe-policy".to_string(),
+                    PolicyProfileConfig {
+                        error_rules: ErrorRulesConfig::default(),
+                        probe_result_actions: crate::config::ProbeResultActionConfig {
+                            unknown: Some(crate::config::ProbeResultActionKindConfig::Cooldown),
+                            cooldown_seconds: Some(15),
+                            ..Default::default()
+                        },
+                    },
+                )]),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([(
+                    "primary".to_string(),
+                    PoolConfig {
+                        policy_profile: Some("probe-policy".to_string()),
+                        ..openai_pool("https://primary.example/v1", "shared-credentials")
+                    },
+                )]),
+            }
+            .resolve_with_credential_repository_and_store_path(&repository, Some(db_path.clone()))
+            .unwrap(),
+        )
+        .unwrap());
+        let credentials = management_response_json(
+            &app,
+            "/management/credential-sets/shared-credentials/credentials",
+        )
+        .await;
+        let credential_id = credentials["credentials"][0]["id"].as_str().unwrap();
+        repository
+            .record_probe_result(
+                crate::credential_repository::CredentialProbeResultRecordInput {
+                    credential_set_id: crate::credential_repository::CredentialSetId(
+                        "shared-credentials".to_string(),
+                    ),
+                    credential_id: crate::credentials::CredentialId(credential_id.to_string()),
+                    channel_id: "primary".to_string(),
+                    provider_id: "provider:openai_compatible".to_string(),
+                    account_id: "account:primary".to_string(),
+                    outcome: crate::credential_repository::CredentialProbeOutcome::Unknown,
+                    classifier_id: None,
+                    adaptation_rule_id: None,
+                    upstream_status: None,
+                    upstream_code: None,
+                    upstream_limit_type: None,
+                    latency_ms: 10,
+                },
+            )
+            .unwrap();
+
+        let apply_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/management/credential-sets/shared-credentials/credentials/{credential_id}/apply-latest-probe"
+                    ))
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(apply_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = management_response_json(
+            &app,
+            &format!("/management/credential-sets/shared-credentials/credentials/{credential_id}"),
+        )
+        .await;
+        assert_eq!(detail["credential"]["state"]["kind"], "available");
+        assert_eq!(detail["latest_probe"]["outcome"], "unknown");
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 0);
     }
 
     #[tokio::test]
@@ -15762,8 +16493,13 @@ pools:
         );
 
         let events = management_response_json(&app, "/management/events").await;
-        assert_eq!(events["events"][0]["kind"], "credential_quota_exhausted");
-        assert_eq!(events["events"][0]["credential_id"], credential_id);
+        let quota_event = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["kind"] == "credential_quota_exhausted")
+            .expect("expected credential_quota_exhausted audit event");
+        assert_eq!(quota_event["credential_id"], credential_id);
     }
 
     #[tokio::test]
