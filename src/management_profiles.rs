@@ -8,7 +8,7 @@ use crate::{
         ProbeResultPolicy, ResolvedErrorPolicySources, ResolvedPolicyProfile,
         ResolvedRoutingProfile,
     },
-    error::{ErrorClassifierSnapshot, FailureKind, FailureScope},
+    error::{BalanceScope, ErrorClassifierSnapshot, FailureKind, FailureScope, RelayProfile},
     management_errors::ManagementServiceError,
     management_resource_lookup::{
         channel_error_rules_lookup, policy_profile, policy_profile_channel_ids, policy_profiles,
@@ -24,6 +24,8 @@ pub struct ErrorRulesResponse {
     pub has_pool_override: bool,
     pub classifier_id: String,
     pub classifier_version: String,
+    pub relay_profile: RelayProfile,
+    pub balance_scope: BalanceScope,
     pub keep_codes: Vec<String>,
     pub switch_codes: Vec<String>,
     pub expire_codes: Vec<String>,
@@ -120,6 +122,10 @@ pub struct ErrorRuleCounts {
 
 #[derive(Debug, Serialize)]
 pub struct ErrorRulesConfigStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_profile: Option<RelayProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_scope: Option<BalanceScope>,
     pub keep_codes: Vec<String>,
     pub switch_codes: Vec<String>,
     pub expire_codes: Vec<String>,
@@ -206,9 +212,13 @@ pub fn error_rules_response(
         policy_profile_id: error_policy_sources
             .as_ref()
             .and_then(|sources| sources.profile_id.clone()),
-        has_pool_override: error_policy_sources.is_some_and(|sources| sources.has_pool_override),
+        has_pool_override: error_policy_sources
+            .as_ref()
+            .is_some_and(|sources| sources.has_pool_override),
         classifier_id: snapshot.classifier_id,
         classifier_version: snapshot.classifier_version,
+        relay_profile: snapshot.relay_profile,
+        balance_scope: snapshot.balance_scope,
         keep_codes: snapshot.keep_codes,
         switch_codes: snapshot.switch_codes,
         expire_codes: snapshot.expire_codes,
@@ -332,6 +342,8 @@ pub fn probe_result_policy_status(policy: &ProbeResultPolicy) -> ProbeResultPoli
 
 pub fn error_rules_config_status(error_rules: &ErrorRulesConfig) -> ErrorRulesConfigStatus {
     ErrorRulesConfigStatus {
+        relay_profile: error_rules.relay_profile,
+        balance_scope: error_rules.balance_scope,
         keep_codes: error_rules.keep_codes.clone().unwrap_or_default(),
         switch_codes: error_rules.switch_codes.clone().unwrap_or_default(),
         expire_codes: error_rules.expire_codes.clone().unwrap_or_default(),

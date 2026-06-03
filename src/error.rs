@@ -29,6 +29,27 @@ pub enum FailureScope {
     ClientToken,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayProfile {
+    #[default]
+    #[serde(rename = "official_openai")]
+    OfficialOpenAi,
+    GenericRelay,
+    UntrustedRelay,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BalanceScope {
+    #[default]
+    Credential,
+    Channel,
+    Account,
+    Provider,
+    ClientToken,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureConfidence {
     Low,
@@ -60,6 +81,8 @@ pub struct ClassifiedFailure {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorClassifier {
+    relay_profile: RelayProfile,
+    balance_scope: BalanceScope,
     keep_codes: Vec<String>,
     switch_codes: Vec<String>,
     expire_codes: Vec<String>,
@@ -73,6 +96,8 @@ pub struct ErrorClassifier {
 pub struct ErrorClassifierSnapshot {
     pub classifier_id: String,
     pub classifier_version: String,
+    pub relay_profile: RelayProfile,
+    pub balance_scope: BalanceScope,
     pub keep_codes: Vec<String>,
     pub switch_codes: Vec<String>,
     pub expire_codes: Vec<String>,
@@ -124,6 +149,8 @@ impl ErrorClassifier {
         ErrorClassifierSnapshot {
             classifier_id: self.classifier_id().to_string(),
             classifier_version: self.classifier_version().to_string(),
+            relay_profile: self.relay_profile,
+            balance_scope: self.balance_scope,
             keep_codes: self.keep_codes.clone(),
             switch_codes: self.switch_codes.clone(),
             expire_codes: self.expire_codes.clone(),
@@ -148,11 +175,21 @@ impl ErrorClassifier {
             FailureScope::ProviderAdapter,
             FailureScope::ClientToken,
         );
-        let (kind, primary_scope, retryable, confidence) = evidence
-            .code
-            .as_deref()
-            .and_then(|code| self.classify_code(code))
-            .unwrap_or_else(|| self.classify_status(status));
+        let (kind, primary_scope, retryable, confidence) =
+            if evidence.code.is_none() && evidence.has_top_level_error_object {
+                (
+                    FailureKind::ClientError,
+                    FailureScope::RequestOnly,
+                    false,
+                    FailureConfidence::Medium,
+                )
+            } else {
+                evidence
+                    .code
+                    .as_deref()
+                    .and_then(|code| self.classify_code(code))
+                    .unwrap_or_else(|| self.classify_status(status))
+            };
         let (cooldown, retry_after_source) = retry_after(headers);
         let mut failure = ClassifiedFailure {
             kind,
@@ -308,6 +345,18 @@ impl ErrorClassifier {
         }
 
         if matches_status(&self.expire_statuses, status) {
+            if matches!(
+                self.relay_profile,
+                RelayProfile::GenericRelay | RelayProfile::UntrustedRelay
+            ) && matches!(status, 401 | 403)
+            {
+                return (
+                    FailureKind::ClientError,
+                    FailureScope::RequestOnly,
+                    false,
+                    FailureConfidence::Medium,
+                );
+            }
             return (
                 FailureKind::AuthInvalid,
                 FailureScope::Credential,
@@ -375,6 +424,8 @@ fn retry_after_with_now(
 impl Default for ErrorClassifier {
     fn default() -> Self {
         Self {
+            relay_profile: RelayProfile::OfficialOpenAi,
+            balance_scope: BalanceScope::Credential,
             keep_codes: vec!["key_switch_cooldown".to_string()],
             switch_codes: vec![
                 "insufficient_quota".to_string(),
@@ -442,6 +493,7 @@ struct UpstreamErrorEvidence {
     status: u16,
     code: Option<String>,
     limit_type: Option<String>,
+    has_top_level_error_object: bool,
 }
 
 impl UpstreamErrorEvidence {
@@ -451,6 +503,10 @@ impl UpstreamErrorEvidence {
             status,
             code: value.as_ref().and_then(error_code_from_value),
             limit_type: value.as_ref().and_then(limit_type_from_value),
+            has_top_level_error_object: value
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .is_some_and(Value::is_object),
         }
     }
 }
@@ -495,6 +551,8 @@ impl ErrorAdaptationMatcher {
 
 #[derive(Debug, Clone, Default)]
 pub struct ErrorClassifierSpec {
+    pub relay_profile: RelayProfile,
+    pub balance_scope: BalanceScope,
     pub keep_codes: Option<Vec<String>>,
     pub switch_codes: Option<Vec<String>>,
     pub expire_codes: Option<Vec<String>>,
@@ -508,6 +566,8 @@ impl ErrorClassifierSpec {
     pub fn build(self) -> anyhow::Result<ErrorClassifier> {
         let default = ErrorClassifier::default();
         Ok(ErrorClassifier {
+            relay_profile: self.relay_profile,
+            balance_scope: self.balance_scope,
             keep_codes: merge_or_default(self.keep_codes, default.keep_codes),
             switch_codes: merge_or_default(self.switch_codes, default.switch_codes),
             expire_codes: merge_or_default(self.expire_codes, default.expire_codes),
@@ -725,6 +785,8 @@ mod tests {
     #[test]
     fn configured_rules_override_defaults() {
         let classifier = ErrorClassifierSpec {
+            relay_profile: RelayProfile::OfficialOpenAi,
+            balance_scope: BalanceScope::Credential,
             keep_codes: Some(vec!["rate_limit_cooldown".to_string()]),
             switch_codes: Some(vec!["custom_switch".to_string()]),
             expire_codes: Some(vec!["custom_expire".to_string()]),
@@ -857,5 +919,119 @@ mod tests {
         assert!(StatusMatcher::parse("7xx").is_err());
         assert!(StatusMatcher::parse("999").is_err());
         assert!(StatusMatcher::parse("99").is_err());
+    }
+
+    fn classifier_for_relay_profile(relay_profile: RelayProfile) -> ErrorClassifier {
+        ErrorClassifierSpec {
+            relay_profile,
+            balance_scope: BalanceScope::Credential,
+            ..Default::default()
+        }
+        .build()
+        .unwrap()
+    }
+
+    #[test]
+    fn phase_1a_official_bare_401_expires_credential() {
+        let failure = classifier_for_relay_profile(RelayProfile::OfficialOpenAi).classify_failure(
+            401,
+            &[],
+            b"{}",
+        );
+
+        assert_eq!(failure.kind, FailureKind::AuthInvalid);
+        assert_eq!(failure.primary_scope, FailureScope::Credential);
+        assert!(!failure.retryable);
+    }
+
+    #[test]
+    fn phase_1a_generic_bare_401_is_request_only() {
+        let failure = classifier_for_relay_profile(RelayProfile::GenericRelay).classify_failure(
+            401,
+            &[],
+            b"{}",
+        );
+
+        assert_eq!(failure.kind, FailureKind::ClientError);
+        assert_eq!(failure.primary_scope, FailureScope::RequestOnly);
+        assert!(!failure.retryable);
+    }
+
+    #[test]
+    fn phase_1a_untrusted_bare_403_is_request_only() {
+        let failure = classifier_for_relay_profile(RelayProfile::UntrustedRelay).classify_failure(
+            403,
+            &[],
+            b"{}",
+        );
+
+        assert_eq!(failure.kind, FailureKind::ClientError);
+        assert_eq!(failure.primary_scope, FailureScope::RequestOnly);
+        assert!(!failure.retryable);
+    }
+
+    #[test]
+    fn phase_1a_structured_invalid_key_expires_credential_for_all_profiles() {
+        for relay_profile in [
+            RelayProfile::OfficialOpenAi,
+            RelayProfile::GenericRelay,
+            RelayProfile::UntrustedRelay,
+        ] {
+            let failure = classifier_for_relay_profile(relay_profile).classify_failure(
+                400,
+                &[],
+                br#"{"error":{"code":"invalid_api_key"}}"#,
+            );
+
+            assert_eq!(failure.kind, FailureKind::AuthInvalid);
+            assert_eq!(failure.primary_scope, FailureScope::Credential);
+            assert!(!failure.retryable);
+        }
+    }
+
+    #[test]
+    fn phase_1a_bare_429_is_credential_rate_limited_for_all_profiles() {
+        for relay_profile in [
+            RelayProfile::OfficialOpenAi,
+            RelayProfile::GenericRelay,
+            RelayProfile::UntrustedRelay,
+        ] {
+            let failure =
+                classifier_for_relay_profile(relay_profile).classify_failure(429, &[], b"{}");
+
+            assert_eq!(failure.kind, FailureKind::RateLimited);
+            assert_eq!(failure.primary_scope, FailureScope::Credential);
+            assert!(failure.retryable);
+        }
+    }
+
+    #[test]
+    fn phase_1a_structured_quota_with_credential_scope_exhausts_credential() {
+        let failure = ErrorClassifierSpec {
+            relay_profile: RelayProfile::GenericRelay,
+            balance_scope: BalanceScope::Credential,
+            ..Default::default()
+        }
+        .build()
+        .unwrap()
+        .classify_failure(400, &[], br#"{"error":{"code":"insufficient_quota"}}"#);
+
+        assert_eq!(failure.kind, FailureKind::QuotaExhausted);
+        assert_eq!(failure.primary_scope, FailureScope::Credential);
+        assert!(!failure.retryable);
+    }
+
+    #[test]
+    fn phase_1a_code_less_top_level_error_object_is_request_only() {
+        let failure = classifier_for_relay_profile(RelayProfile::OfficialOpenAi).classify_failure(
+            401,
+            &[],
+            br#"{"error":{"message":"synthetic client error"}}"#,
+        );
+
+        assert_eq!(failure.kind, FailureKind::ClientError);
+        assert_eq!(failure.primary_scope, FailureScope::RequestOnly);
+        assert!(!failure.retryable);
+        assert_eq!(failure.upstream_code, None);
     }
 }

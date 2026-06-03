@@ -859,7 +859,10 @@ mod tests {
             CredentialLifecycleState, CredentialRepository, CredentialSetId,
             SqliteCredentialRepository,
         },
-        error::{ClassifiedFailure, FailureConfidence, FailureKind, FailureScope},
+        error::{
+            BalanceScope, ClassifiedFailure, FailureConfidence, FailureKind, FailureScope,
+            RelayProfile,
+        },
         events::{EventLog, ManagementEventActor, RoutingTelemetry},
         failure_observer::transition_observed_upstream_failure,
         management_commands::{
@@ -10256,6 +10259,8 @@ pools:
                 "relay-profile".to_string(),
                 PolicyProfileConfig {
                     error_rules: ErrorRulesConfig {
+                        relay_profile: Some(RelayProfile::GenericRelay),
+                        balance_scope: Some(BalanceScope::Credential),
                         adaptation_rules: vec![profile_rule],
                         ..ErrorRulesConfig::default()
                     },
@@ -10289,6 +10294,7 @@ pools:
                     auth_header: "authorization".to_string(),
                     auth_prefix: "Bearer ".to_string(),
                     error_rules: ErrorRulesConfig {
+                        relay_profile: Some(RelayProfile::OfficialOpenAi),
                         adaptation_rules: vec![pool_rule],
                         ..ErrorRulesConfig::default()
                     },
@@ -10317,6 +10323,8 @@ pools:
         let value = serde_json::from_str::<Value>(&body).unwrap();
         assert_eq!(value["policy_profile_id"], "relay-profile");
         assert_eq!(value["has_pool_override"], true);
+        assert_eq!(value["relay_profile"], "official_openai");
+        assert_eq!(value["balance_scope"], "credential");
         assert_eq!(value["adaptation_rules"][0]["id"], "profile-rpm");
         assert_eq!(value["adaptation_rules"][0]["source"], "profile");
         assert_eq!(value["adaptation_rules"][0]["profile_id"], "relay-profile");
@@ -10359,6 +10367,8 @@ pools:
                 "relay-profile".to_string(),
                 PolicyProfileConfig {
                     error_rules: ErrorRulesConfig {
+                        relay_profile: Some(RelayProfile::GenericRelay),
+                        balance_scope: Some(BalanceScope::Credential),
                         switch_codes: Some(vec!["rate_limit_exceeded".to_string()]),
                         adaptation_rules: vec![ErrorAdaptationRuleConfig {
                             id: "profile-rpm".to_string(),
@@ -10433,6 +10443,8 @@ pools:
         assert_eq!(profile["id"], "relay-profile");
         assert_eq!(profile["channel_ids"][0], "test");
         assert_eq!(profile["channel_count"], 1);
+        assert_eq!(profile["error_rules"]["relay_profile"], "generic_relay");
+        assert_eq!(profile["error_rules"]["balance_scope"], "credential");
         assert_eq!(profile["rule_counts"]["switch_codes"], 1);
         assert_eq!(profile["rule_counts"]["adaptation_rules"], 1);
 
@@ -10450,6 +10462,11 @@ pools:
         let detail_body = to_bytes(detail_response.into_body(), 4096).await.unwrap();
         let detail_value = serde_json::from_slice::<Value>(&detail_body).unwrap();
         assert_eq!(detail_value["id"], "relay-profile");
+        assert_eq!(
+            detail_value["error_rules"]["relay_profile"],
+            "generic_relay"
+        );
+        assert_eq!(detail_value["error_rules"]["balance_scope"], "credential");
         assert_eq!(
             detail_value["error_rules"]["switch_codes"][0],
             "rate_limit_exceeded"

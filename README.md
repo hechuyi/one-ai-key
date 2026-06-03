@@ -96,6 +96,30 @@ upstreams:
         upstream_model: provider/gpt-5.4-mini
 ```
 
+Relay error semantics can be selected with `relay_profile` in a policy profile,
+channel-local `error_rules`, or an `upstreams` shortcut. Phase 1A supports three
+profiles: `official_openai`, `generic_relay`, and `untrusted_relay`.
+`official_openai` preserves the default behavior where bare `401`/`403` means
+the selected credential is invalid. The relay profiles treat bare `401`/`403`
+conservatively as request-only client errors unless structured invalid-key
+evidence is present. All profiles keep structured invalid-key evidence
+credential-scoped, bare `429` credential-scoped, and code-less top-level error
+objects request-only.
+
+`balance_scope` defaults to `credential`. In Phase 1A, only credential-scoped
+structured quota evidence is supported; `balance_scope: channel` parses but is
+rejected during config resolution until Phase 1B adds channel suppression state.
+Account, provider, and client-token balance scopes are also rejected. Error
+rules match structured status, upstream code, and limit-type evidence only; there
+is no free-form upstream message matcher on the request path.
+
+Inspect effective policies through the existing management endpoints:
+
+```text
+GET /management/channels/{channel_id}/error-rules
+GET /management/policy-profiles/{profile_id}
+```
+
 Example request:
 
 ```bash
@@ -180,6 +204,11 @@ curl -sS http://localhost:4101/management/model-discovery/sync-apply \
 validated registry transaction. It does not update virtual-key scope and does
 not affect client traffic until `POST /management/runtime/reload` or a process
 restart applies the staged registry.
+
+Client-facing `/v1/models` remains a compiled runtime projection over explicit
+`model_routes` filtered by the authenticated client token. It does not call
+upstream `/v1/models`; upstream discovery is available only through the
+management-only discovery and sync endpoints above.
 
 Credential rotation runbook:
 

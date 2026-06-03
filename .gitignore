@@ -18,6 +18,7 @@
 /docker-compose.override.yml
 /key-pool-router/
 /config/*.yaml
+/scripts/one_ai_key_keys.py
 
 # Secret material.
 *.pem
@@ -33,3 +34,7 @@ AGENTS.md
 *.pid
 *.tmp
 .DS_Store
+
+# Python cache.
+__pycache__/
+*.py[cod]

@@ -165,6 +165,8 @@ Unsupported matcher fields such as free-form message contains/regex matching mus
 
 **Phase 1A stop card:** red tests cover profile config resolution, current-config backward compatibility, each table row, unsupported field rejection, unsupported `balance_scope: channel` rejection, management policy projection fields, and absence of request-path free-form message parsing. Complete only when these tests pass under `scripts/local-ci.sh` and the local x86_64 build gate still passes.
 
+**Status note:** Phase 1A documentation and acceptance scope is limited to the typed classifier semantics above. The current management acceptance surface is the existing `/management/channels/:id/error-rules` effective-rule projection plus `/management/policy-profiles` and `/management/policy-profiles/:id` profile projections. `/v1/models` remains a compiled runtime projection over explicit `model_routes`; Phase 1A does not add live upstream model aggregation, channel balance suppression, free-form message matchers, or new management endpoints.
+
 ## Phase 1B: Channel Balance Suppression State
 
 **Purpose:** enable `balance_scope: channel` as a transient selected-channel availability state.

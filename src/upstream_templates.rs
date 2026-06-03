@@ -10,7 +10,7 @@ use crate::{
         ModelRouteConfig, ModelRouteTargetConfig, PolicyProfileConfig, PoolConfig,
         ProbeResultActionConfig, ProviderConfig,
     },
-    error::{FailureKind, FailureScope},
+    error::{BalanceScope, FailureKind, FailureScope, RelayProfile},
     provider::ProviderKind,
 };
 
@@ -33,6 +33,10 @@ struct UpstreamShortcutConfig {
     auth_header: Option<String>,
     #[serde(default)]
     auth_prefix: Option<String>,
+    #[serde(default)]
+    relay_profile: Option<RelayProfile>,
+    #[serde(default)]
+    balance_scope: Option<BalanceScope>,
     #[serde(default = "crate::config::default_enabled")]
     enabled: bool,
     #[serde(default)]
@@ -274,7 +278,11 @@ fn expand_in_value(
                 credential_set: credential_set_id,
                 auth_header,
                 auth_prefix,
-                error_rules: ErrorRulesConfig::default(),
+                error_rules: ErrorRulesConfig {
+                    relay_profile: upstream.relay_profile,
+                    balance_scope: upstream.balance_scope,
+                    ..ErrorRulesConfig::default()
+                },
             },
         )?;
 
@@ -550,6 +558,8 @@ fn section_mapping_mut<'a>(
 fn hhhl_policy_profile() -> PolicyProfileConfig {
     PolicyProfileConfig {
         error_rules: ErrorRulesConfig {
+            relay_profile: None,
+            balance_scope: None,
             keep_codes: Some(vec!["key_switch_cooldown".to_string()]),
             switch_codes: Some(vec![
                 "insufficient_quota".to_string(),
@@ -579,6 +589,8 @@ fn hhhl_policy_profile() -> PolicyProfileConfig {
 fn xiaomi_mimo_policy_profile() -> PolicyProfileConfig {
     PolicyProfileConfig {
         error_rules: ErrorRulesConfig {
+            relay_profile: None,
+            balance_scope: None,
             keep_codes: None,
             switch_codes: Some(vec![
                 "rate_limit_exceeded".to_string(),
@@ -993,6 +1005,36 @@ upstreams:
         assert!(
             err.to_string().contains("unknown field"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn upstream_shortcut_expands_relay_profile_and_balance_scope() {
+        let raw = local_fixture_config_yaml(
+            r#"
+default_pool: relay
+upstreams:
+  relay:
+    template: openai_compatible_bearer
+    api_base: https://relay.example.test/v1
+    keys_file: data/relay.keys
+    relay_profile: generic_relay
+    balance_scope: credential
+    models:
+      - relay-model
+"#,
+        );
+
+        let expanded = expand_raw_yaml(&raw).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&expanded).unwrap();
+
+        assert_eq!(
+            value["pools"]["relay"]["error_rules"]["relay_profile"],
+            serde_yaml::Value::String("generic_relay".to_string())
+        );
+        assert_eq!(
+            value["pools"]["relay"]["error_rules"]["balance_scope"],
+            serde_yaml::Value::String("credential".to_string())
         );
     }
 

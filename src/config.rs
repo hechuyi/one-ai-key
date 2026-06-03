@@ -16,8 +16,9 @@ use crate::{
         CredentialRepository, CredentialSetId, CredentialSetSource, KeyImport, KeyImportReport,
     },
     error::{
-        ErrorAdaptationAction, ErrorAdaptationMatcher, ErrorAdaptationRule, ErrorClassifier,
-        ErrorClassifierSpec, FailureKind, FailureScope, StatusMatcher,
+        BalanceScope, ErrorAdaptationAction, ErrorAdaptationMatcher, ErrorAdaptationRule,
+        ErrorClassifier, ErrorClassifierSpec, FailureKind, FailureScope, RelayProfile,
+        StatusMatcher,
     },
     pool::{KeyPoolConfig, PoolCredentialInput},
     provider::ProviderKind,
@@ -323,6 +324,8 @@ pub struct RouteTargetRetryConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorRulesConfig {
+    pub relay_profile: Option<RelayProfile>,
+    pub balance_scope: Option<BalanceScope>,
     pub keep_codes: Option<Vec<String>>,
     pub switch_codes: Option<Vec<String>>,
     pub expire_codes: Option<Vec<String>>,
@@ -548,6 +551,8 @@ pub struct ResolvedRoutingPolicySources {
 impl ErrorRulesConfig {
     fn into_classifier_with_context(self, context: &str) -> anyhow::Result<ErrorClassifier> {
         ErrorClassifierSpec {
+            relay_profile: self.relay_profile.unwrap_or_default(),
+            balance_scope: validate_balance_scope(context, self.balance_scope.unwrap_or_default())?,
             keep_codes: self.keep_codes,
             switch_codes: self.switch_codes,
             expire_codes: self.expire_codes,
@@ -1406,6 +1411,8 @@ fn resolve_pool_error_policy(
         .expire_statuses
         .clone()
         .or(merged.expire_statuses);
+    merged.relay_profile = pool.error_rules.relay_profile.or(merged.relay_profile);
+    merged.balance_scope = pool.error_rules.balance_scope.or(merged.balance_scope);
 
     normalize_adaptation_rule_ids(&mut merged.adaptation_rules);
     let pool_adaptation_rules = normalized_adaptation_rules(&pool.error_rules.adaptation_rules);
@@ -1630,6 +1637,24 @@ fn validate_adaptation_action_combination(
     Ok(())
 }
 
+fn validate_balance_scope(
+    context: &str,
+    balance_scope: BalanceScope,
+) -> anyhow::Result<BalanceScope> {
+    match balance_scope {
+        BalanceScope::Credential => Ok(balance_scope),
+        BalanceScope::Channel => {
+            anyhow::bail!("{context}.balance_scope channel is reserved for Phase 1B")
+        }
+        BalanceScope::Account | BalanceScope::Provider | BalanceScope::ClientToken => {
+            anyhow::bail!(
+                "{context}.balance_scope {} is not implemented",
+                balance_scope_as_config(balance_scope)
+            )
+        }
+    }
+}
+
 fn kind_as_config(kind: FailureKind) -> &'static str {
     match kind {
         FailureKind::RateLimited => "rate_limited",
@@ -1655,8 +1680,20 @@ fn scope_as_config(scope: FailureScope) -> &'static str {
     }
 }
 
+fn balance_scope_as_config(scope: BalanceScope) -> &'static str {
+    match scope {
+        BalanceScope::Credential => "credential",
+        BalanceScope::Channel => "channel",
+        BalanceScope::Account => "account",
+        BalanceScope::Provider => "provider",
+        BalanceScope::ClientToken => "client_token",
+    }
+}
+
 fn error_rules_has_override(error_rules: &ErrorRulesConfig) -> bool {
-    error_rules.keep_codes.is_some()
+    error_rules.relay_profile.is_some()
+        || error_rules.balance_scope.is_some()
+        || error_rules.keep_codes.is_some()
         || error_rules.switch_codes.is_some()
         || error_rules.expire_codes.is_some()
         || error_rules.keep_statuses.is_some()
@@ -1940,5 +1977,279 @@ fn parse_route_strategy(raw: Option<&str>) -> anyhow::Result<RouteStrategy> {
         "priority" => Ok(RouteStrategy::Priority),
         "priority_weighted_sticky" => Ok(RouteStrategy::PriorityWeightedSticky),
         other => anyhow::bail!("unsupported route strategy {other}"),
+    }
+}
+
+#[cfg(test)]
+mod relay_hardening_phase_1a_tests {
+    use super::*;
+    use crate::{
+        credential_repository::FileCredentialRepository,
+        error::{ClassifiedFailure, FailureKind, FailureScope},
+    };
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_keys_file(contents: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("litellm-proxy-relay-phase-1a-{suffix}.keys"));
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn config_yaml(error_rules: &str) -> String {
+        let keys_file = temp_keys_file("synthetic-upstream-key\n");
+        format!(
+            r#"
+listen: 127.0.0.1:0
+client_tokens:
+  - name: local-client
+    token: synthetic-client-token
+management:
+  admin_token: synthetic-management-token
+default_pool: relay
+credential_sets:
+  relay_credentials:
+    keys_file: {}
+default_routing_profile: default-routing
+routing_profiles:
+  default-routing:
+    key_selection: sticky_until_failure
+    default_credential_cooldown_seconds: 20
+    same_request_credential_retry:
+      enabled: false
+      max_retries: 0
+    route_target_retry:
+      enabled: true
+pools:
+  relay:
+    provider_kind: openai_compatible
+    api_base: https://relay.example.test/v1
+    credential_set: relay_credentials
+    error_rules:
+{}"#,
+            keys_file.display(),
+            indent(error_rules, 6)
+        )
+    }
+
+    fn config_yaml_with_policy_profile(
+        profile_error_rules: &str,
+        pool_error_rules: &str,
+    ) -> String {
+        let keys_file = temp_keys_file("synthetic-upstream-key\n");
+        format!(
+            r#"
+listen: 127.0.0.1:0
+client_tokens:
+  - name: local-client
+    token: synthetic-client-token
+management:
+  admin_token: synthetic-management-token
+default_pool: relay
+credential_sets:
+  relay_credentials:
+    keys_file: {}
+policy_profiles:
+  generic-profile:
+    error_rules:
+{}
+default_routing_profile: default-routing
+routing_profiles:
+  default-routing:
+    key_selection: sticky_until_failure
+    default_credential_cooldown_seconds: 20
+    same_request_credential_retry:
+      enabled: false
+      max_retries: 0
+    route_target_retry:
+      enabled: true
+pools:
+  relay:
+    policy_profile: generic-profile
+    provider_kind: openai_compatible
+    api_base: https://relay.example.test/v1
+    credential_set: relay_credentials
+    error_rules:
+{}"#,
+            keys_file.display(),
+            indent(profile_error_rules, 6),
+            indent(pool_error_rules, 6)
+        )
+    }
+
+    fn indent(raw: &str, spaces: usize) -> String {
+        let prefix = " ".repeat(spaces);
+        raw.trim()
+            .lines()
+            .map(|line| format!("{prefix}{line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn resolve_config(raw: &str) -> anyhow::Result<ResolvedConfig> {
+        let config: AppConfig = serde_yaml::from_str(raw)?;
+        config.resolve_with_credential_repository(&FileCredentialRepository::new())
+    }
+
+    fn classify(error_rules: &str, status: u16, body: &[u8]) -> ClassifiedFailure {
+        let resolved = resolve_config(&config_yaml(error_rules)).unwrap();
+        resolved.pools["relay"]
+            .error_classifier
+            .classify_failure(status, &[], body)
+    }
+
+    #[test]
+    fn relay_profile_values_parse_and_resolve() {
+        for relay_profile in ["official_openai", "generic_relay", "untrusted_relay"] {
+            resolve_config(&config_yaml(&format!("relay_profile: {relay_profile}"))).unwrap();
+        }
+    }
+
+    #[test]
+    fn default_relay_profile_preserves_official_openai_bare_auth_semantics() {
+        let failure = classify("{}", 401, b"{}");
+
+        assert_eq!(failure.kind, FailureKind::AuthInvalid);
+        assert_eq!(failure.primary_scope, FailureScope::Credential);
+        assert!(!failure.retryable);
+    }
+
+    #[test]
+    fn pool_error_rules_override_policy_profile_relay_profile() {
+        let resolved = resolve_config(&config_yaml_with_policy_profile(
+            "relay_profile: generic_relay",
+            "relay_profile: official_openai",
+        ))
+        .unwrap();
+
+        let failure = resolved.pools["relay"]
+            .error_classifier
+            .classify_failure(401, &[], b"{}");
+
+        assert_eq!(failure.kind, FailureKind::AuthInvalid);
+        assert_eq!(failure.primary_scope, FailureScope::Credential);
+    }
+
+    #[test]
+    fn balance_scope_defaults_to_credential_for_structured_quota() {
+        let failure = classify(
+            "relay_profile: generic_relay",
+            400,
+            br#"{"error":{"code":"insufficient_quota"}}"#,
+        );
+
+        assert_eq!(failure.kind, FailureKind::QuotaExhausted);
+        assert_eq!(failure.primary_scope, FailureScope::Credential);
+        assert!(!failure.retryable);
+    }
+
+    #[test]
+    fn balance_scope_channel_parses_but_config_resolution_rejects_phase_1a() {
+        let raw = config_yaml("balance_scope: channel");
+        let config: AppConfig = serde_yaml::from_str(&raw).unwrap();
+
+        let err = config
+            .resolve_with_credential_repository(&FileCredentialRepository::new())
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("balance_scope channel")
+                && err.to_string().contains("Phase 1B"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unsupported_balance_scopes_reject_config_resolution() {
+        for scope in ["account", "provider", "client_token"] {
+            let err = resolve_config(&config_yaml(&format!("balance_scope: {scope}"))).unwrap_err();
+            assert!(
+                err.to_string().contains("balance_scope")
+                    && err.to_string().contains("not implemented"),
+                "unexpected error for {scope}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_free_form_message_matcher_fields_are_rejected() {
+        let err = resolve_config(&config_yaml(
+            r#"
+adaptation_rules:
+  - id: unsupported-message-matcher
+    matcher:
+      message_contains:
+        - synthetic marker
+"#,
+        ))
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn generic_relay_bare_401_is_request_only() {
+        let failure = classify("relay_profile: generic_relay", 401, b"{}");
+
+        assert_eq!(failure.kind, FailureKind::ClientError);
+        assert_eq!(failure.primary_scope, FailureScope::RequestOnly);
+        assert!(!failure.retryable);
+    }
+
+    #[test]
+    fn untrusted_relay_bare_403_is_request_only() {
+        let failure = classify("relay_profile: untrusted_relay", 403, b"{}");
+
+        assert_eq!(failure.kind, FailureKind::ClientError);
+        assert_eq!(failure.primary_scope, FailureScope::RequestOnly);
+        assert!(!failure.retryable);
+    }
+
+    #[test]
+    fn structured_invalid_key_expires_credential_across_relay_profiles() {
+        for relay_profile in ["official_openai", "generic_relay", "untrusted_relay"] {
+            let failure = classify(
+                &format!("relay_profile: {relay_profile}"),
+                400,
+                br#"{"error":{"code":"invalid_api_key"}}"#,
+            );
+
+            assert_eq!(failure.kind, FailureKind::AuthInvalid);
+            assert_eq!(failure.primary_scope, FailureScope::Credential);
+            assert!(!failure.retryable);
+        }
+    }
+
+    #[test]
+    fn bare_429_is_credential_rate_limited_across_relay_profiles() {
+        for relay_profile in ["official_openai", "generic_relay", "untrusted_relay"] {
+            let failure = classify(&format!("relay_profile: {relay_profile}"), 429, b"{}");
+
+            assert_eq!(failure.kind, FailureKind::RateLimited);
+            assert_eq!(failure.primary_scope, FailureScope::Credential);
+            assert!(failure.retryable);
+        }
+    }
+
+    #[test]
+    fn code_less_top_level_error_object_is_request_only() {
+        let failure = classify(
+            "relay_profile: official_openai",
+            401,
+            br#"{"error":{"message":"synthetic client error"}}"#,
+        );
+
+        assert_eq!(failure.kind, FailureKind::ClientError);
+        assert_eq!(failure.primary_scope, FailureScope::RequestOnly);
+        assert!(!failure.retryable);
     }
 }
