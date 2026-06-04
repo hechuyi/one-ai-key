@@ -1,5 +1,8 @@
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     credential_probe::probe_result_is_default_key_switch_cooldown,
@@ -78,6 +81,9 @@ pub async fn alerts_response_for_state(
     response
         .alerts
         .extend(model_route_all_target_suppression_alerts(state));
+    response
+        .alerts
+        .extend(response_filter_contamination_alerts_for_state(state));
     recompute_alert_totals(&mut response);
     Ok(response)
 }
@@ -119,6 +125,14 @@ pub struct ManagementAlertStatus {
     pub candidate_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suppressed_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redact_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reject_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub channel_ids: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -163,6 +177,10 @@ pub fn management_alert_status(projection: AlertProjection<'_>) -> ManagementAle
         public_model: None,
         candidate_count: None,
         suppressed_count: None,
+        rule_id: None,
+        redact_count: None,
+        reject_count: None,
+        window_seconds: None,
         channel_ids: Vec::new(),
         reason_codes: Vec::new(),
         message: projection.message,
@@ -311,6 +329,10 @@ fn model_route_all_target_suppression_alerts(state: &AppState) -> Vec<Management
             public_model: Some(public_model),
             candidate_count: Some(candidate_count),
             suppressed_count: Some(candidate_count),
+            rule_id: None,
+            redact_count: None,
+            reject_count: None,
+            window_seconds: None,
             channel_ids,
             reason_codes,
             message: "public model route has no selectable candidates because all targets are cooling down or suppressed",
@@ -342,4 +364,103 @@ fn route_suppression_relevant_candidates(
             })
         })
         .collect()
+}
+
+const RESPONSE_FILTER_CONTAMINATION_THRESHOLD: usize = 3;
+
+#[derive(Debug, Default)]
+struct ResponseFilterContaminationBucket {
+    channel_id: String,
+    rule_id: String,
+    redact_count: usize,
+    reject_count: usize,
+    reason_codes: BTreeSet<String>,
+}
+
+impl ResponseFilterContaminationBucket {
+    fn event_count(&self) -> usize {
+        self.redact_count.saturating_add(self.reject_count)
+    }
+}
+
+pub fn response_filter_contamination_alerts_for_state(
+    state: &AppState,
+) -> Vec<ManagementAlertStatus> {
+    let window_seconds = state
+        .response_filter_alert_window
+        .read()
+        .expect("response filter alert window lock poisoned")
+        .as_secs();
+    let now = current_unix_seconds();
+    let snapshot = state
+        .response_filter_events
+        .lock()
+        .expect("response filter events mutex poisoned")
+        .snapshot();
+    let mut buckets: BTreeMap<(String, String), ResponseFilterContaminationBucket> =
+        BTreeMap::new();
+
+    for event in snapshot {
+        if !matches!(event.action.as_str(), "redact" | "reject") {
+            continue;
+        }
+        if now.saturating_sub(event.created_at_unix_seconds) > window_seconds {
+            continue;
+        }
+
+        let key = (event.channel_id.clone(), event.rule_id.clone());
+        let bucket = buckets
+            .entry(key)
+            .or_insert_with(|| ResponseFilterContaminationBucket {
+                channel_id: event.channel_id.clone(),
+                rule_id: event.rule_id.clone(),
+                ..Default::default()
+            });
+        match event.action.as_str() {
+            "redact" => bucket.redact_count = bucket.redact_count.saturating_add(1),
+            "reject" => bucket.reject_count = bucket.reject_count.saturating_add(1),
+            _ => {}
+        }
+        if !event.reason_code.is_empty() {
+            bucket.reason_codes.insert(event.reason_code);
+        }
+    }
+
+    buckets
+        .into_values()
+        .filter(|bucket| bucket.event_count() >= RESPONSE_FILTER_CONTAMINATION_THRESHOLD)
+        .map(|bucket| ManagementAlertStatus {
+            kind: "response_filter_contamination",
+            severity: "warning",
+            resource_kind: "channel",
+            resource_type: "channel",
+            resource_id: bucket.channel_id.clone(),
+            public_model: None,
+            candidate_count: None,
+            suppressed_count: None,
+            rule_id: Some(bucket.rule_id),
+            redact_count: Some(bucket.redact_count),
+            reject_count: Some(bucket.reject_count),
+            window_seconds: Some(window_seconds),
+            channel_ids: vec![bucket.channel_id],
+            reason_codes: bucket.reason_codes.into_iter().collect(),
+            message: "response filter repeatedly matched upstream output for this channel",
+            serving_mode: "serving_degraded",
+            accepting_requests: true,
+            needs_operator_input: true,
+            required_action: "inspect_response_filter_contamination",
+            credentials: RuntimeCredentialCounts::default(),
+        })
+        .collect()
+}
+
+pub fn response_filter_contamination_alert_count_for_state(state: &AppState) -> usize {
+    response_filter_contamination_alerts_for_state(state).len()
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

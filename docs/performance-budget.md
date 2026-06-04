@@ -9,6 +9,8 @@ This service is a personal AI account and API-key router, not a heavy control pl
 - The proxy request path must not perform disk I/O.
 - The proxy request path must not allocate work proportional to all credentials. Credential selection in the active channel uses a selector index plus deadline promotion rather than scanning the full credential set per request.
 - Successful upstream responses should stream; they must not be fully buffered.
+- Body-bearing 2xx success guarding is bounded to the pre-output window only: at most 8192 peeked bytes, the first complete data-bearing SSE event, and 200 ms per attempt. Guard pass-through must replay the peeked prefix exactly once and then return to streaming.
+- Response filtering is streaming and bounded. SSE filtering may hold bytes only until an event boundary; non-event pending bytes are capped at 8192 bytes with a 1024-byte overlap window. Guard and filter budgets must not compose into full-response buffering or request-path disk I/O.
 - Non-streaming request bodies are bounded by `max_request_body_bytes`; the default is 2 MiB for 1c1G deployments.
 - Generic named-pool request bodies are streamed through a bounded stream and must not be fully buffered on the proxy hot path.
 - Upstream model catalog response bodies are bounded separately from request bodies by `max_model_catalog_body_bytes`; the default is 512 KiB.

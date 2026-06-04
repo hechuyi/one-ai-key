@@ -1,0 +1,42 @@
+# VCS and local agent files.
+.git/
+.gitignore
+AGENTS.md
+
+# Build outputs and release artifacts.
+target/
+dist/
+rust_out/
+key-pool-router/
+
+# Runtime state and local databases.
+data/
+postgres_data/
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+
+# Local deployment/configuration with real credentials.
+.env
+.env.*
+config.yaml
+docker-compose.override.yml
+config/*.yaml
+scripts/one_ai_key_keys.py
+
+# Secret material.
+*.pem
+*.key
+*key*.txt
+*keys*.txt
+*secret*
+*secrets*
+
+# Logs, caches, and transient files.
+*.log
+*.pid
+*.tmp
+.DS_Store
+__pycache__/
+*.py[cod]

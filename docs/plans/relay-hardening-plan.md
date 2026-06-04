@@ -416,6 +416,12 @@ This roadmap has hard stopping points. Do not continue into the next phase when 
 
 The whole roadmap stops after Phase 5. Any work on automatic filter-to-health mutation, account/provider balance suppression, persistent model discovery states, or remote deployment requires a new explicit goal.
 
+## Implementation Progress
+
+Current implementation has passed through Phase 3B in committed history. Phase 4 is implemented as a response-filter observability and framing node: response-filter matches write bounded safe metadata to an in-memory ring, `/management/response-filter-events` exposes a readonly snapshot, repeated `(channel_id, rule_id)` hits produce management-only contamination alerts with time-window decay, resilience health counts those alerts as degradation, and tests assert no lifecycle, channel-health, credential-state, or routing-telemetry mutation from filter hits.
+
+The remaining roadmap work is Phase 5: explain runtime, health truth-table hardening, README boundary documentation, composed performance documentation, response-filter documentation consistency, and final full local CI plus x86_64 release-build hygiene.
+
 ## Convergence Record
 
 Root issue ledger for this revision:
@@ -429,4 +435,4 @@ Root issue ledger for this revision:
 | Tests not red/green enough | Added phase stop cards with endpoint/schema assertions and blocked conditions. |
 | Model discovery scope drift | Reframed model discovery as deferred boundary only. |
 
-Propagation audit: the locked invariants are restated in the decision matrix, phase tasks, stop cards, deferred boundary, and parked-item lifecycle. Cold scan result: no remaining internally solvable blocker is intentionally left open; parked items have revisit triggers and visibility. Current status: internally converged as a plan document after second-round subagent review, with implementation still not started.
+Propagation audit: the locked invariants are restated in the decision matrix, phase tasks, stop cards, deferred boundary, and parked-item lifecycle. Cold scan result: no remaining internally solvable blocker is intentionally left open; parked items have revisit triggers and visibility. Current status: implementation has progressed through the committed Phase 3B stop node, with Phase 4 implemented in the current working tree pending final gate and commit; Phase 5 remains open.

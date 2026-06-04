@@ -68,7 +68,8 @@ use crate::{
     management_routing::{model_routes_response, routing_preview_for_model},
     management_runtime::{
         readiness_response, reload_runtime as reload_runtime_state, resilience_health_response,
-        routing_telemetry_snapshot_response, runtime_response_for_state, serving_health_response,
+        response_filter_events_snapshot_response, routing_telemetry_snapshot_response,
+        runtime_response_for_state, serving_health_response,
     },
     model_discovery,
     state::AppState,
@@ -1401,6 +1402,24 @@ pub async fn routing_telemetry(
     let limit = query.bounded_limit(100, 1000);
     let offset = query.offset_or_zero();
     Json(routing_telemetry_snapshot_response(&state, offset, limit)).into_response()
+}
+
+pub async fn response_filter_events(
+    State(state): State<AppState>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let principal = match authorize_management(&state, &headers) {
+        Ok(principal) => principal,
+        Err(resp) => return *resp,
+    };
+    let _principal_context = (&principal.id, &principal.name, &principal.role);
+    let limit = query.bounded_limit(100, 1000);
+    let offset = query.offset_or_zero();
+    Json(response_filter_events_snapshot_response(
+        &state, offset, limit,
+    ))
+    .into_response()
 }
 
 pub async fn runtime(State(state): State<AppState>, headers: HeaderMap) -> Response {

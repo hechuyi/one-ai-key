@@ -31,8 +31,9 @@ use crate::{
     state::{AppState, ChannelId, PoolState},
     success_guard::{guard_success_response, should_guard_success_status, GuardResult},
     upstream_response::{
-        prefixed_body_stream, read_limited_body, response_with_headers, stream_response,
-        stream_response_from_byte_stream, BodyStreamFailureObserver,
+        prefixed_body_stream, read_limited_body, response_with_headers,
+        stream_response_from_byte_stream_with_filter_events, stream_response_with_filter_events,
+        BodyStreamFailureObserver, ResponseFilterEventContext, ResponseFilterEventOptions,
     },
 };
 
@@ -72,6 +73,31 @@ fn body_stream_failure_observer(
             .await;
         })
     })
+}
+
+fn response_filter_event_options(
+    state: &AppState,
+    route_plan: &FrozenRoutePlan,
+    snapshot: &RequestSelectionSnapshot,
+) -> ResponseFilterEventOptions {
+    let events = state.response_filter_events.clone();
+    ResponseFilterEventOptions {
+        context: ResponseFilterEventContext {
+            request_id: snapshot.request_id.clone(),
+            channel_id: snapshot.channel_id.0.clone(),
+            public_model: route_plan
+                .public_model
+                .clone()
+                .or_else(|| snapshot.requested_model.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+        },
+        sink: std::sync::Arc::new(move |event| {
+            let _ = events
+                .lock()
+                .expect("response filter events mutex poisoned")
+                .push(event);
+        }),
+    }
 }
 
 fn guarded_success_envelope_response() -> Response {
@@ -758,7 +784,7 @@ async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response 
                 .failure_domains
                 .record_success(&pool_state.provider_id, &pool_state.account_id);
             pool_state.record_selected_channel_success();
-            return stream_response(
+            return stream_response_with_filter_events(
                 status,
                 response_headers,
                 upstream_resp,
@@ -767,6 +793,11 @@ async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response 
                     state.clone(),
                     pool_state.clone(),
                     snapshot.clone(),
+                )),
+                Some(response_filter_event_options(
+                    &state,
+                    &route_plan,
+                    &snapshot,
                 )),
             );
         }
@@ -796,7 +827,7 @@ async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response 
                     .record_success(&pool_state.provider_id, &pool_state.account_id);
                 pool_state.record_selected_channel_success();
                 let stream = Box::pin(prefixed_body_stream(prefix, stream));
-                return stream_response_from_byte_stream(
+                return stream_response_from_byte_stream_with_filter_events(
                     status,
                     response_headers,
                     stream,
@@ -807,6 +838,11 @@ async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response 
                         snapshot.clone(),
                     )),
                     false,
+                    Some(response_filter_event_options(
+                        &state,
+                        &route_plan,
+                        &snapshot,
+                    )),
                 );
             }
             Err(err) => {
@@ -1071,7 +1107,7 @@ async fn forward_with_pool(
                     .failure_domains
                     .record_success(&pool_state.provider_id, &pool_state.account_id);
                 pool_state.record_selected_channel_success();
-                return PoolForwardResult::Response(stream_response(
+                return PoolForwardResult::Response(stream_response_with_filter_events(
                     status,
                     response_headers,
                     upstream_resp,
@@ -1081,6 +1117,7 @@ async fn forward_with_pool(
                         pool_state.clone(),
                         snapshot.clone(),
                     )),
+                    Some(response_filter_event_options(state, route_plan, &snapshot)),
                 ));
             }
             match guard_success_response(
@@ -1130,18 +1167,21 @@ async fn forward_with_pool(
                         .record_success(&pool_state.provider_id, &pool_state.account_id);
                     pool_state.record_selected_channel_success();
                     let stream = Box::pin(prefixed_body_stream(prefix, stream));
-                    return PoolForwardResult::Response(stream_response_from_byte_stream(
-                        status,
-                        response_headers,
-                        stream,
-                        state.response_filter.clone(),
-                        Some(body_stream_failure_observer(
-                            state.clone(),
-                            pool_state.clone(),
-                            snapshot.clone(),
-                        )),
-                        false,
-                    ));
+                    return PoolForwardResult::Response(
+                        stream_response_from_byte_stream_with_filter_events(
+                            status,
+                            response_headers,
+                            stream,
+                            state.response_filter.clone(),
+                            Some(body_stream_failure_observer(
+                                state.clone(),
+                                pool_state.clone(),
+                                snapshot.clone(),
+                            )),
+                            false,
+                            Some(response_filter_event_options(state, route_plan, &snapshot)),
+                        ),
+                    );
                 }
                 Err(err) => {
                     let failure = pool_state.error_classifier.classify_transport_failure();

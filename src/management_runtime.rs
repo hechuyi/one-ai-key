@@ -6,7 +6,11 @@ use std::{
 use serde::Serialize;
 
 use crate::{
-    events::{ManagementAuditEvent, ManagementEventActor, RetryPressureCounters, RoutingTelemetry},
+    events::{
+        ManagementAuditEvent, ManagementEventActor, ResponseFilterEvent, RetryPressureCounters,
+        RoutingTelemetry,
+    },
+    management_alerts::response_filter_contamination_alert_count_for_state,
     management_errors::{registry_store_error, ManagementServiceError},
     management_registry::resolve_staged_registry_document,
     management_status::{
@@ -15,6 +19,42 @@ use crate::{
     },
     state::{AppState, ChannelHealth, RuntimeTopologySummary},
 };
+
+#[derive(Debug, Serialize)]
+pub struct ResponseFilterEventsResponse {
+    pub buffered_events: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub events: Vec<ResponseFilterEvent>,
+}
+
+pub fn response_filter_events_response(
+    snapshot: Vec<ResponseFilterEvent>,
+    offset: usize,
+    limit: usize,
+) -> ResponseFilterEventsResponse {
+    let buffered_events = snapshot.len();
+    let events = snapshot.into_iter().skip(offset).take(limit).collect();
+    ResponseFilterEventsResponse {
+        buffered_events,
+        offset,
+        limit,
+        events,
+    }
+}
+
+pub fn response_filter_events_snapshot_response(
+    state: &AppState,
+    offset: usize,
+    limit: usize,
+) -> ResponseFilterEventsResponse {
+    let snapshot = state
+        .response_filter_events
+        .lock()
+        .expect("response filter events mutex poisoned")
+        .snapshot();
+    response_filter_events_response(snapshot, offset, limit)
+}
 
 #[derive(Debug, Serialize)]
 pub struct RoutingTelemetryResponse {
@@ -71,6 +111,8 @@ pub struct RuntimeResponse {
     pub management_event_window_capacity: usize,
     pub routing_telemetry_events: usize,
     pub routing_telemetry_capacity: usize,
+    pub response_filter_events: usize,
+    pub response_filter_event_capacity: usize,
     pub request_limits: RequestLimits,
     pub timeout_seconds: TimeoutSeconds,
 }
@@ -91,6 +133,8 @@ pub struct RuntimeResponseParts {
     pub management_event_window_capacity: usize,
     pub routing_telemetry_events: usize,
     pub routing_telemetry_capacity: usize,
+    pub response_filter_events: usize,
+    pub response_filter_event_capacity: usize,
     pub max_request_body_bytes: usize,
     pub max_model_catalog_body_bytes: usize,
     pub max_model_catalog_channels: usize,
@@ -121,6 +165,8 @@ pub fn runtime_response_from_parts(parts: RuntimeResponseParts) -> RuntimeRespon
         management_event_window_capacity: parts.management_event_window_capacity,
         routing_telemetry_events: parts.routing_telemetry_events,
         routing_telemetry_capacity: parts.routing_telemetry_capacity,
+        response_filter_events: parts.response_filter_events,
+        response_filter_event_capacity: parts.response_filter_event_capacity,
         request_limits: RequestLimits {
             max_request_body_bytes: parts.max_request_body_bytes,
             max_model_catalog_body_bytes: parts.max_model_catalog_body_bytes,
@@ -165,6 +211,8 @@ pub async fn runtime_response(
         management_event_window_capacity: sample.management_event_window_capacity,
         routing_telemetry_events: sample.routing_telemetry_events,
         routing_telemetry_capacity: state.routing.telemetry_buffer_capacity,
+        response_filter_events: sample.response_filter_events,
+        response_filter_event_capacity: sample.response_filter_event_capacity,
         max_request_body_bytes: state.max_request_body_bytes,
         max_model_catalog_body_bytes: state.max_model_catalog_body_bytes,
         max_model_catalog_channels: state.routing.max_model_catalog_channels,
@@ -201,6 +249,8 @@ struct RuntimeSnapshotSample {
     management_events: usize,
     management_event_window_capacity: usize,
     routing_telemetry_events: usize,
+    response_filter_events: usize,
+    response_filter_event_capacity: usize,
     serving_channels: usize,
     credential_set_blocking_alerts: usize,
     operator_input_alerts: usize,
@@ -302,6 +352,13 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
             .expect("routing telemetry mutex poisoned");
         (telemetry.len(), telemetry.retry_pressure_snapshot())
     };
+    let (response_filter_events, response_filter_event_capacity) = {
+        let events = state
+            .response_filter_events
+            .lock()
+            .expect("response filter events mutex poisoned");
+        (events.len(), events.capacity())
+    };
 
     RuntimeSnapshotSample {
         active_registry_generation,
@@ -319,6 +376,8 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
         management_events: state.events.len(),
         management_event_window_capacity: state.events.window_capacity(),
         routing_telemetry_events,
+        response_filter_events,
+        response_filter_event_capacity,
         serving_channels,
         credential_set_blocking_alerts,
         operator_input_alerts,
@@ -592,7 +651,7 @@ pub struct ResilienceHealthResponse {
 
 pub async fn resilience_health_response(state: &AppState) -> ResilienceHealthResponse {
     let sample = collect_runtime_snapshot(state).await;
-    let response_filter_alerts = 0usize;
+    let response_filter_alerts = response_filter_contamination_alert_count_for_state(state);
     let status = if sample.serving_channels == 0 || sample.credential_set_blocking_alerts > 0 {
         "blocked"
     } else if sample.operator_input_alerts > 0

@@ -23,7 +23,9 @@ use crate::{
     },
     credentials::{CredentialId, CredentialStateSnapshot},
     error::ErrorClassifier,
-    events::{DomainEvent, EventLog, ManagementEvent, RoutingTelemetryBuffer},
+    events::{
+        DomainEvent, EventLog, ManagementEvent, ResponseFilterEventBuffer, RoutingTelemetryBuffer,
+    },
     pool::KeyPool,
     provider::{ProviderAdapter, ProviderKind},
     registry::RegistryDocument,
@@ -47,6 +49,8 @@ pub struct AppState {
     pub timeout_profile: ResolvedTimeoutProfile,
     pub routing: ResolvedRoutingConfig,
     pub response_filter: Arc<StdRwLock<ResponseFilterPolicy>>,
+    pub response_filter_events: Arc<StdMutex<ResponseFilterEventBuffer>>,
+    pub response_filter_alert_window: Arc<StdRwLock<Duration>>,
     pub credential_store: CredentialStoreHandle,
     pub client_token_store: ClientTokenStoreHandle,
     pub registry_store: RegistryStoreHandle,
@@ -633,6 +637,12 @@ impl AppState {
             timeout_profile: config.timeout_profile.clone(),
             routing: config.routing.clone(),
             response_filter: Arc::new(StdRwLock::new(config.response_filter)),
+            response_filter_events: Arc::new(StdMutex::new(ResponseFilterEventBuffer::new(
+                config.response_filter_event_window_capacity,
+            ))),
+            response_filter_alert_window: Arc::new(StdRwLock::new(
+                config.response_filter_alert_window,
+            )),
             credential_store,
             client_token_store,
             registry_store,
@@ -737,6 +747,15 @@ impl AppState {
             .response_filter
             .write()
             .expect("response filter lock poisoned") = config.response_filter;
+        self.response_filter_events
+            .lock()
+            .expect("response filter events lock poisoned")
+            .replace_capacity(config.response_filter_event_window_capacity);
+        *self
+            .response_filter_alert_window
+            .write()
+            .expect("response filter alert window lock poisoned") =
+            config.response_filter_alert_window;
         *self
             .management_ip_allowlist
             .write()
@@ -1975,6 +1994,108 @@ mod tests {
         assert_eq!(
             state.runtime_catalogs.registry_generation(),
             reloaded_generation
+        );
+    }
+
+    #[test]
+    fn app_state_uses_configured_response_filter_event_settings() {
+        let keys_file = temp_path("key-pool-router-response-filter-event-settings-keys");
+        fs::write(&keys_file, "k1\n").unwrap();
+        let mut document = single_pool_config(keys_file, None).into_registry_document();
+        document.response_filter = crate::config::ResponseFilterConfig {
+            enabled: false,
+            replacement: None,
+            event_window_capacity: Some(3),
+            alert_window_seconds: Some(17),
+            rules: Vec::new(),
+        };
+        let config = document.resolve().unwrap();
+
+        let state = AppState::new(config).unwrap();
+
+        assert_eq!(
+            state
+                .response_filter_events
+                .lock()
+                .expect("response filter events lock poisoned")
+                .capacity(),
+            3
+        );
+        assert_eq!(
+            *state
+                .response_filter_alert_window
+                .read()
+                .expect("response filter alert window lock poisoned"),
+            Duration::from_secs(17)
+        );
+    }
+
+    #[test]
+    fn runtime_reload_updates_response_filter_event_settings_without_resetting_ids() {
+        let keys_file = temp_path("key-pool-router-response-filter-reload-keys");
+        fs::write(&keys_file, "k1\n").unwrap();
+        let mut document = single_pool_config(keys_file.clone(), None).into_registry_document();
+        document.response_filter = crate::config::ResponseFilterConfig {
+            enabled: false,
+            replacement: None,
+            event_window_capacity: Some(4),
+            alert_window_seconds: Some(17),
+            rules: Vec::new(),
+        };
+        let config = document.resolve().unwrap();
+        let state = AppState::new(config).unwrap();
+        {
+            let mut events = state
+                .response_filter_events
+                .lock()
+                .expect("response filter events lock poisoned");
+            for rule_id in ["one", "two", "three"] {
+                events.push(crate::events::ResponseFilterEventInput {
+                    request_id: format!("request-{rule_id}"),
+                    channel_id: "test".to_string(),
+                    public_model: "gpt-test".to_string(),
+                    rule_id: rule_id.to_string(),
+                    action: "redact".to_string(),
+                    content_kind: "json".to_string(),
+                    reason_code: "rule_matched".to_string(),
+                    outcome: "redacted".to_string(),
+                    body_committed: false,
+                });
+            }
+        }
+
+        let mut reloaded_document = single_pool_config(keys_file, None).into_registry_document();
+        reloaded_document.response_filter = crate::config::ResponseFilterConfig {
+            enabled: false,
+            replacement: None,
+            event_window_capacity: Some(2),
+            alert_window_seconds: Some(23),
+            rules: Vec::new(),
+        };
+        state
+            .rebuild_runtime_from_resolved_config(reloaded_document.resolve().unwrap(), Some(2))
+            .unwrap();
+
+        let events = state
+            .response_filter_events
+            .lock()
+            .expect("response filter events lock poisoned");
+        assert_eq!(events.capacity(), 2);
+        let snapshot = events.snapshot();
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|event| event.rule_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["two", "three"]
+        );
+        drop(events);
+        assert_eq!(
+            *state
+                .response_filter_alert_window
+                .read()
+                .expect("response filter alert window lock poisoned"),
+            Duration::from_secs(23)
         );
     }
 

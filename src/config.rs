@@ -133,6 +133,13 @@ pub struct ResolvedRoutingConfig {
     pub telemetry_buffer_capacity: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedResponseFilterConfig {
+    pub policy: ResponseFilterPolicy,
+    pub event_window_capacity: usize,
+    pub alert_window: Duration,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseFilterConfig {
@@ -140,6 +147,10 @@ pub struct ResponseFilterConfig {
     pub enabled: bool,
     #[serde(default)]
     pub replacement: Option<String>,
+    #[serde(default)]
+    pub event_window_capacity: Option<usize>,
+    #[serde(default)]
+    pub alert_window_seconds: Option<u64>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub rules: Vec<ResponseFilterRuleConfig>,
 }
@@ -411,6 +422,8 @@ pub struct ResolvedConfig {
     pub timeout_profile: ResolvedTimeoutProfile,
     pub routing: ResolvedRoutingConfig,
     pub response_filter: ResponseFilterPolicy,
+    pub response_filter_event_window_capacity: usize,
+    pub response_filter_alert_window: Duration,
     pub management_event_log_path: Option<PathBuf>,
     pub management_event_window_capacity: usize,
     pub credential_store_path: Option<PathBuf>,
@@ -1228,6 +1241,10 @@ impl AppConfig {
             timeout_profile,
             routing,
             response_filter: ResponseFilterPolicy::disabled(),
+            response_filter_event_window_capacity: default_response_filter_event_window_capacity(),
+            response_filter_alert_window: Duration::from_secs(
+                default_response_filter_alert_window_seconds(),
+            ),
             management_event_log_path: management.event_log_path,
             management_event_window_capacity,
             credential_store_path,
@@ -1295,7 +1312,9 @@ pub(crate) fn resolve_registry_document_with_credential_repository_and_store_pat
             credential_store_path,
         )
         .map(|mut config| {
-            config.response_filter = response_filter;
+            config.response_filter = response_filter.policy;
+            config.response_filter_event_window_capacity = response_filter.event_window_capacity;
+            config.response_filter_alert_window = response_filter.alert_window;
             config
         })
 }
@@ -1855,7 +1874,7 @@ impl RoutingConfig {
 }
 
 impl ResponseFilterConfig {
-    fn resolve(self) -> anyhow::Result<ResponseFilterPolicy> {
+    fn resolve(self) -> anyhow::Result<ResolvedResponseFilterConfig> {
         let mut rule_ids = HashSet::new();
         let mut rules = Vec::new();
         for rule in self.rules.into_iter().filter(|rule| rule.enabled) {
@@ -1891,10 +1910,23 @@ impl ResponseFilterConfig {
                 action: rule.action.into_action(),
             });
         }
-        ResponseFilterPolicy::compile(ResponseFilterSpec {
+        let policy = ResponseFilterPolicy::compile(ResponseFilterSpec {
             enabled: self.enabled,
             replacement: self.replacement.unwrap_or_default(),
             rules,
+        })?;
+        Ok(ResolvedResponseFilterConfig {
+            policy,
+            event_window_capacity: positive_usize(
+                self.event_window_capacity
+                    .unwrap_or_else(default_response_filter_event_window_capacity),
+                "response_filter.event_window_capacity",
+            )?,
+            alert_window: seconds_duration(
+                self.alert_window_seconds
+                    .unwrap_or_else(default_response_filter_alert_window_seconds),
+                "response_filter.alert_window_seconds",
+            )?,
         })
     }
 }
@@ -1963,6 +1995,14 @@ fn default_management_event_window_capacity() -> usize {
     1024
 }
 
+fn default_response_filter_event_window_capacity() -> usize {
+    1024
+}
+
+fn default_response_filter_alert_window_seconds() -> u64 {
+    900
+}
+
 pub(crate) fn default_route_target_priority() -> u16 {
     100
 }
@@ -1988,7 +2028,7 @@ mod relay_hardening_phase_1a_tests {
     };
     use std::{
         fs,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     fn temp_keys_file(contents: &str) -> PathBuf {
@@ -2096,11 +2136,92 @@ pools:
         config.resolve_with_credential_repository(&FileCredentialRepository::new())
     }
 
+    fn resolve_document_with_response_filter(
+        response_filter: ResponseFilterConfig,
+    ) -> anyhow::Result<ResolvedConfig> {
+        let app: AppConfig = serde_yaml::from_str(&config_yaml("{}"))?;
+        let mut document = app.into_registry_document();
+        document.response_filter = response_filter;
+        document.resolve_with_credential_repository(&FileCredentialRepository::new())
+    }
+
     fn classify(error_rules: &str, status: u16, body: &[u8]) -> ClassifiedFailure {
         let resolved = resolve_config(&config_yaml(error_rules)).unwrap();
         resolved.pools["relay"]
             .error_classifier
             .classify_failure(status, &[], body)
+    }
+
+    #[test]
+    fn response_filter_event_settings_default_to_phase4_values() {
+        let resolved = resolve_document_with_response_filter(ResponseFilterConfig::default())
+            .expect("default response filter settings resolve");
+
+        assert_eq!(resolved.response_filter_event_window_capacity, 1024);
+        assert_eq!(
+            resolved.response_filter_alert_window,
+            Duration::from_secs(900)
+        );
+    }
+
+    #[test]
+    fn response_filter_event_settings_resolve_from_registry_document() {
+        let resolved = resolve_document_with_response_filter(ResponseFilterConfig {
+            enabled: false,
+            replacement: None,
+            event_window_capacity: Some(7),
+            alert_window_seconds: Some(11),
+            rules: Vec::new(),
+        })
+        .expect("configured response filter settings resolve");
+
+        assert_eq!(resolved.response_filter_event_window_capacity, 7);
+        assert_eq!(
+            resolved.response_filter_alert_window,
+            Duration::from_secs(11)
+        );
+    }
+
+    #[test]
+    fn response_filter_event_settings_reject_zero_values() {
+        for (field, config) in [
+            (
+                "response_filter.event_window_capacity",
+                ResponseFilterConfig {
+                    enabled: false,
+                    replacement: None,
+                    event_window_capacity: Some(0),
+                    alert_window_seconds: None,
+                    rules: Vec::new(),
+                },
+            ),
+            (
+                "response_filter.alert_window_seconds",
+                ResponseFilterConfig {
+                    enabled: false,
+                    replacement: None,
+                    event_window_capacity: None,
+                    alert_window_seconds: Some(0),
+                    rules: Vec::new(),
+                },
+            ),
+        ] {
+            let err = resolve_document_with_response_filter(config).unwrap_err();
+            assert!(
+                err.to_string().contains(field) && err.to_string().contains("greater than zero"),
+                "unexpected error for {field}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_filter_config_rejects_unknown_observability_fields() {
+        let err = serde_yaml::from_str::<ResponseFilterConfig>("event_capacity: 1\n").unwrap_err();
+
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

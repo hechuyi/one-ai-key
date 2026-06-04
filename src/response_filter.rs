@@ -79,6 +79,25 @@ pub enum ResponseFilterDecision {
 pub struct ResponseFilterMatch {
     pub rule_id: String,
     pub action: ResponseFilterAction,
+    pub reason_code: &'static str,
+}
+
+impl ResponseFilterMatch {
+    fn rule_matched(rule_id: String, action: ResponseFilterAction) -> Self {
+        Self {
+            rule_id,
+            action,
+            reason_code: "rule_matched",
+        }
+    }
+
+    fn required_rule_missing(rule_id: String, action: ResponseFilterAction) -> Self {
+        Self {
+            rule_id,
+            action,
+            reason_code: "required_rule_missing",
+        }
+    }
 }
 
 impl ResponseFilterPolicy {
@@ -190,10 +209,10 @@ impl ResponseFilterPolicy {
                     if !normalized_text.contains(normalized_value) {
                         continue;
                     }
-                    matches.push(ResponseFilterMatch {
-                        rule_id: rule.id.clone(),
-                        action: rule.action,
-                    });
+                    matches.push(ResponseFilterMatch::rule_matched(
+                        rule.id.clone(),
+                        rule.action,
+                    ));
                     if rule.action == ResponseFilterAction::Reject {
                         return ResponseFilterDecision::Rejected { matches };
                     }
@@ -204,10 +223,10 @@ impl ResponseFilterPolicy {
                     if !regex.is_match(text) {
                         continue;
                     }
-                    matches.push(ResponseFilterMatch {
-                        rule_id: rule.id.clone(),
-                        action: rule.action,
-                    });
+                    matches.push(ResponseFilterMatch::rule_matched(
+                        rule.id.clone(),
+                        rule.action,
+                    ));
                     if rule.action == ResponseFilterAction::Reject {
                         return ResponseFilterDecision::Rejected { matches };
                     }
@@ -223,10 +242,10 @@ impl ResponseFilterPolicy {
                     if normalized_text.contains(normalized_value) {
                         continue;
                     }
-                    matches.push(ResponseFilterMatch {
-                        rule_id: rule.id.clone(),
-                        action: rule.action,
-                    });
+                    matches.push(ResponseFilterMatch::required_rule_missing(
+                        rule.id.clone(),
+                        rule.action,
+                    ));
                     if rule.action == ResponseFilterAction::Reject {
                         return ResponseFilterDecision::Rejected { matches };
                     }
@@ -236,10 +255,10 @@ impl ResponseFilterPolicy {
                     if regex.is_match(text) {
                         continue;
                     }
-                    matches.push(ResponseFilterMatch {
-                        rule_id: rule.id.clone(),
-                        action: rule.action,
-                    });
+                    matches.push(ResponseFilterMatch::required_rule_missing(
+                        rule.id.clone(),
+                        rule.action,
+                    ));
                     if rule.action == ResponseFilterAction::Reject {
                         return ResponseFilterDecision::Rejected { matches };
                     }
@@ -388,6 +407,7 @@ mod tests {
                 matches: vec![ResponseFilterMatch {
                     rule_id: "marker".to_string(),
                     action: ResponseFilterAction::Redact,
+                    reason_code: "rule_matched",
                 }],
             }
         );
@@ -415,6 +435,7 @@ mod tests {
                 matches: vec![ResponseFilterMatch {
                     rule_id: "marker".to_string(),
                     action: ResponseFilterAction::Redact,
+                    reason_code: "rule_matched",
                 }],
             }
         );
@@ -442,6 +463,7 @@ mod tests {
                 matches: vec![ResponseFilterMatch {
                     rule_id: "blocked-marker".to_string(),
                     action: ResponseFilterAction::Reject,
+                    reason_code: "rule_matched",
                 }],
             }
         );
@@ -469,6 +491,7 @@ mod tests {
                 matches: vec![ResponseFilterMatch {
                     rule_id: "marker".to_string(),
                     action: ResponseFilterAction::Reject,
+                    reason_code: "rule_matched",
                 }],
             }
         );
@@ -497,6 +520,7 @@ mod tests {
                 matches: vec![ResponseFilterMatch {
                     rule_id: "marker".to_string(),
                     action: ResponseFilterAction::Redact,
+                    reason_code: "rule_matched",
                 }],
             }
         );
@@ -524,6 +548,7 @@ mod tests {
                 matches: vec![ResponseFilterMatch {
                     rule_id: "required-marker".to_string(),
                     action: ResponseFilterAction::Reject,
+                    reason_code: "required_rule_missing",
                 }],
             }
         );
@@ -555,6 +580,7 @@ mod tests {
                 matches: vec![ResponseFilterMatch {
                     rule_id: "required-json-shape".to_string(),
                     action: ResponseFilterAction::Redact,
+                    reason_code: "required_rule_missing",
                 }],
             }
         );

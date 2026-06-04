@@ -1641,6 +1641,8 @@ mod tests {
         bootstrap.response_filter = crate::config::ResponseFilterConfig {
             enabled: true,
             replacement: Some("[filtered]".to_string()),
+            event_window_capacity: None,
+            alert_window_seconds: None,
             rules: vec![crate::config::ResponseFilterRuleConfig {
                 id: "bootstrap-filter".to_string(),
                 enabled: true,
@@ -1709,6 +1711,8 @@ mod tests {
         resources.response_filter = crate::config::ResponseFilterConfig {
             enabled: false,
             replacement: Some("[resource-filtered]".to_string()),
+            event_window_capacity: None,
+            alert_window_seconds: None,
             rules: Vec::new(),
         };
         resources.model_groups.insert(

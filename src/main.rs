@@ -416,6 +416,11 @@ const MANAGEMENT_ROUTE_SPECS: &[ManagementRouteSpec] = &[
     },
     ManagementRouteSpec {
         method: "GET",
+        path: "/management/response-filter-events",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
         path: "/management/routing-telemetry",
         minimum_role: ManagementRole::Readonly,
     },
@@ -782,6 +787,10 @@ fn app_without_test_peer_default(state: AppState) -> Router {
         )
         .route("/management/events", get(management::list_events))
         .route(
+            "/management/response-filter-events",
+            get(management::response_filter_events),
+        )
+        .route(
             "/management/routing-telemetry",
             get(management::routing_telemetry),
         )
@@ -865,7 +874,10 @@ mod tests {
             BalanceScope, ClassifiedFailure, FailureConfidence, FailureKind, FailureScope,
             RelayProfile,
         },
-        events::{EventLog, ManagementEventActor, RoutingTelemetry, UpstreamFailureTelemetry},
+        events::{
+            EventLog, ManagementEventActor, ResponseFilterEventInput, RoutingTelemetry,
+            UpstreamFailureTelemetry,
+        },
         failure_observer::transition_observed_upstream_failure,
         management_commands::{
             disable_credential_response_for_channel, enable_credential_response_for_channel,
@@ -1524,6 +1536,8 @@ pools:
         document.response_filter = crate::config::ResponseFilterConfig {
             enabled: true,
             replacement: Some("[filtered]".to_string()),
+            event_window_capacity: None,
+            alert_window_seconds: None,
             rules: vec![crate::config::ResponseFilterRuleConfig {
                 id: "marker".to_string(),
                 enabled: true,
@@ -1545,6 +1559,7 @@ pools:
                 matches: vec![crate::response_filter::ResponseFilterMatch {
                     rule_id: "marker".to_string(),
                     action: crate::response_filter::ResponseFilterAction::Redact,
+                    reason_code: "rule_matched",
                 }],
             }
         );
@@ -1557,6 +1572,8 @@ pools:
         document.response_filter = crate::config::ResponseFilterConfig {
             enabled: true,
             replacement: Some("[filtered]".to_string()),
+            event_window_capacity: None,
+            alert_window_seconds: None,
             rules: vec![
                 crate::config::ResponseFilterRuleConfig {
                     id: "relay-ad".to_string(),
@@ -4940,6 +4957,9 @@ pools:
         assert!(main_source.contains("mod management_runtime;"));
 
         for token in [
+            "pub struct ResponseFilterEventsResponse",
+            "pub fn response_filter_events_response",
+            "pub fn response_filter_events_snapshot_response",
             "pub struct RoutingTelemetryResponse",
             "pub fn routing_telemetry_response",
             "pub fn routing_telemetry_snapshot_response",
@@ -5187,6 +5207,25 @@ pools:
         assert!(!telemetry_handler_body.contains("ManagementService::new"));
         assert!(!telemetry_handler_body.contains("routing_telemetry.lock()"));
         assert!(!telemetry_handler_body.contains(".snapshot()"));
+
+        let response_filter_events_handler_start = management_source
+            .find("pub async fn response_filter_events")
+            .expect("response filter events handler exists");
+        let response_filter_events_handler_end = management_source
+            [response_filter_events_handler_start..]
+            .find("\npub async fn runtime")
+            .map(|offset| response_filter_events_handler_start + offset)
+            .expect("next management handler exists");
+        let response_filter_events_handler_body = &management_source
+            [response_filter_events_handler_start..response_filter_events_handler_end];
+        let response_filter_events_handler_compact = response_filter_events_handler_body
+            .split_whitespace()
+            .collect::<String>();
+        assert!(response_filter_events_handler_compact
+            .contains("response_filter_events_snapshot_response(&state,offset,limit,)"));
+        assert!(!response_filter_events_handler_body.contains("ManagementService::new"));
+        assert!(!response_filter_events_handler_body.contains("response_filter_events.lock()"));
+        assert!(!response_filter_events_handler_body.contains(".snapshot()"));
 
         let readiness_handler_start = management_source
             .find("pub async fn readiness")
@@ -8292,7 +8331,7 @@ pools:
                 .unwrap();
         }
 
-        let response = app(state)
+        let response = app(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/ready")
@@ -8321,7 +8360,7 @@ pools:
             };
         }
 
-        let response = app(state)
+        let response = app(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/ready")
@@ -10230,6 +10269,11 @@ pools:
                 ManagementRole::Operator,
             ),
             ("GET", "/management/events", ManagementRole::Readonly),
+            (
+                "GET",
+                "/management/response-filter-events",
+                ManagementRole::Readonly,
+            ),
             (
                 "GET",
                 "/management/routing-telemetry",
@@ -12210,7 +12254,7 @@ pools:
             None,
             store_path.clone(),
         );
-        let response = app(state)
+        let response = app(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -19513,6 +19557,8 @@ pools:
         let runtime = serde_json::from_str::<Value>(&body).unwrap();
         assert_eq!(runtime["routing_telemetry_capacity"], 1);
         assert_eq!(runtime["routing_telemetry_events"], 1);
+        assert_eq!(runtime["response_filter_event_capacity"], 1024);
+        assert_eq!(runtime["response_filter_events"], 0);
         assert_eq!(runtime["recent_retry_counters"]["window_capacity"], 1);
         assert_eq!(
             runtime["recent_retry_counters"]["by_directive"]["retry_credential"],
@@ -20648,7 +20694,7 @@ pools:
                 .unwrap();
         }
 
-        let response = app(state)
+        let response = app(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -20852,6 +20898,273 @@ pools:
         assert_eq!(body["events"][0]["kind"], "transition_applied");
         assert_eq!(body["events"][0]["request_id"], "req_1");
         assert_eq!(body["events"][0]["channel_id"], "test");
+    }
+
+    #[tokio::test]
+    async fn management_response_filter_events_returns_bounded_safe_snapshot() {
+        let state = test_state();
+        state
+            .response_filter_events
+            .lock()
+            .expect("response filter events mutex poisoned")
+            .push(ResponseFilterEventInput {
+                request_id: "req_1".to_string(),
+                channel_id: "test".to_string(),
+                public_model: "gpt-test".to_string(),
+                rule_id: "rule_a".to_string(),
+                action: "redact".to_string(),
+                content_kind: "json".to_string(),
+                reason_code: "rule_matched".to_string(),
+                outcome: "redacted".to_string(),
+                body_committed: false,
+            });
+        state
+            .response_filter_events
+            .lock()
+            .expect("response filter events mutex poisoned")
+            .push(ResponseFilterEventInput {
+                request_id: "req_2".to_string(),
+                channel_id: "test".to_string(),
+                public_model: "gpt-test".to_string(),
+                rule_id: "rule_b".to_string(),
+                action: "reject".to_string(),
+                content_kind: "sse".to_string(),
+                reason_code: "required_rule_missing".to_string(),
+                outcome: "rejected".to_string(),
+                body_committed: true,
+            });
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/management/response-filter-events?offset=1&limit=1")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        for forbidden in [
+            "matched_text",
+            "raw_chunk",
+            "request_body",
+            "response_body",
+            "credential_id",
+            "upstream_key",
+            "client_token",
+            "secret",
+        ] {
+            assert!(
+                !body_text.contains(forbidden),
+                "response-filter event snapshot leaked forbidden field {forbidden}"
+            );
+        }
+        let body = serde_json::from_str::<Value>(&body_text).unwrap();
+        assert_eq!(body["buffered_events"], 2);
+        assert_eq!(body["offset"], 1);
+        assert_eq!(body["limit"], 1);
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        let event = events[0].as_object().unwrap();
+        let keys: std::collections::BTreeSet<_> = event.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "action",
+                "body_committed",
+                "channel_id",
+                "content_kind",
+                "created_at_unix_seconds",
+                "event_id",
+                "outcome",
+                "public_model",
+                "reason_code",
+                "request_id",
+                "rule_id",
+            ])
+        );
+        assert_eq!(event["event_id"], 2);
+        assert!(event["created_at_unix_seconds"].as_u64().unwrap() > 0);
+        assert_eq!(event["request_id"], "req_2");
+        assert_eq!(event["channel_id"], "test");
+        assert_eq!(event["public_model"], "gpt-test");
+        assert_eq!(event["rule_id"], "rule_b");
+        assert_eq!(event["action"], "reject");
+        assert_eq!(event["content_kind"], "sse");
+        assert_eq!(event["reason_code"], "required_rule_missing");
+        assert_eq!(event["outcome"], "rejected");
+        assert_eq!(event["body_committed"], true);
+    }
+
+    fn response_filter_event_input(
+        request_id: &str,
+        channel_id: &str,
+        rule_id: &str,
+        action: &str,
+        outcome: &str,
+    ) -> ResponseFilterEventInput {
+        ResponseFilterEventInput {
+            request_id: request_id.to_string(),
+            channel_id: channel_id.to_string(),
+            public_model: "gpt-test".to_string(),
+            rule_id: rule_id.to_string(),
+            action: action.to_string(),
+            content_kind: "json".to_string(),
+            reason_code: "rule_matched".to_string(),
+            outcome: outcome.to_string(),
+            body_committed: false,
+        }
+    }
+
+    fn push_response_filter_event_at(
+        state: &AppState,
+        created_at_unix_seconds: u64,
+        request_id: &str,
+        action: &str,
+        outcome: &str,
+    ) {
+        state
+            .response_filter_events
+            .lock()
+            .expect("response filter events mutex poisoned")
+            .push_at_unix_seconds(
+                response_filter_event_input(request_id, "test", "synthetic-rule", action, outcome),
+                created_at_unix_seconds,
+            );
+    }
+
+    fn current_test_unix_seconds() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_secs()
+    }
+
+    #[tokio::test]
+    async fn management_alerts_reports_response_filter_contamination_without_mutating_runtime_state(
+    ) {
+        let state = test_state_with_keys(["upstream-key-a", "upstream-key-b"]);
+        let channel = state.channels.get("test").unwrap();
+        let before_health = channel
+            .health
+            .lock()
+            .expect("channel health mutex poisoned")
+            .clone();
+        let before_credentials = {
+            let pool = channel.pool.lock().await;
+            pool.credential_snapshots()
+        };
+        let before_routing_telemetry_events = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .len();
+        let now = current_test_unix_seconds();
+
+        push_response_filter_event_at(&state, now, "req_filter_1", "redact", "redacted");
+        push_response_filter_event_at(&state, now, "req_filter_2", "redact", "redacted");
+        push_response_filter_event_at(&state, now, "req_filter_3", "reject", "rejected");
+
+        let alerts = management_response_json(&app(state.clone()), "/management/alerts").await;
+        let contamination_alert = alerts["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|alert| alert["kind"] == "response_filter_contamination")
+            .expect("response filter contamination alert is projected");
+
+        assert_eq!(contamination_alert["severity"], "warning");
+        assert_eq!(contamination_alert["resource_kind"], "channel");
+        assert_eq!(contamination_alert["resource_type"], "channel");
+        assert_eq!(contamination_alert["resource_id"], "test");
+        assert_eq!(
+            contamination_alert["channel_ids"],
+            serde_json::json!(["test"])
+        );
+        assert_eq!(contamination_alert["rule_id"], "synthetic-rule");
+        assert_eq!(contamination_alert["redact_count"], 2);
+        assert_eq!(contamination_alert["reject_count"], 1);
+        assert_eq!(contamination_alert["window_seconds"], 900);
+        assert_eq!(contamination_alert["accepting_requests"], true);
+        assert_eq!(contamination_alert["needs_operator_input"], true);
+        assert_eq!(
+            contamination_alert["required_action"],
+            "inspect_response_filter_contamination"
+        );
+        let alert_text = alerts.to_string();
+        for forbidden in [
+            "matched_text",
+            "raw_chunk",
+            "request_body",
+            "response_body",
+            "upstream-key",
+            "client_token",
+            "secret",
+        ] {
+            assert!(
+                !alert_text.contains(forbidden),
+                "response-filter alert leaked forbidden field or fixture value {forbidden}"
+            );
+        }
+
+        let after_health = channel
+            .health
+            .lock()
+            .expect("channel health mutex poisoned")
+            .clone();
+        assert_eq!(after_health, before_health);
+        let after_credentials = {
+            let pool = channel.pool.lock().await;
+            pool.credential_snapshots()
+        };
+        assert_eq!(after_credentials, before_credentials);
+        assert_eq!(
+            state
+                .routing_telemetry
+                .lock()
+                .expect("routing telemetry mutex poisoned")
+                .len(),
+            before_routing_telemetry_events
+        );
+    }
+
+    #[tokio::test]
+    async fn management_alerts_response_filter_contamination_decays_outside_window() {
+        let state = test_state_with_keys(["upstream-key-a", "upstream-key-b"]);
+        *state
+            .response_filter_alert_window
+            .write()
+            .expect("response filter alert window lock poisoned") = Duration::from_secs(60);
+        let old = current_test_unix_seconds().saturating_sub(120);
+
+        push_response_filter_event_at(&state, old, "req_filter_1", "redact", "redacted");
+        push_response_filter_event_at(&state, old, "req_filter_2", "redact", "redacted");
+        push_response_filter_event_at(&state, old, "req_filter_3", "reject", "rejected");
+
+        let alerts = management_response_json(&app(state), "/management/alerts").await;
+        assert!(alerts["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|alert| { alert["kind"] != "response_filter_contamination" }));
+    }
+
+    #[tokio::test]
+    async fn management_health_resilience_counts_response_filter_contamination_as_degraded() {
+        let state = test_state_with_keys(["upstream-key-a", "upstream-key-b"]);
+        let now = current_test_unix_seconds();
+        push_response_filter_event_at(&state, now, "req_filter_1", "redact", "redacted");
+        push_response_filter_event_at(&state, now, "req_filter_2", "redact", "redacted");
+        push_response_filter_event_at(&state, now, "req_filter_3", "reject", "rejected");
+
+        let health = management_response_json(&app(state), "/management/health/resilience").await;
+
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["response_filter_alerts"], 1);
     }
 
     #[tokio::test]
@@ -21353,6 +21666,22 @@ pools:
             .oneshot(
                 Request::builder()
                     .uri("/management/routing-telemetry")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn management_response_filter_events_requires_management_auth() {
+        let response = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/management/response-filter-events")
                     .header(header::AUTHORIZATION, client_bearer())
                     .body(Body::empty())
                     .unwrap(),
@@ -29458,6 +29787,8 @@ model_routes:
             crate::config::ResponseFilterConfig {
                 enabled: true,
                 replacement: Some("[filtered]".to_string()),
+                event_window_capacity: None,
+                alert_window_seconds: None,
                 rules: vec![crate::config::ResponseFilterRuleConfig {
                     id: "marker".to_string(),
                     enabled: true,
@@ -29470,7 +29801,7 @@ model_routes:
             },
         );
 
-        let response = app(state)
+        let response = app(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -29489,6 +29820,40 @@ model_routes:
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["choices"][0]["message"]["content"], "[filtered]");
+
+        let filter_events =
+            management_response_json(&app(state.clone()), "/management/response-filter-events")
+                .await;
+        let events = filter_events["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("req_"));
+        assert_eq!(events[0]["channel_id"], "test");
+        assert_eq!(events[0]["public_model"], "gpt-test");
+        assert_eq!(events[0]["rule_id"], "marker");
+        assert_eq!(events[0]["action"], "redact");
+        assert_eq!(events[0]["content_kind"], "json");
+        assert_eq!(events[0]["reason_code"], "rule_matched");
+        assert_eq!(events[0]["outcome"], "redacted");
+        assert_eq!(events[0]["body_committed"], true);
+        let serialized_filter_events = serde_json::to_string(&filter_events).unwrap();
+        assert!(!serialized_filter_events.contains("unsafe-marker"));
+        assert!(!serialized_filter_events.contains("response_body"));
+        assert!(!serialized_filter_events.contains("request_body"));
+
+        let telemetry =
+            management_response_json(&app(state.clone()), "/management/routing-telemetry").await;
+        let telemetry_events = telemetry["events"].as_array().unwrap();
+        assert_eq!(telemetry_events.len(), 1);
+        assert_eq!(telemetry_events[0]["kind"], "route_selected");
+
+        let channel = state.channels.get("test").unwrap();
+        let pool = channel.pool.lock().await;
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.cooling_down_credentials, 0);
+        assert_eq!(snapshot.expired_credentials, 0);
     }
 
     #[tokio::test]
@@ -29825,6 +30190,8 @@ model_routes:
             crate::config::ResponseFilterConfig {
                 enabled: true,
                 replacement: Some("[filtered]".to_string()),
+                event_window_capacity: None,
+                alert_window_seconds: None,
                 rules: vec![crate::config::ResponseFilterRuleConfig {
                     id: "marker".to_string(),
                     enabled: true,
@@ -30216,6 +30583,8 @@ model_routes:
             crate::config::ResponseFilterConfig {
                 enabled: true,
                 replacement: Some("[filtered]".to_string()),
+                event_window_capacity: None,
+                alert_window_seconds: None,
                 rules: vec![crate::config::ResponseFilterRuleConfig {
                     id: "marker".to_string(),
                     enabled: true,
@@ -30276,6 +30645,8 @@ model_routes:
             crate::config::ResponseFilterConfig {
                 enabled: true,
                 replacement: Some("[filtered]".to_string()),
+                event_window_capacity: None,
+                alert_window_seconds: None,
                 rules: vec![crate::config::ResponseFilterRuleConfig {
                     id: "marker".to_string(),
                     enabled: true,
@@ -30341,6 +30712,8 @@ model_routes:
             crate::config::ResponseFilterConfig {
                 enabled: true,
                 replacement: Some("[filtered]".to_string()),
+                event_window_capacity: None,
+                alert_window_seconds: None,
                 rules: vec![crate::config::ResponseFilterRuleConfig {
                     id: "marker".to_string(),
                     enabled: true,

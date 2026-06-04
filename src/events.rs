@@ -208,6 +208,106 @@ pub struct UpstreamFailureTelemetry {
     pub retry_decision_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResponseFilterEvent {
+    pub event_id: u64,
+    pub created_at_unix_seconds: u64,
+    pub request_id: String,
+    pub channel_id: String,
+    pub public_model: String,
+    pub rule_id: String,
+    pub action: String,
+    pub content_kind: String,
+    pub reason_code: String,
+    pub outcome: String,
+    pub body_committed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResponseFilterEventInput {
+    pub request_id: String,
+    pub channel_id: String,
+    pub public_model: String,
+    pub rule_id: String,
+    pub action: String,
+    pub content_kind: String,
+    pub reason_code: String,
+    pub outcome: String,
+    pub body_committed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResponseFilterEventBuffer {
+    capacity: usize,
+    next_id: u64,
+    events: VecDeque<ResponseFilterEvent>,
+}
+
+impl ResponseFilterEventBuffer {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            next_id: 0,
+            events: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    pub fn push(&mut self, input: ResponseFilterEventInput) -> Option<ResponseFilterEvent> {
+        self.push_at_unix_seconds(input, current_unix_seconds())
+    }
+
+    pub fn push_at_unix_seconds(
+        &mut self,
+        input: ResponseFilterEventInput,
+        created_at_unix_seconds: u64,
+    ) -> Option<ResponseFilterEvent> {
+        if self.capacity == 0 {
+            return None;
+        }
+        self.next_id = self.next_id.saturating_add(1);
+        let event = ResponseFilterEvent {
+            event_id: self.next_id,
+            created_at_unix_seconds,
+            request_id: input.request_id,
+            channel_id: input.channel_id,
+            public_model: input.public_model,
+            rule_id: input.rule_id,
+            action: input.action,
+            content_kind: input.content_kind,
+            reason_code: input.reason_code,
+            outcome: input.outcome,
+            body_committed: input.body_committed,
+        };
+        if self.events.len() == self.capacity {
+            self.events.pop_front();
+        }
+        self.events.push_back(event.clone());
+        Some(event)
+    }
+
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn snapshot(&self) -> Vec<ResponseFilterEvent> {
+        self.events.iter().cloned().collect()
+    }
+
+    pub fn replace_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        while self.events.len() > self.capacity {
+            self.events.pop_front();
+        }
+        self.events.shrink_to_fit();
+        self.events
+            .reserve(self.capacity.saturating_sub(self.events.len()));
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetryPressureDirectiveCounters {
     pub retry_credential: u64,
@@ -1556,6 +1656,68 @@ mod tests {
     }
 
     #[test]
+    fn response_filter_event_buffer_assigns_monotonic_ids_and_drops_oldest() {
+        let mut buffer = ResponseFilterEventBuffer::new(2);
+
+        buffer.push(test_response_filter_event_input("req-1", "rule-a"));
+        buffer.push(test_response_filter_event_input("req-2", "rule-b"));
+        buffer.push(test_response_filter_event_input("req-3", "rule-c"));
+
+        let events = buffer.snapshot();
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(events[0].event_id, 2);
+        assert_eq!(events[0].request_id, "req-2");
+        assert_eq!(events[1].event_id, 3);
+        assert_eq!(events[1].rule_id, "rule-c");
+        assert!(events.iter().all(|event| event.created_at_unix_seconds > 0));
+    }
+
+    #[test]
+    fn response_filter_event_serializes_only_safe_metadata() {
+        let mut buffer = ResponseFilterEventBuffer::new(1);
+        let event = buffer
+            .push(test_response_filter_event_input(
+                "req-safe",
+                "blocked-marker",
+            ))
+            .unwrap();
+
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["event_id"], 1);
+        assert_eq!(value["request_id"], "req-safe");
+        assert_eq!(value["channel_id"], "channel-a");
+        assert_eq!(value["public_model"], "gpt-test");
+        assert_eq!(value["rule_id"], "blocked-marker");
+        assert_eq!(value["action"], "reject");
+        assert_eq!(value["content_kind"], "json");
+        assert_eq!(value["reason_code"], "rule_matched");
+        assert_eq!(value["outcome"], "rejected");
+        assert_eq!(value["body_committed"], false);
+        let serialized = value.to_string();
+        assert!(!serialized.contains("sk-"));
+        assert!(!serialized.contains("unsafe-marker"));
+        assert!(!serialized.contains("/tmp/"));
+    }
+
+    #[test]
+    fn response_filter_event_buffer_can_replace_capacity_without_resetting_ids() {
+        let mut buffer = ResponseFilterEventBuffer::new(3);
+        buffer.push(test_response_filter_event_input("req-1", "rule-a"));
+        buffer.push(test_response_filter_event_input("req-2", "rule-b"));
+        buffer.push(test_response_filter_event_input("req-3", "rule-c"));
+
+        buffer.replace_capacity(1);
+        let event = buffer
+            .push(test_response_filter_event_input("req-4", "rule-d"))
+            .unwrap();
+
+        assert_eq!(event.event_id, 4);
+        assert_eq!(buffer.capacity(), 1);
+        assert_eq!(buffer.snapshot()[0].request_id, "req-4");
+    }
+
+    #[test]
     fn lifecycle_persistence_drop_routing_telemetry_serializes_without_secret_material() {
         let event = RoutingTelemetry::CredentialLifecyclePersistenceDropped {
             request_id: "req-1".to_string(),
@@ -1599,6 +1761,23 @@ mod tests {
             retry_pressure_accounted: true,
             retry_decision: "retry_credential".to_string(),
             retry_decision_reason: None,
+        }
+    }
+
+    fn test_response_filter_event_input(
+        request_id: &str,
+        rule_id: &str,
+    ) -> ResponseFilterEventInput {
+        ResponseFilterEventInput {
+            request_id: request_id.to_string(),
+            channel_id: "channel-a".to_string(),
+            public_model: "gpt-test".to_string(),
+            rule_id: rule_id.to_string(),
+            action: "reject".to_string(),
+            content_kind: "json".to_string(),
+            reason_code: "rule_matched".to_string(),
+            outcome: "rejected".to_string(),
+            body_committed: false,
         }
     }
 }
