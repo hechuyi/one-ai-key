@@ -102,10 +102,10 @@ OpenTelemetry contributes the event-contract lesson: events need stable names, b
 
 ### 0A. Local Build And Release Harness
 
-- [ ] Add or standardize `scripts/local-ci.sh` as the canonical local verification entrypoint. It must run `cargo fmt -- --check`, `cargo check --locked`, `cargo clippy --locked -- -D warnings`, and `cargo test --locked`.
-- [ ] Add or standardize `scripts/build-release-x86_64-linux-docker.sh` as the canonical host-side release-artifact build entrypoint. It must enter the local x86_64 Linux Nix container, produce the binary artifact locally, and write a SHA256 file. `scripts/build-release-x86_64-linux.sh` is the guarded container-side entrypoint, not the host release gate.
-- [ ] If the local x86_64 NixOS container is not available, the phase is blocked. Do not SSH to a server, use a remote builder, or declare a phase complete from host-only tests.
-- [ ] Secret-backed integration tests must read ignored local config or env vars and must skip with a clear message when absent. They must not hardcode keys.
+- [x] Add or standardize `scripts/local-ci.sh` as the canonical local verification entrypoint. It must run `cargo fmt -- --check`, `cargo check --locked`, `cargo clippy --locked -- -D warnings`, and `cargo test --locked`.
+- [x] Add or standardize `scripts/build-release-x86_64-linux-docker.sh` as the canonical host-side release-artifact build entrypoint. It must enter the local x86_64 Linux Nix container, produce the binary artifact locally, and write a SHA256 file. `scripts/build-release-x86_64-linux.sh` is the guarded container-side entrypoint, not the host release gate.
+- [x] If the local x86_64 NixOS container is not available, the phase is blocked. Do not SSH to a server, use a remote builder, or declare a phase complete from host-only tests.
+- [x] Secret-backed integration tests must read ignored local config or env vars and must skip with a clear message when absent. They must not hardcode keys.
 
 **Release gate:** before any GitHub release, run `git status -sb --untracked-files=all` and verify that no local config, SQLite database, JSONL log, key file, private agent file, `dist/` output, or release artifact is staged. Release assets must be named by version and target, include SHA256, and be immutable enough for a future NixOS pin by URL plus hash.
 
@@ -125,11 +125,11 @@ Network boundary choice for this roadmap: implement `management.ip_allowlist` fi
 
 ### 0C. Audit And Config Contracts
 
-- [ ] Every management mutation emits a stable audit record with `created_at_unix_seconds`, actor id, role, action, resource type/id, outcome, request id when present, registry/runtime generation when relevant, and `reason_code`.
-- [ ] Persisted/displayed audit records store `reason_code` only. Free-form operator notes, if accepted by request payloads for compatibility, are redacted from management responses and never written to JSONL.
-- [ ] If durable audit logging is configured and append fails, the management mutation fails before applying runtime or durable state. Do not apply the mutation and then emit a best-effort audit-failure event.
-- [ ] JSONL replay remains compatible with old records that lack `created_at_unix_seconds`.
-- [ ] Add `deny_unknown_fields` or explicit unknown-field validation for all new config namespaces introduced by this roadmap: relay profile, balance scope, management principals, IP allowlist, audit settings, guard settings, and response-filter event settings.
+- [x] Every management mutation emits a stable audit record with `created_at_unix_seconds`, actor id, role, action, resource type/id, outcome, request id when present, registry/runtime generation when relevant, and `reason_code`.
+- [x] Persisted/displayed audit records store `reason_code` only. Free-form operator notes, if accepted by request payloads for compatibility, are redacted from management responses and never written to JSONL.
+- [x] If durable audit logging is configured and append fails, the management mutation fails before applying runtime or durable state. Do not apply the mutation and then emit a best-effort audit-failure event.
+- [x] JSONL replay remains compatible with old records that lack `created_at_unix_seconds`.
+- [x] Add `deny_unknown_fields` or explicit unknown-field validation for all new config namespaces introduced by this roadmap: relay profile, balance scope, management principals, IP allowlist, audit settings, guard settings, and response-filter event settings.
 
 ### 0D. Health Split
 
@@ -215,13 +215,13 @@ Endpoint/schema acceptance:
 
 **Likely files:** `src/routing.rs`, `src/events.rs`, `src/failure_observer.rs`, `src/management_runtime.rs`, `src/management_routing.rs`, docs and tests.
 
-- [ ] Keep same-request credential retry opt-in and disabled by default.
-- [ ] Preserve hard gates: non-replayable body, streaming request, partial output, attempt-limit exhaustion, and effective-deadline exhaustion must not retry.
-- [ ] All same-request and route-target fallback attempts share one attempt-state path.
-- [ ] Add an effective request deadline for retry/fallback if not already present in the selected timeout profile. Fallback must not start if it cannot fit inside the effective deadline.
-- [ ] Add duplicate-charge risk fields for fallback after upstream transaction failure or guarded 2xx failure when charge status is unknown.
-- [ ] Add bounded retry-pressure counters/events to prevent silent traffic amplification.
-- [ ] Keep HTTP 2xx success-guard classification, response-filter lifecycle mutation, and live `/v1/models` aggregation out of Phase 2.
+- [x] Keep same-request credential retry opt-in and disabled by default.
+- [x] Preserve hard gates: non-replayable body, streaming request, partial output, attempt-limit exhaustion, and effective-deadline exhaustion must not retry.
+- [x] All same-request and route-target fallback attempts share one attempt-state path.
+- [x] Add an effective request deadline for retry/fallback if not already present in the selected timeout profile. Fallback must not start if it cannot fit inside the effective deadline.
+- [x] Add duplicate-charge risk fields for fallback after upstream transaction failure or guarded 2xx failure when charge status is unknown.
+- [x] Add bounded retry-pressure counters/events to prevent silent traffic amplification.
+- [x] Keep HTTP 2xx success-guard classification, response-filter lifecycle mutation, and live `/v1/models` aggregation out of Phase 2.
 
 Stable telemetry schema additions:
 
@@ -285,12 +285,12 @@ This stop node may be implemented before or after Phase 4. It refines the retry/
 
 Scope:
 
-- [ ] For non-streaming requests with replayable bodies, before returning an upstream-derived client error, exhaust all allowed same-request credential retries and frozen route-target fallback attempts within the unified attempt-state gates.
-- [ ] Same-request credential retry must exclude credentials already failed in the current request and must not switch back to the same key.
-- [ ] Route-target retry uses frozen candidates from the original route planning result. It skips targets that are already cooling down, disabled, or without an eligible credential, and its inclusion/skip reasons are explainable in telemetry and routing preview.
-- [ ] Streaming, non-replayable, and partial-output paths never fallback or retry. They return stable denial reasons instead of attempting continuation.
-- [ ] `Retry-After` and typed channel-failure evidence may influence transient cooldown. They never override manual disablement or configured disablement.
-- [ ] Retry/fallback decisions do not parse free-form upstream text and do not record raw response bodies, request bodies, upstream keys, client tokens, or token-like values.
+- [x] For non-streaming requests with replayable bodies, before returning an upstream-derived client error, exhaust all allowed same-request credential retries and frozen route-target fallback attempts within the unified attempt-state gates.
+- [x] Same-request credential retry must exclude credentials already failed in the current request and must not switch back to the same key.
+- [x] Route-target retry uses frozen candidates from the original route planning result. It skips targets that are already cooling down, disabled, or without an eligible credential, and its inclusion/skip reasons are explainable in telemetry and routing preview.
+- [x] Streaming, non-replayable, and partial-output paths never fallback or retry. They return stable denial reasons instead of attempting continuation.
+- [x] `Retry-After` and typed channel-failure evidence may influence transient cooldown. They never override manual disablement or configured disablement.
+- [x] Retry/fallback decisions do not parse free-form upstream text and do not record raw response bodies, request bodies, upstream keys, client tokens, or token-like values.
 
 Stop-card tests:
 
@@ -341,12 +341,12 @@ Framing/header contract:
 
 **Likely files:** `src/management_runtime.rs`, `src/management_routing.rs`, `src/management_alerts.rs`, `README.md`, `docs/architecture.md`, `docs/performance-budget.md`, tests.
 
-- [ ] Add or stabilize `GET /management/explain/runtime` with runtime generation, registry source, credential source, client-token source, staged-vs-runtime state, reload requirement, last reload time, and last reload error.
-- [ ] Add or stabilize model-route explanation using existing `/management/routing/preview` rather than adding live model discovery to `/v1/models`.
-- [ ] Ensure `GET /management/health/serving` and `GET /management/health/resilience` include relay suppression, retry pressure, credential-set spare capacity, and response-filter alert summaries.
-- [ ] Update README with a clear suitable/not-suitable boundary.
-- [ ] Update performance docs with composed guard/filter byte and latency budgets.
-- [ ] Update response-filter docs to state the event boundary and the explicit non-input to routing/channel lifecycle.
+- [x] Add or stabilize `GET /management/explain/runtime` with runtime generation, registry source, credential source, client-token source, staged-vs-runtime state, reload requirement, last reload time, and last reload error.
+- [x] Add or stabilize model-route explanation using existing `/management/routing/preview` rather than adding live model discovery to `/v1/models`.
+- [x] Ensure `GET /management/health/serving` and `GET /management/health/resilience` include relay suppression, retry pressure, credential-set spare capacity, and response-filter alert summaries.
+- [x] Update README with a clear suitable/not-suitable boundary.
+- [x] Update performance docs with composed guard/filter byte and latency budgets.
+- [x] Update response-filter docs to state the event boundary and the explicit non-input to routing/channel lifecycle.
 
 Explain endpoint schemas must be redacted: no raw tokens, token hashes, upstream keys, raw request/response bodies, matched text, absolute key paths, URL userinfo, or token-like query parameters.
 
@@ -418,9 +418,9 @@ The whole roadmap stops after Phase 5. Any work on automatic filter-to-health mu
 
 ## Implementation Progress
 
-Current implementation has passed through Phase 3B in committed history. Phase 4 is implemented as a response-filter observability and framing node: response-filter matches write bounded safe metadata to an in-memory ring, `/management/response-filter-events` exposes a readonly snapshot, repeated `(channel_id, rule_id)` hits produce management-only contamination alerts with time-window decay, resilience health counts those alerts as degradation, and tests assert no lifecycle, channel-health, credential-state, or routing-telemetry mutation from filter hits.
+Current implementation has passed through Phase 5. Phase 4 is implemented as a response-filter observability and framing node: response-filter matches write bounded safe metadata to an in-memory ring, `/management/response-filter-events` exposes a readonly snapshot, repeated `(channel_id, rule_id)` hits produce management-only contamination alerts with time-window decay, resilience health counts those alerts as degradation, and tests assert no lifecycle, channel-health, credential-state, or routing-telemetry mutation from filter hits.
 
-The remaining roadmap work is Phase 5: explain runtime, health truth-table hardening, README boundary documentation, composed performance documentation, response-filter documentation consistency, and final full local CI plus x86_64 release-build hygiene.
+Phase 5 is implemented as the final explanation, documentation, and boundary-hardening node: `/management/explain/runtime` reports the compiled runtime and staged-vs-runtime state with redacted source summaries, routing preview remains the model-route explanation surface, management health projections expose serving/resilience distinctions and response-filter alert summaries, README/performance/response-filter documentation records the lightweight-router boundary, and the final local CI plus x86_64 Docker/Nix release gate produced a versioned artifact with SHA256 verification.
 
 ## Convergence Record
 
@@ -435,4 +435,4 @@ Root issue ledger for this revision:
 | Tests not red/green enough | Added phase stop cards with endpoint/schema assertions and blocked conditions. |
 | Model discovery scope drift | Reframed model discovery as deferred boundary only. |
 
-Propagation audit: the locked invariants are restated in the decision matrix, phase tasks, stop cards, deferred boundary, and parked-item lifecycle. Cold scan result: no remaining internally solvable blocker is intentionally left open; parked items have revisit triggers and visibility. Current status: implementation has progressed through the committed Phase 3B stop node, with Phase 4 implemented in the current working tree pending final gate and commit; Phase 5 remains open.
+Propagation audit: the locked invariants are restated in the decision matrix, phase tasks, stop cards, deferred boundary, and parked-item lifecycle. Cold scan result: no remaining internally solvable blocker is intentionally left open; parked items have revisit triggers and visibility. Current status: roadmap implementation is complete through Phase 5, with the final local CI, x86_64 Docker/Nix release build, release checksum verification, and repository hygiene checks forming the closing evidence. Automatic filter-to-health mutation, account/provider balance suppression, persistent model-discovery trust states, UI/billing surfaces, and remote deployment remain parked unless a new explicit goal reopens them.
