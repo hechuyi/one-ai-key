@@ -26,7 +26,7 @@ use crate::{
     },
     routing::{
         apply_retry_directive_to_attempt_state, FailureSource, FrozenRetryCandidates,
-        RequestSelectionSnapshot, RetryAttemptContinuation, RetryDirective, SelectionReason,
+        RequestSelectionSnapshot, RetryAttemptContinuation, SelectionReason,
     },
     state::{AppState, ChannelId, PoolState},
     success_guard::{guard_success_response, should_guard_success_status, GuardResult},
@@ -1092,8 +1092,26 @@ async fn forward_with_pool(
                 .await;
                 let response =
                     json_error(StatusCode::BAD_GATEWAY, format!("upstream error: {err}"));
-                if matches!(directive, RetryDirective::RetryRouteTarget) {
-                    return PoolForwardResult::RouteFallback(response);
+                match apply_retry_directive_to_attempt_state(
+                    directive,
+                    &mut frozen_retry_candidates,
+                    &mut attempt,
+                ) {
+                    RetryAttemptContinuation::RetrySameTarget => continue,
+                    RetryAttemptContinuation::RetryRouteTarget => {
+                        return PoolForwardResult::RouteFallback(response);
+                    }
+                    RetryAttemptContinuation::RetryCredential { credential_id } => {
+                        retry_credential_id = Some(credential_id);
+                        continue;
+                    }
+                    RetryAttemptContinuation::ReturnCurrentError { .. } => {}
+                    RetryAttemptContinuation::FrozenCandidateDrift { .. } => {
+                        return PoolForwardResult::Response(json_error(
+                            StatusCode::BAD_GATEWAY,
+                            "retry candidate drifted from frozen request selection",
+                        ));
+                    }
                 }
                 return PoolForwardResult::Response(response);
             }
@@ -1151,6 +1169,7 @@ async fn forward_with_pool(
                         RetryAttemptContinuation::RetryRouteTarget => {
                             return PoolForwardResult::RouteFallback(response);
                         }
+                        RetryAttemptContinuation::RetrySameTarget => continue,
                         RetryAttemptContinuation::ReturnCurrentError { .. } => {}
                         RetryAttemptContinuation::FrozenCandidateDrift { .. } => {
                             return PoolForwardResult::Response(json_error(
@@ -1209,6 +1228,7 @@ async fn forward_with_pool(
                             );
                             return PoolForwardResult::RouteFallback(response);
                         }
+                        RetryAttemptContinuation::RetrySameTarget => continue,
                         RetryAttemptContinuation::ReturnCurrentError { .. } => {}
                         RetryAttemptContinuation::FrozenCandidateDrift { .. } => {
                             return PoolForwardResult::Response(json_error(
@@ -1254,6 +1274,7 @@ async fn forward_with_pool(
                         );
                         return PoolForwardResult::RouteFallback(response);
                     }
+                    RetryAttemptContinuation::RetrySameTarget => continue,
                     RetryAttemptContinuation::ReturnCurrentError { .. } => {}
                     RetryAttemptContinuation::FrozenCandidateDrift { .. } => {
                         return PoolForwardResult::Response(json_error(
@@ -1291,6 +1312,7 @@ async fn forward_with_pool(
                 let response = response_with_headers(status, response_headers, Body::from(bytes));
                 return PoolForwardResult::RouteFallback(response);
             }
+            RetryAttemptContinuation::RetrySameTarget => continue,
             RetryAttemptContinuation::ReturnCurrentError { .. }
             | RetryAttemptContinuation::FrozenCandidateDrift { .. } => {}
         }

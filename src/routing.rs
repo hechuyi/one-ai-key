@@ -110,12 +110,14 @@ pub enum RetryDirective {
     ReturnCurrentError { reason: RetryDecisionReason },
     RetryCredential { credential_id: CredentialId },
     RetryRouteTarget,
+    RetrySameTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetryAttemptContinuation {
     RetryCredential { credential_id: CredentialId },
     RetryRouteTarget,
+    RetrySameTarget,
     ReturnCurrentError { reason: RetryDecisionReason },
     FrozenCandidateDrift { credential_id: CredentialId },
 }
@@ -247,6 +249,10 @@ pub fn apply_retry_directive_to_attempt_state(
             }
         }
         RetryDirective::RetryRouteTarget => RetryAttemptContinuation::RetryRouteTarget,
+        RetryDirective::RetrySameTarget => {
+            *attempt += 1;
+            RetryAttemptContinuation::RetrySameTarget
+        }
         RetryDirective::ReturnCurrentError { reason } => {
             RetryAttemptContinuation::ReturnCurrentError { reason }
         }
@@ -357,16 +363,18 @@ pub fn transition_after_failure(input: TransitionInput<'_>) -> TransitionResult 
             reason: RetryDecisionReason::FailureNotRetryable,
         }
     } else if matches!(input.failure.primary_scope, FailureScope::Channel) {
-        if !input.policy.route_target_retry_enabled {
+        if input.policy.route_target_retry_enabled && input.snapshot.route_target_available {
+            RetryDirective::RetryRouteTarget
+        } else if same_target_transient_retry_allowed(&input) {
+            RetryDirective::RetrySameTarget
+        } else if !input.policy.route_target_retry_enabled {
             RetryDirective::ReturnCurrentError {
                 reason: RetryDecisionReason::RouteTargetRetryDisabled,
             }
-        } else if !input.snapshot.route_target_available {
+        } else {
             RetryDirective::ReturnCurrentError {
                 reason: RetryDecisionReason::NoRouteCandidate,
             }
-        } else {
-            RetryDirective::RetryRouteTarget
         }
     } else if input.snapshot.attempt >= input.policy.max_same_request_retries {
         if credential_retry_exhausted_route_fallback_allowed(&input) {
@@ -435,6 +443,24 @@ fn duplicate_charge_risk(
     }
 }
 
+fn same_target_transient_retry_allowed(input: &TransitionInput<'_>) -> bool {
+    input.policy.route_target_retry_enabled
+        && input.snapshot.attempt == 0
+        && input.failure.cooldown.is_none()
+        && matches!(
+            (input.failure.kind, input.failure.primary_scope),
+            (FailureKind::ProviderUnavailable, FailureScope::Channel)
+        )
+        && match input.failure_source {
+            FailureSource::LocalTransport => true,
+            FailureSource::UpstreamTransaction => input
+                .failure
+                .upstream_status
+                .is_some_and(|status| (500..=599).contains(&status)),
+            FailureSource::GuardedSuccessEnvelope => false,
+        }
+}
+
 fn rejects_source_gated_channel_balance(input: &TransitionInput<'_>) -> bool {
     matches!(
         (input.failure.kind, input.failure.primary_scope),
@@ -483,6 +509,14 @@ mod tests {
         ClassifiedFailure {
             retryable: true,
             ..failure(kind, scope)
+        }
+    }
+
+    fn retryable_5xx_provider_failure() -> ClassifiedFailure {
+        ClassifiedFailure {
+            retryable: true,
+            upstream_status: Some(502),
+            ..failure(FailureKind::ProviderUnavailable, FailureScope::Channel)
         }
     }
 
@@ -709,6 +743,28 @@ mod tests {
             }
         );
         assert_eq!(attempt, 0);
+    }
+
+    #[test]
+    fn retry_attempt_continuation_advances_same_target_attempt() {
+        let mut frozen = Some(FrozenRetryCandidates::new(vec![CredentialId(
+            "cred_1".to_string(),
+        )]));
+        let mut attempt = 0;
+
+        assert_eq!(
+            apply_retry_directive_to_attempt_state(
+                RetryDirective::RetrySameTarget,
+                &mut frozen,
+                &mut attempt,
+            ),
+            RetryAttemptContinuation::RetrySameTarget
+        );
+        assert_eq!(attempt, 1);
+        assert_eq!(
+            frozen.as_ref().unwrap().remaining(),
+            vec![CredentialId("cred_1".to_string())]
+        );
     }
 
     fn policy() -> RoutingPolicy {
@@ -1425,6 +1481,102 @@ mod tests {
             std::time::Instant::now(),
             policy(),
         ));
+
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::NoRouteCandidate,
+            }
+        );
+    }
+
+    #[test]
+    fn transient_5xx_without_fallback_candidate_retries_same_target_once() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.route_target_available = false;
+
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_5xx_provider_failure(),
+            std::time::Instant::now(),
+            policy(),
+        ));
+
+        assert_eq!(result.retry, RetryDirective::RetrySameTarget);
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
+    }
+
+    #[test]
+    fn transient_same_target_retry_is_limited_to_one_attempt() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.route_target_available = false;
+        snapshot.attempt = 1;
+
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_5xx_provider_failure(),
+            std::time::Instant::now(),
+            policy(),
+        ));
+
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::NoRouteCandidate,
+            }
+        );
+    }
+
+    #[test]
+    fn transient_same_target_retry_does_not_override_retry_after_cooldown() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.route_target_available = false;
+
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            ClassifiedFailure {
+                retryable: true,
+                upstream_status: Some(503),
+                cooldown: Some(std::time::Duration::from_secs(30)),
+                ..failure(FailureKind::ProviderUnavailable, FailureScope::Channel)
+            },
+            std::time::Instant::now(),
+            policy(),
+        ));
+
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::NoRouteCandidate,
+            }
+        );
+    }
+
+    #[test]
+    fn guarded_success_envelope_does_not_retry_same_target() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.route_target_available = false;
+
+        let result = transition_after_failure(TransitionInput {
+            snapshot: &snapshot,
+            failure: ClassifiedFailure {
+                retryable: true,
+                upstream_status: Some(200),
+                ..failure(FailureKind::ProviderUnavailable, FailureScope::Channel)
+            },
+            failure_source: FailureSource::GuardedSuccessEnvelope,
+            now: std::time::Instant::now(),
+            next_attempt_budget: Some(std::time::Duration::from_millis(50)),
+            policy: policy(),
+        });
 
         assert_eq!(
             result.retry,

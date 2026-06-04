@@ -29242,6 +29242,89 @@ model_routes:
     }
 
     #[tokio::test]
+    async fn single_route_target_transient_5xx_retries_before_client_error() {
+        let upstream_hits = Arc::new(AtomicU64::new(0));
+        let upstream_hits_for_handler = upstream_hits.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let upstream_hits = upstream_hits_for_handler.clone();
+                async move {
+                    let hit = upstream_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if hit == 1 {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "upstream_unavailable",
+                                    "message": "provider unavailable"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "same-target-ok"}}
+                        ]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state = test_state_with_api_base(&api_base);
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"].as_str(),
+            Some("same-target-ok")
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned");
+        let events = telemetry.snapshot();
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    RoutingTelemetry::UpstreamFailureObserved { failure, .. }
+                        if failure.directive == "retry_same_target"
+                            && failure.failure_kind == "provider_unavailable"
+                            && failure.failure_scope == "channel"
+                            && failure.duplicate_charge_risk == "unknown"
+                )
+            }),
+            "pre-output transient 5xx should be observed as retry_same_target"
+        );
+        let counters = telemetry.retry_pressure_snapshot();
+        drop(telemetry);
+        assert_eq!(counters.by_directive.retry_same_target, 1);
+    }
+
+    #[tokio::test]
     async fn provider_unavailable_retry_after_marks_channel_cooling_down() {
         let upstream = Router::new().route(
             "/v1/chat/completions",

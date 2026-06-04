@@ -171,7 +171,13 @@ duplicate an upstream transaction because charge status cannot be proven.
 Fallback must not start unless the selected timeout profile leaves enough
 effective deadline for another attempt, and retry-pressure counters are bounded
 so fallback amplification is visible without unbounded memory growth. Phase 3
-adds a bounded HTTP 2xx success guard before success accounting: body-bearing
+also includes a single same-target transient retry for non-streaming replayable
+requests when a channel-scoped provider failure has no `Retry-After` cooldown
+and no frozen route target remains. It is reported as `retry_same_target`; a
+5xx upstream transaction keeps `duplicate_charge_risk=unknown`, while a local
+transport failure keeps `duplicate_charge_risk=none`. This is only a pre-output
+stability guard, not mid-stream continuation. Phase 3 adds a bounded HTTP 2xx
+success guard before success accounting: body-bearing
 2xx JSON/SSE responses are peeked up to 8192 bytes and 200 ms, obvious
 top-level structured error envelopes are classified with
 `failure_source=guarded_success_envelope`, and pass-through outcomes replay the

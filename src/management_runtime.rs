@@ -230,6 +230,9 @@ pub async fn runtime_response(
     staged_registry_version: Option<u64>,
 ) -> RuntimeResponse {
     let sample = collect_runtime_snapshot(state).await;
+    let same_target_transient_retry_attempt_capacity = sample
+        .retry_profile_summary
+        .route_target_retry_enabled_channels;
 
     runtime_response_from_parts(RuntimeResponseParts {
         uptime_seconds: state.started_at.elapsed().as_secs(),
@@ -245,6 +248,7 @@ pub async fn runtime_response(
             same_request_credential_retry_attempts: sample
                 .same_request_credential_retry_attempt_capacity,
             route_target_fallback_candidates: state.routing.max_route_candidates,
+            same_target_transient_retry_attempts: same_target_transient_retry_attempt_capacity,
         },
         recent_retry_counters: RuntimeRecentRetryCounters::from_window(
             sample.recent_retry_counters,
@@ -670,12 +674,14 @@ pub struct RuntimeRetryProfileSummary {
 pub struct RuntimeRetryPressureCapacity {
     pub same_request_credential_retry_attempts: usize,
     pub route_target_fallback_candidates: usize,
+    pub same_target_transient_retry_attempts: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RuntimeRecentRetryCounters {
     pub same_request_credential_retries: u64,
     pub route_target_fallbacks: u64,
+    pub same_target_transient_retries: u64,
     pub terminal_retry_decisions: u64,
     pub window_capacity: usize,
     pub by_directive: RuntimeRetryPressureDirectiveCounters,
@@ -687,6 +693,7 @@ pub struct RuntimeRecentRetryCounters {
 pub struct RuntimeRetryPressureDirectiveCounters {
     pub retry_credential: u64,
     pub retry_route_target: u64,
+    pub retry_same_target: u64,
     pub return_error: u64,
 }
 
@@ -702,11 +709,13 @@ impl RuntimeRecentRetryCounters {
         Self {
             same_request_credential_retries: counters.by_directive.retry_credential,
             route_target_fallbacks: counters.by_directive.retry_route_target,
+            same_target_transient_retries: counters.by_directive.retry_same_target,
             terminal_retry_decisions: counters.by_directive.return_error,
             window_capacity,
             by_directive: RuntimeRetryPressureDirectiveCounters {
                 retry_credential: counters.by_directive.retry_credential,
                 retry_route_target: counters.by_directive.retry_route_target,
+                retry_same_target: counters.by_directive.retry_same_target,
                 return_error: counters.by_directive.return_error,
             },
             by_denial_reason: counters.by_denial_reason,

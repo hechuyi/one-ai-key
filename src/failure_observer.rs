@@ -69,7 +69,7 @@ async fn apply_error_action(
     let _mutation_guard = pool_state.mutation_gate.lock().await;
     let mut pool = pool_state.pool.lock().await;
     let policy = routing_policy_for_pool(pool_state);
-    let result = transition_after_failure(TransitionInput {
+    let mut result = transition_after_failure(TransitionInput {
         snapshot,
         failure,
         failure_source,
@@ -84,6 +84,12 @@ async fn apply_error_action(
         snapshot,
         result.mutation.clone(),
     );
+    if matches!(result.retry, RetryDirective::RetrySameTarget) && telemetry.is_empty() {
+        result.retry = RetryDirective::ReturnCurrentError {
+            reason: RetryDecisionReason::NoRouteCandidate,
+        };
+        result.duplicate_charge_risk = DuplicateChargeRisk::None;
+    }
     (result, telemetry)
 }
 
@@ -186,6 +192,7 @@ fn retry_decision_telemetry(
         ),
         RetryDirective::RetryCredential { .. } => ("retry_credential", "retry_credential", None),
         RetryDirective::RetryRouteTarget => ("retry_route_target", "retry_route_target", None),
+        RetryDirective::RetrySameTarget => ("retry_same_target", "retry_same_target", None),
     }
 }
 

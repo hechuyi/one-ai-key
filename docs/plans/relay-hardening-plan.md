@@ -227,7 +227,7 @@ Stable telemetry schema additions:
 
 | Surface | Fields |
 | --- | --- |
-| `/management/routing-telemetry` event `retry_decision` | `request_id`, `public_model`, `channel_id`, `credential_id_hash`, `attempt`, `failure_source`, `failure_kind`, `failure_scope`, `directive: retry_credential|retry_route_target|return_error`, `denial_reason`, `duplicate_charge_risk: none|unknown|known_no_charge`, `effective_deadline_remaining_ms`. |
+| `/management/routing-telemetry` event `retry_decision` | `request_id`, `public_model`, `channel_id`, `credential_id_hash`, `attempt`, `failure_source`, `failure_kind`, `failure_scope`, `directive: retry_credential|retry_route_target|retry_same_target|return_error`, `denial_reason`, `duplicate_charge_risk: none|unknown|known_no_charge`, `effective_deadline_remaining_ms`. |
 | `/management/runtime` | Retry profile summary, `retry_pressure_capacity`, bounded recent retry/fallback counters split by directive, denial reason, and duplicate-charge risk. |
 | `/management/routing/preview` | Read-only policy summary: route-target retry enabled, same-request credential retry enabled, max retries, candidate limit. |
 
@@ -288,6 +288,7 @@ Scope:
 - [x] For non-streaming requests with replayable bodies, before returning an upstream-derived client error, exhaust all allowed same-request credential retries and frozen route-target fallback attempts within the unified attempt-state gates.
 - [x] Same-request credential retry must exclude credentials already failed in the current request and must not switch back to the same key.
 - [x] Route-target retry uses frozen candidates from the original route planning result. It skips targets that are already cooling down, disabled, or without an eligible credential, and its inclusion/skip reasons are explainable in telemetry and routing preview.
+- [x] Single-target transient provider failures get one same-target pre-output retry when no frozen route target remains, no cooldown evidence is present, and the normal replayability, streaming, partial-output, and deadline gates allow another attempt.
 - [x] Streaming, non-replayable, and partial-output paths never fallback or retry. They return stable denial reasons instead of attempting continuation.
 - [x] `Retry-After` and typed channel-failure evidence may influence transient cooldown. They never override manual disablement or configured disablement.
 - [x] Retry/fallback decisions do not parse free-form upstream text and do not record raw response bodies, request bodies, upstream keys, client tokens, or token-like values.
@@ -298,6 +299,7 @@ Stop-card tests:
 - Credential candidate exhaustion falls through to the next eligible frozen route target when route-target retry remains allowed.
 - Candidate exhaustion without an eligible route target returns stable `no_frozen_candidate`, `attempt_limit_reached`, or `no_route_candidate` denial/error codes as appropriate.
 - Primary target `5xx`, `429`, and typed guarded-`2xx` failures fallback to the next eligible frozen target when replayability, deadline, and policy gates allow it.
+- Single-route `5xx` provider failures retry the same target once before returning a client-visible error; `Retry-After` cooldown evidence, guarded-success 2xx failures, streaming, non-replayable, and partial-output paths do not use same-target retry.
 - Streaming, non-replayable, and partial-output paths produce no fallback and expose the stable denial reason.
 - Telemetry records retry directive, denial reason, and duplicate-charge-risk classification without raw body/key/token material.
 - Retry pressure remains bounded under repeated failures.
@@ -418,7 +420,7 @@ The whole roadmap stops after Phase 5. Any work on automatic filter-to-health mu
 
 ## Implementation Progress
 
-Current implementation has passed through Phase 5. Phase 4 is implemented as a response-filter observability and framing node: response-filter matches write bounded safe metadata to an in-memory ring, `/management/response-filter-events` exposes a readonly snapshot, repeated `(channel_id, rule_id)` hits produce management-only contamination alerts with time-window decay, resilience health counts those alerts as degradation, and tests assert no lifecycle, channel-health, credential-state, or routing-telemetry mutation from filter hits.
+Current implementation has passed through Phase 5. Phase 3B now includes the post-plan stability correction for single-candidate upstream jitter: non-streaming replayable requests may perform one same-target pre-output retry for a channel-scoped provider failure when no route fallback candidate remains and no cooldown evidence is present. The directive is observable as `retry_same_target`; upstream 5xx retries retain `duplicate_charge_risk=unknown`, local transport retries retain `duplicate_charge_risk=none`, and guarded-success 2xx, streaming, non-replayable, partial-output, cooldown, and post-output paths remain terminal under the existing gates. Phase 4 is implemented as a response-filter observability and framing node: response-filter matches write bounded safe metadata to an in-memory ring, `/management/response-filter-events` exposes a readonly snapshot, repeated `(channel_id, rule_id)` hits produce management-only contamination alerts with time-window decay, resilience health counts those alerts as degradation, and tests assert no lifecycle, channel-health, credential-state, or routing-telemetry mutation from filter hits.
 
 Phase 5 is implemented as the final explanation, documentation, and boundary-hardening node: `/management/explain/runtime` reports the compiled runtime and staged-vs-runtime state with redacted source summaries, routing preview remains the model-route explanation surface, management health projections expose serving/resilience distinctions and response-filter alert summaries, README/performance/response-filter documentation records the lightweight-router boundary, and the final local CI plus x86_64 Docker/Nix release gate produced a versioned artifact with SHA256 verification.
 

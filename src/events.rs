@@ -312,6 +312,7 @@ impl ResponseFilterEventBuffer {
 pub struct RetryPressureDirectiveCounters {
     pub retry_credential: u64,
     pub retry_route_target: u64,
+    pub retry_same_target: u64,
     pub return_error: u64,
 }
 
@@ -342,6 +343,10 @@ impl RetryPressureCounters {
             "retry_route_target" => {
                 self.by_directive.retry_route_target =
                     self.by_directive.retry_route_target.saturating_add(1)
+            }
+            "retry_same_target" => {
+                self.by_directive.retry_same_target =
+                    self.by_directive.retry_same_target.saturating_add(1)
             }
             "return_error" | "return_current_error" => {
                 self.by_directive.return_error = self.by_directive.return_error.saturating_add(1)
