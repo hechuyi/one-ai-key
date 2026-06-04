@@ -19833,6 +19833,23 @@ pools:
         assert_eq!(health["serving_channels"], 1);
         assert_eq!(health["blocking_alerts"], 0);
         assert_eq!(health["blocking_reasons"], serde_json::json!([]));
+        assert_eq!(health["relay_suppression"]["suppressed_public_models"], 0);
+        assert_eq!(health["relay_suppression"]["suppressed_candidates"], 0);
+        assert_eq!(
+            health["retry_pressure"]["same_request_credential_retries"],
+            0
+        );
+        assert_eq!(health["retry_pressure"]["route_target_fallbacks"], 0);
+        assert_eq!(health["retry_pressure"]["terminal_retry_decisions"], 0);
+        assert_eq!(
+            health["credential_spare_capacity"]["credential_sets_without_spare"],
+            1
+        );
+        assert_eq!(
+            health["credential_spare_capacity"]["available_credentials"],
+            1
+        );
+        assert_eq!(health["response_filter_alert_summary"]["alerts"], 0);
     }
 
     #[tokio::test]
@@ -19990,6 +20007,20 @@ pools:
         assert_eq!(health["credential_sets_without_spare"], 1);
         assert_eq!(health["channels_cooling_down"], 1);
         assert_eq!(health["response_filter_alerts"], 0);
+        assert_eq!(
+            health["credential_spare_capacity"]["credential_sets_without_spare"],
+            health["credential_sets_without_spare"]
+        );
+        assert_eq!(
+            health["credential_spare_capacity"]["available_credentials"],
+            1
+        );
+        assert_eq!(
+            health["credential_spare_capacity"]["cooling_down_credentials"],
+            1
+        );
+        assert_eq!(health["relay_suppression"]["channels_cooling_down"], 1);
+        assert_eq!(health["response_filter_alert_summary"]["alerts"], 0);
     }
 
     #[tokio::test]
@@ -20105,7 +20136,9 @@ pools:
                 .unwrap();
         }
 
-        let response = app(state)
+        let app = app(state);
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/management/alerts")
@@ -20330,7 +20363,9 @@ pools:
             );
         }
 
-        let response = app(state)
+        let router = app(state);
+        let response = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/management/alerts")
@@ -20366,6 +20401,18 @@ pools:
         );
         assert_eq!(
             route_alert["reason_codes"],
+            serde_json::json!(["channel_cooling_down"])
+        );
+
+        let health = management_response_json(&router, "/management/health/resilience").await;
+        assert_eq!(health["relay_suppression"]["suppressed_public_models"], 1);
+        assert_eq!(health["relay_suppression"]["suppressed_candidates"], 2);
+        assert_eq!(
+            health["relay_suppression"]["affected_channels"],
+            serde_json::json!(["cooling_a", "cooling_b"])
+        );
+        assert_eq!(
+            health["relay_suppression"]["reason_codes"],
             serde_json::json!(["channel_cooling_down"])
         );
     }
@@ -21392,6 +21439,95 @@ pools:
 
         assert_eq!(health["status"], "degraded");
         assert_eq!(health["response_filter_alerts"], 1);
+        assert_eq!(health["response_filter_alert_summary"]["alerts"], 1);
+        assert_eq!(health["response_filter_alert_summary"]["redact_count"], 2);
+        assert_eq!(health["response_filter_alert_summary"]["reject_count"], 1);
+        assert_eq!(
+            health["response_filter_alert_summary"]["affected_channels"],
+            serde_json::json!(["test"])
+        );
+        assert_eq!(
+            health["response_filter_alert_summary"]["rules"],
+            serde_json::json!(["synthetic-rule"])
+        );
+    }
+
+    #[tokio::test]
+    async fn management_health_resilience_reports_retry_pressure_summary() {
+        let state = test_state();
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::UpstreamFailureObserved {
+                request_id: "req_retry".to_string(),
+                channel_id: "test".to_string(),
+                failure: Box::new(runtime_retry_pressure_failure(
+                    "retry_credential",
+                    None,
+                    "unknown",
+                    "fingerprint-a",
+                )),
+            });
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::UpstreamFailureObserved {
+                request_id: "req_fallback".to_string(),
+                channel_id: "test".to_string(),
+                failure: Box::new(runtime_retry_pressure_failure(
+                    "retry_route_target",
+                    None,
+                    "unknown",
+                    "fingerprint-b",
+                )),
+            });
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::UpstreamFailureObserved {
+                request_id: "req_terminal".to_string(),
+                channel_id: "test".to_string(),
+                failure: Box::new(runtime_retry_pressure_failure(
+                    "return_error",
+                    Some("attempt_limit_reached"),
+                    "none",
+                    "fingerprint-c",
+                )),
+            });
+
+        let health = management_response_json(&app(state), "/management/health/resilience").await;
+
+        assert_eq!(
+            health["retry_pressure"]["same_request_credential_retries"],
+            1
+        );
+        assert_eq!(health["retry_pressure"]["route_target_fallbacks"], 1);
+        assert_eq!(health["retry_pressure"]["terminal_retry_decisions"], 1);
+        assert_eq!(health["retry_pressure"]["window_capacity"], 1024);
+        assert_eq!(
+            health["retry_pressure"]["by_directive"]["retry_credential"],
+            1
+        );
+        assert_eq!(
+            health["retry_pressure"]["by_directive"]["retry_route_target"],
+            1
+        );
+        assert_eq!(health["retry_pressure"]["by_directive"]["return_error"], 1);
+        assert_eq!(
+            health["retry_pressure"]["by_denial_reason"]["attempt_limit_reached"],
+            1
+        );
+        assert_eq!(
+            health["retry_pressure"]["by_duplicate_charge_risk"]["unknown"],
+            2
+        );
+        assert_eq!(
+            health["retry_pressure"]["by_duplicate_charge_risk"]["none"],
+            1
+        );
     }
 
     #[tokio::test]

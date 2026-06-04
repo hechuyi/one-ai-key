@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,7 +12,10 @@ use crate::{
         ManagementAuditEvent, ManagementEventActor, ResponseFilterEvent, RetryPressureCounters,
         RoutingTelemetry,
     },
-    management_alerts::response_filter_contamination_alert_count_for_state,
+    management_alerts::{
+        model_route_all_target_suppression_alerts, response_filter_contamination_alerts_for_state,
+        ManagementAlertStatus,
+    },
     management_errors::{registry_store_error, ManagementServiceError},
     management_registry::resolve_staged_registry_document,
     management_status::{
@@ -762,6 +765,10 @@ pub struct ServingHealthResponse {
     pub serving_channels: usize,
     pub blocking_alerts: usize,
     pub blocking_reasons: Vec<&'static str>,
+    pub relay_suppression: RelaySuppressionHealthSummary,
+    pub retry_pressure: RuntimeRecentRetryCounters,
+    pub credential_spare_capacity: CredentialSpareCapacityHealthSummary,
+    pub response_filter_alert_summary: ResponseFilterAlertHealthSummary,
 }
 
 pub async fn serving_health_response(state: &AppState) -> ServingHealthResponse {
@@ -779,12 +786,23 @@ pub async fn serving_health_response(state: &AppState) -> ServingHealthResponse 
     if credential_set_blocking_alerts > 0 {
         blocking_reasons.push("credential_set_blocking_alerts");
     }
+    let relay_suppression = relay_suppression_health_summary(state, sample.channels_cooling_down);
+    let response_filter_alerts = response_filter_contamination_alerts_for_state(state);
+    let credential_spare_capacity = credential_spare_capacity_summary(&sample);
+    let retry_pressure = RuntimeRecentRetryCounters::from_window(
+        sample.recent_retry_counters,
+        state.routing.telemetry_buffer_capacity,
+    );
     ServingHealthResponse {
         status,
         serving: serving_channels > 0,
         serving_channels,
         blocking_alerts,
         blocking_reasons,
+        relay_suppression,
+        retry_pressure,
+        credential_spare_capacity,
+        response_filter_alert_summary: response_filter_alert_summary(response_filter_alerts),
     }
 }
 
@@ -795,17 +813,28 @@ pub struct ResilienceHealthResponse {
     pub credential_sets_without_spare: usize,
     pub channels_cooling_down: usize,
     pub response_filter_alerts: usize,
+    pub relay_suppression: RelaySuppressionHealthSummary,
+    pub retry_pressure: RuntimeRecentRetryCounters,
+    pub credential_spare_capacity: CredentialSpareCapacityHealthSummary,
+    pub response_filter_alert_summary: ResponseFilterAlertHealthSummary,
 }
 
 pub async fn resilience_health_response(state: &AppState) -> ResilienceHealthResponse {
     let sample = collect_runtime_snapshot(state).await;
-    let response_filter_alerts = response_filter_contamination_alert_count_for_state(state);
+    let response_filter_alerts = response_filter_contamination_alerts_for_state(state);
+    let response_filter_alert_count = response_filter_alerts.len();
+    let relay_suppression = relay_suppression_health_summary(state, sample.channels_cooling_down);
+    let credential_spare_capacity = credential_spare_capacity_summary(&sample);
+    let retry_pressure = RuntimeRecentRetryCounters::from_window(
+        sample.recent_retry_counters,
+        state.routing.telemetry_buffer_capacity,
+    );
     let status = if sample.serving_channels == 0 || sample.credential_set_blocking_alerts > 0 {
         "blocked"
     } else if sample.operator_input_alerts > 0
         || sample.credential_sets_without_spare > 0
         || sample.channels_cooling_down > 0
-        || response_filter_alerts > 0
+        || response_filter_alert_count > 0
     {
         "degraded"
     } else {
@@ -816,7 +845,11 @@ pub async fn resilience_health_response(state: &AppState) -> ResilienceHealthRes
         operator_input_alerts: sample.operator_input_alerts,
         credential_sets_without_spare: sample.credential_sets_without_spare,
         channels_cooling_down: sample.channels_cooling_down,
-        response_filter_alerts,
+        response_filter_alerts: response_filter_alert_count,
+        relay_suppression,
+        retry_pressure,
+        credential_spare_capacity,
+        response_filter_alert_summary: response_filter_alert_summary(response_filter_alerts),
     }
 }
 
@@ -838,6 +871,103 @@ pub struct TimeoutSeconds {
 
 pub fn duration_secs(duration: Duration) -> u64 {
     duration.as_secs()
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RelaySuppressionHealthSummary {
+    pub channels_cooling_down: usize,
+    pub suppressed_public_models: usize,
+    pub suppressed_candidates: usize,
+    pub affected_channels: Vec<String>,
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CredentialSpareCapacityHealthSummary {
+    pub credential_sets_without_spare: usize,
+    pub total_credentials: usize,
+    pub available_credentials: usize,
+    pub cooling_down_credentials: usize,
+    pub expired_credentials: usize,
+    pub quota_exhausted_credentials: usize,
+    pub disabled_credentials: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ResponseFilterAlertHealthSummary {
+    pub alerts: usize,
+    pub affected_channels: Vec<String>,
+    pub rules: Vec<String>,
+    pub redact_count: usize,
+    pub reject_count: usize,
+    pub window_seconds: Option<u64>,
+}
+
+fn relay_suppression_health_summary(
+    state: &AppState,
+    channels_cooling_down: usize,
+) -> RelaySuppressionHealthSummary {
+    let alerts = model_route_all_target_suppression_alerts(state);
+    let mut affected_channels = BTreeSet::new();
+    let mut reason_codes = BTreeSet::new();
+    let mut suppressed_candidates = 0usize;
+    for alert in &alerts {
+        suppressed_candidates =
+            suppressed_candidates.saturating_add(alert.suppressed_count.unwrap_or_default());
+        affected_channels.extend(alert.channel_ids.iter().cloned());
+        reason_codes.extend(alert.reason_codes.iter().cloned());
+    }
+
+    RelaySuppressionHealthSummary {
+        channels_cooling_down,
+        suppressed_public_models: alerts.len(),
+        suppressed_candidates,
+        affected_channels: affected_channels.into_iter().collect(),
+        reason_codes: reason_codes.into_iter().collect(),
+    }
+}
+
+fn credential_spare_capacity_summary(
+    sample: &RuntimeSnapshotSample,
+) -> CredentialSpareCapacityHealthSummary {
+    CredentialSpareCapacityHealthSummary {
+        credential_sets_without_spare: sample.credential_sets_without_spare,
+        total_credentials: sample.credentials.total,
+        available_credentials: sample.credentials.available,
+        cooling_down_credentials: sample.credentials.cooling_down,
+        expired_credentials: sample.credentials.expired,
+        quota_exhausted_credentials: sample.credentials.quota_exhausted,
+        disabled_credentials: sample.credentials.disabled,
+    }
+}
+
+fn response_filter_alert_summary(
+    alerts: Vec<ManagementAlertStatus>,
+) -> ResponseFilterAlertHealthSummary {
+    let mut affected_channels = BTreeSet::new();
+    let mut rules = BTreeSet::new();
+    let mut redact_count = 0usize;
+    let mut reject_count = 0usize;
+    let mut window_seconds = None;
+
+    for alert in &alerts {
+        affected_channels.extend(alert.channel_ids.iter().cloned());
+        if let Some(rule_id) = &alert.rule_id {
+            rules.insert(rule_id.clone());
+        }
+        redact_count = redact_count.saturating_add(alert.redact_count.unwrap_or_default());
+        reject_count = reject_count.saturating_add(alert.reject_count.unwrap_or_default());
+        window_seconds = window_seconds.or(alert.window_seconds);
+    }
+
+    ResponseFilterAlertHealthSummary {
+        alerts: alerts.len(),
+        affected_channels: affected_channels.into_iter().collect(),
+        rules: rules.into_iter().collect(),
+        redact_count,
+        reject_count,
+        window_seconds,
+    }
 }
 
 fn current_unix_seconds() -> u64 {

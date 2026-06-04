@@ -278,7 +278,9 @@ fn recompute_alert_totals(response: &mut AlertsResponse) {
         .count();
 }
 
-fn model_route_all_target_suppression_alerts(state: &AppState) -> Vec<ManagementAlertStatus> {
+pub(crate) fn model_route_all_target_suppression_alerts(
+    state: &AppState,
+) -> Vec<ManagementAlertStatus> {
     let routes = state.channels.model_routes_context();
     let mut alerts = Vec::new();
     for route_context in routes.routes {
@@ -452,10 +454,6 @@ pub fn response_filter_contamination_alerts_for_state(
             credentials: RuntimeCredentialCounts::default(),
         })
         .collect()
-}
-
-pub fn response_filter_contamination_alert_count_for_state(state: &AppState) -> usize {
-    response_filter_contamination_alerts_for_state(state).len()
 }
 
 fn current_unix_seconds() -> u64 {
