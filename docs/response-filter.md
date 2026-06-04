@@ -65,18 +65,18 @@ When no effective rules are configured, successful responses use the same direct
 
 ## Event Boundary
 
-When response-filter event capture is enabled, the proxy writes only bounded metadata to the in-memory `response_filter_events` ring. `GET /management/response-filter-events` exposes:
+When response-filter event capture is enabled, the proxy writes only bounded metadata to the in-memory `response_filter_events` ring after a rule outcome is known. This is an observability boundary, not a control boundary: the event records that filtering happened, but it is not replayed into route planning, credential selection, retry policy, or channel-health transitions. `GET /management/response-filter-events` exposes:
 
 `event_id`, `created_at_unix_seconds`, `request_id`, `channel_id`, `public_model`, `rule_id`, `action`, `content_kind`, `reason_code`, `outcome`, and `body_committed`.
 
 The event stream never stores matched text, raw chunks, request bodies, response bodies, upstream keys, client tokens, credential ids, or absolute key paths. Ring capacity defaults to 1024 events and is updated by runtime reload.
 
-`GET /management/alerts` derives a management-only `response_filter_contamination` alert when at least three `redact` or `reject` events for the same `(channel_id, rule_id)` occur inside `response_filter.alert_window_seconds`, which defaults to 900 seconds. The alert includes channel id, rule id, redact/reject counts, reason codes, and the window size. Alerts decay when matching events age out of the window.
+`GET /management/alerts` derives a management-only `response_filter_contamination` alert when at least three `redact` or `reject` events for the same `(channel_id, rule_id)` occur inside `response_filter.alert_window_seconds`, which defaults to 900 seconds. The alert includes channel id, rule id, redact/reject counts, reason codes, and the window size. Alerts decay when matching events age out of the window. Alerts summarize operator-visible contamination signals only; they are not routing telemetry and are not lifecycle evidence.
 
 ## Boundaries
 
 Response filtering must not query credential storage, registry storage, upstream model catalogs, or management APIs on the request path. It must not mutate credential lifecycle state, channel health, routing telemetry, or failure domains. It must not log or persist matched untrusted text.
 
-Response-filter events and alerts are observability only. They are not retry input, lifecycle evidence, channel-health evidence, routing telemetry, failure-domain state, or credential-selection input.
+Response-filter events and alerts are observability only. They are not retry input, routing input, lifecycle evidence, channel-health evidence, routing telemetry, channel lifecycle input, failure-domain state, or credential-selection input.
 
 Use conservative rules. Literal and regex blacklists are suitable for known relay contamination markers. Required rules are useful for strict deployments that expect a narrow response shape, but they can reject or redact legitimate model output if configured too broadly.

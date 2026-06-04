@@ -19,6 +19,33 @@ It is not limited to OpenAI. It supports:
 
 Architecture notes live in `docs/architecture.md`.
 
+## Fit Boundary
+
+This project is suitable when you want a lightweight personal or small-team
+gateway that presents one OpenAI-compatible base URL, routes public model ids to
+explicit local channel candidates, rotates credentials after typed upstream
+failures, and exposes redacted management views for operator decisions. It is
+designed for deployments where startup and management paths may parse YAML,
+query local SQLite stores, import credentials, and probe model catalogs, while
+the request path reads compiled in-memory state, streams successful responses,
+and keeps guard/filter inspection bounded.
+
+It is also suitable for relay hardening when the relay behavior can be expressed
+as typed status/code/limit evidence, selected-channel transient suppression,
+bounded pre-output 2xx success-guard classification, and management-only
+response-filter events and alerts. The intended operating model is low surprise:
+no hidden upstream catalog fan-out for client requests, no request-path storage
+joins, no full-response buffering, and no automatic lifecycle mutation from
+contaminated output unless a later explicit design adds that policy.
+
+This project is not suitable as a multi-tenant billing platform, hosted control
+plane, UI product, price/catalog synchronization service, active health-check
+cluster, mid-stream fallback engine, or remote deployment orchestrator. It is
+also not suitable if routing correctness depends on live `/v1/models`
+aggregation, free-form upstream message parsing, account/provider-wide balance
+suppression, persistent model trust states, request-path database access, or
+response-filter hits automatically disabling credentials or channels.
+
 Local development:
 
 ```bash
