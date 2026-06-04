@@ -295,7 +295,8 @@ Scope:
 Stop-card tests:
 
 - Bad selected key retries to a good credential in the same request without reusing the failed credential.
-- Candidate exhaustion returns stable `no_frozen_candidate`, `attempt_limit_reached`, or `no_route_candidate` denial/error codes as appropriate.
+- Credential candidate exhaustion falls through to the next eligible frozen route target when route-target retry remains allowed.
+- Candidate exhaustion without an eligible route target returns stable `no_frozen_candidate`, `attempt_limit_reached`, or `no_route_candidate` denial/error codes as appropriate.
 - Primary target `5xx`, `429`, and typed guarded-`2xx` failures fallback to the next eligible frozen target when replayability, deadline, and policy gates allow it.
 - Streaming, non-replayable, and partial-output paths produce no fallback and expose the stable denial reason.
 - Telemetry records retry directive, denial reason, and duplicate-charge-risk classification without raw body/key/token material.

@@ -845,7 +845,7 @@ mod tests {
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        sync::{oneshot, Mutex},
+        sync::{oneshot, Mutex, Notify},
     };
     use tower::ServiceExt;
 
@@ -7420,20 +7420,29 @@ pools:
             retry_enabled,
             RetryDecisionReason::EffectiveDeadlineExhausted,
         );
+        let mut attempt_limit_without_route_target =
+            phase2_stop_card_snapshot(vec![next.clone()], true, false, 1, None);
+        attempt_limit_without_route_target.route_target_available = false;
         assert_phase2_stop_card_reason(
-            &phase2_stop_card_snapshot(vec![next.clone()], true, false, 1, None),
+            &attempt_limit_without_route_target,
             retryable_credential.clone(),
             retry_enabled,
             RetryDecisionReason::AttemptLimitReached,
         );
+        let mut policy_disabled_without_route_target =
+            phase2_stop_card_snapshot(vec![next.clone()], true, false, 0, None);
+        policy_disabled_without_route_target.route_target_available = false;
         assert_phase2_stop_card_reason(
-            &phase2_stop_card_snapshot(vec![next.clone()], true, false, 0, None),
+            &policy_disabled_without_route_target,
             retryable_credential.clone(),
             phase2_stop_card_policy(false, 1, true),
             RetryDecisionReason::PolicyDisabled,
         );
+        let mut no_frozen_candidate_without_route_target =
+            phase2_stop_card_snapshot(Vec::new(), true, false, 0, None);
+        no_frozen_candidate_without_route_target.route_target_available = false;
         assert_phase2_stop_card_reason(
-            &phase2_stop_card_snapshot(Vec::new(), true, false, 0, None),
+            &no_frozen_candidate_without_route_target,
             retryable_credential,
             retry_enabled,
             RetryDecisionReason::NoFrozenCandidate,
@@ -28991,6 +29000,381 @@ model_routes:
     }
 
     #[tokio::test]
+    async fn openai_compatible_429_exhausts_credentials_then_falls_back_to_next_route_target() {
+        let primary_authorizations = Arc::new(Mutex::new(Vec::<String>::new()));
+        let primary_authorizations_for_handler = primary_authorizations.clone();
+        let primary = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap| {
+                let primary_authorizations = primary_authorizations_for_handler.clone();
+                async move {
+                    let authorization = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .expect("authorization header")
+                        .to_string();
+                    primary_authorizations.lock().await.push(authorization);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "rate_limit_exceeded",
+                                "message": "slow down"
+                            }
+                        })),
+                    )
+                }
+            }),
+        );
+        let primary_base = spawn_upstream(primary).await;
+
+        let fallback_hits = Arc::new(AtomicU64::new(0));
+        let fallback_hits_for_handler = fallback_hits.clone();
+        let fallback = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "fallback-ok"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let fallback_base = spawn_upstream(fallback).await;
+
+        let mut primary_pool = openai_pool(primary_base, "primary-credentials");
+        primary_pool.routing_profile = Some("retry-routing".to_string());
+        let fallback_pool = openai_pool(fallback_base, "fallback-credentials");
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("a_primary".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets: credential_sets_from_files([
+                    (
+                        "primary-credentials",
+                        temp_keys_file(
+                            "phase3b-primary-key-1\nphase3b-primary-key-2\nphase3b-primary-key-3\n",
+                        ),
+                    ),
+                    (
+                        "fallback-credentials",
+                        temp_keys_file("phase3b-fallback-key\n"),
+                    ),
+                ]),
+                model_routes: HashMap::from([priority_route(
+                    "gpt-phase3b",
+                    ["a_primary", "b_fallback"],
+                )]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([
+                    (
+                        "default-routing".to_string(),
+                        crate::config::RoutingProfileConfig {
+                            key_selection:
+                                crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                            default_credential_cooldown_seconds: 20,
+                            same_request_credential_retry:
+                                crate::config::SameRequestCredentialRetryConfig {
+                                    enabled: false,
+                                    max_retries: 0,
+                                },
+                            route_target_retry: crate::config::RouteTargetRetryConfig {
+                                enabled: true,
+                            },
+                        },
+                    ),
+                    (
+                        "retry-routing".to_string(),
+                        crate::config::RoutingProfileConfig {
+                            key_selection:
+                                crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                            default_credential_cooldown_seconds: 20,
+                            same_request_credential_retry:
+                                crate::config::SameRequestCredentialRetryConfig {
+                                    enabled: true,
+                                    max_retries: 2,
+                                },
+                            route_target_retry: crate::config::RouteTargetRetryConfig {
+                                enabled: true,
+                            },
+                        },
+                    ),
+                ]),
+                pools: HashMap::from([
+                    ("a_primary".to_string(), primary_pool),
+                    ("b_fallback".to_string(), fallback_pool),
+                ]),
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-phase3b","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"].as_str(),
+            Some("fallback-ok")
+        );
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+
+        let primary_authorizations = primary_authorizations.lock().await.clone();
+        assert_eq!(
+            primary_authorizations,
+            vec![
+                "Bearer phase3b-primary-key-1".to_string(),
+                "Bearer phase3b-primary-key-2".to_string(),
+                "Bearer phase3b-primary-key-3".to_string(),
+            ]
+        );
+
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .snapshot();
+        let primary_failures = telemetry
+            .iter()
+            .filter_map(|event| match event {
+                RoutingTelemetry::UpstreamFailureObserved {
+                    channel_id,
+                    failure,
+                    ..
+                } if channel_id == "a_primary" => Some(failure.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(primary_failures.len(), 3);
+        assert_eq!(primary_failures[0].directive, "retry_credential");
+        assert_eq!(primary_failures[1].directive, "retry_credential");
+        assert_eq!(primary_failures[2].directive, "retry_route_target");
+        assert!(primary_failures
+            .iter()
+            .all(|failure| failure.duplicate_charge_risk == "unknown"));
+
+        let telemetry_json = serde_json::to_string(&telemetry).unwrap();
+        assert!(!telemetry_json.contains("phase3b-primary-key"));
+        assert!(!telemetry_json.contains("phase3b-fallback-key"));
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_429_falls_back_to_next_route_target_with_same_request_retry_disabled(
+    ) {
+        let primary_authorizations = Arc::new(Mutex::new(Vec::<String>::new()));
+        let primary_authorizations_for_handler = primary_authorizations.clone();
+        let primary = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap| {
+                let primary_authorizations = primary_authorizations_for_handler.clone();
+                async move {
+                    let authorization = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .expect("authorization header")
+                        .to_string();
+                    primary_authorizations.lock().await.push(authorization);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "rate_limit_exceeded",
+                                "message": "slow down"
+                            }
+                        })),
+                    )
+                }
+            }),
+        );
+        let primary_base = spawn_upstream(primary).await;
+
+        let fallback_hits = Arc::new(AtomicU64::new(0));
+        let fallback_hits_for_handler = fallback_hits.clone();
+        let fallback = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "fallback-ok"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let fallback_base = spawn_upstream(fallback).await;
+
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("a_primary".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets: credential_sets_from_files([
+                    (
+                        "primary-credentials",
+                        temp_keys_file("phase3b-single-primary-key\n"),
+                    ),
+                    (
+                        "fallback-credentials",
+                        temp_keys_file("phase3b-single-fallback-key\n"),
+                    ),
+                ]),
+                model_routes: HashMap::from([priority_route(
+                    "gpt-phase3b-single",
+                    ["a_primary", "b_fallback"],
+                )]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([
+                    (
+                        "a_primary".to_string(),
+                        openai_pool(primary_base, "primary-credentials"),
+                    ),
+                    (
+                        "b_fallback".to_string(),
+                        openai_pool(fallback_base, "fallback-credentials"),
+                    ),
+                ]),
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-phase3b-single","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"].as_str(),
+            Some("fallback-ok")
+        );
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            primary_authorizations.lock().await.as_slice(),
+            ["Bearer phase3b-single-primary-key"]
+        );
+
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .snapshot();
+        let primary_failure = telemetry
+            .iter()
+            .find_map(|event| match event {
+                RoutingTelemetry::UpstreamFailureObserved {
+                    channel_id,
+                    failure,
+                    ..
+                } if channel_id == "a_primary" => Some(failure.as_ref()),
+                _ => None,
+            })
+            .expect("primary failure telemetry");
+        assert_eq!(primary_failure.directive, "retry_route_target");
+        assert_eq!(primary_failure.duplicate_charge_risk, "unknown");
+
+        let telemetry_json = serde_json::to_string(&telemetry).unwrap();
+        assert!(!telemetry_json.contains("phase3b-single-primary-key"));
+        assert!(!telemetry_json.contains("phase3b-single-fallback-key"));
+    }
+
+    #[tokio::test]
     async fn provider_unavailable_marks_channel_degraded_without_mutating_credentials() {
         let upstream = Router::new().route(
             "/v1/chat/completions",
@@ -29736,34 +30120,42 @@ model_routes:
 
     #[tokio::test]
     async fn successful_streaming_response_returns_before_body_completes() {
+        let release_second_chunk = Arc::new(Notify::new());
+        let release_second_chunk_for_handler = release_second_chunk.clone();
         let upstream = Router::new().route(
             "/v1/chat/completions",
-            post(|| async {
-                let body_stream = stream::unfold(0, |state| async move {
-                    match state {
-                        0 => Some((
-                            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: one\n\n")),
-                            1,
-                        )),
-                        1 => {
-                            tokio::time::sleep(Duration::from_millis(300)).await;
-                            Some((Ok(Bytes::from_static(b"data: two\n\n")), 2))
+            post(move || {
+                let release_second_chunk = release_second_chunk_for_handler.clone();
+                async move {
+                    let body_stream = stream::unfold(0, move |state| {
+                        let release_second_chunk = release_second_chunk.clone();
+                        async move {
+                            match state {
+                                0 => Some((
+                                    Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                                        b"data: one\n\n",
+                                    )),
+                                    1,
+                                )),
+                                1 => {
+                                    release_second_chunk.notified().await;
+                                    Some((Ok(Bytes::from_static(b"data: two\n\n")), 2))
+                                }
+                                _ => None,
+                            }
                         }
-                        _ => None,
-                    }
-                });
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .body(Body::from_stream(body_stream))
-                    .unwrap()
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(body_stream))
+                        .unwrap()
+                }
             }),
         );
         let api_base = spawn_upstream(upstream).await;
 
-        let started = Instant::now();
-        let response = app(test_state_with_api_base(&api_base))
-            .oneshot(
+        let request = app(test_state_with_api_base(&api_base)).oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
@@ -29773,42 +30165,49 @@ model_routes:
                         r#"{"model":"gpt-test","messages":[{"role":"user","content":"ok"}],"stream":true}"#,
                     ))
                     .unwrap(),
-            )
+            );
+        let response = tokio::time::timeout(Duration::from_secs(1), request)
             .await
+            .expect("proxy should return headers before upstream streaming body completes")
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "proxy buffered the streaming response before returning"
-        );
+        release_second_chunk.notify_one();
     }
 
     #[tokio::test]
     async fn response_filter_streams_redacted_sse_without_full_buffering() {
+        let release_second_chunk = Arc::new(Notify::new());
+        let release_second_chunk_for_handler = release_second_chunk.clone();
         let upstream = Router::new().route(
             "/v1/chat/completions",
-            post(|| async {
-                let body_stream = stream::unfold(0, |state| async move {
-                    match state {
-                        0 => Some((
-                            Ok::<Bytes, std::io::Error>(Bytes::from_static(
-                                b"data: unsafe-marker\n\n",
-                            )),
-                            1,
-                        )),
-                        1 => {
-                            tokio::time::sleep(Duration::from_millis(300)).await;
-                            Some((Ok(Bytes::from_static(b"data: done\n\n")), 2))
+            post(move || {
+                let release_second_chunk = release_second_chunk_for_handler.clone();
+                async move {
+                    let body_stream = stream::unfold(0, move |state| {
+                        let release_second_chunk = release_second_chunk.clone();
+                        async move {
+                            match state {
+                                0 => Some((
+                                    Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                                        b"data: unsafe-marker\n\n",
+                                    )),
+                                    1,
+                                )),
+                                1 => {
+                                    release_second_chunk.notified().await;
+                                    Some((Ok(Bytes::from_static(b"data: done\n\n")), 2))
+                                }
+                                _ => None,
+                            }
                         }
-                        _ => None,
-                    }
-                });
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .body(Body::from_stream(body_stream))
-                    .unwrap()
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(body_stream))
+                        .unwrap()
+                }
             }),
         );
         let api_base = spawn_upstream(upstream).await;
@@ -29829,9 +30228,7 @@ model_routes:
             },
         );
 
-        let started = Instant::now();
-        let response = app(state)
-            .oneshot(
+        let request = app(state).oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
@@ -29841,15 +30238,16 @@ model_routes:
                         r#"{"model":"gpt-test","messages":[{"role":"user","content":"ok"}],"stream":true}"#,
                     ))
                     .unwrap(),
-            )
+            );
+        let response = tokio::time::timeout(Duration::from_secs(1), request)
             .await
+            .expect(
+                "response filter should return headers before upstream streaming body completes",
+            )
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "response filter buffered the streaming response before returning"
-        );
+        release_second_chunk.notify_one();
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("data: [filtered]"));
