@@ -17,7 +17,9 @@
 /config.yaml
 /docker-compose.override.yml
 /key-pool-router/
+/keys/
 /config/*.yaml
+/config/*.json
 /scripts/one_ai_key_keys.py
 
 # Secret material.
@@ -30,7 +32,10 @@
 AGENTS.md
 
 # Logs and transient files.
+/db/
+/logs/
 *.log
+*.log.*
 *.pid
 *.tmp
 .DS_Store
