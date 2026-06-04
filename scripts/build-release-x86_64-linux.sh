@@ -32,6 +32,11 @@ if ! command -v rustc >/dev/null 2>&1 || ! rustc --version >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v gzip >/dev/null 2>&1 || ! gzip --version >/dev/null 2>&1; then
+  printf 'error: release builds require gzip for deterministic archive compression\n' >&2
+  exit 1
+fi
+
 cd "${REPO_ROOT}"
 
 PACKAGE_ID=$(cargo pkgid --locked)
@@ -51,6 +56,7 @@ DIST_DIR="${REPO_ROOT}/dist"
 BUILD_BIN="${REPO_ROOT}/target/${TARGET}/release/${PACKAGE_NAME}"
 ARCHIVE_NAME="${PACKAGE_NAME}-${VERSION}-${TARGET}.tar.gz"
 ARCHIVE_PATH="${DIST_DIR}/${ARCHIVE_NAME}"
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
 STAGING_DIR=$(mktemp -d)
 
 cleanup() {
@@ -61,8 +67,15 @@ trap cleanup EXIT
 cargo build --release --locked --target "${TARGET}"
 
 mkdir -p "${DIST_DIR}"
-install -m 0755 "${BUILD_BIN}" "${STAGING_DIR}/${PACKAGE_NAME}"
-tar -C "${STAGING_DIR}" -czf "${ARCHIVE_PATH}" "${PACKAGE_NAME}"
+install -m 0755 -p "${BUILD_BIN}" "${STAGING_DIR}/${PACKAGE_NAME}"
+touch -h -d "@${SOURCE_DATE_EPOCH}" "${STAGING_DIR}" "${STAGING_DIR}/${PACKAGE_NAME}"
+tar -C "${STAGING_DIR}" \
+  --sort=name \
+  --mtime="@${SOURCE_DATE_EPOCH}" \
+  --owner=0 \
+  --group=0 \
+  --numeric-owner \
+  -cf - "${PACKAGE_NAME}" | gzip -n -9 > "${ARCHIVE_PATH}"
 (cd "${DIST_DIR}" && sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256")
 
 printf 'wrote %s\n' "${ARCHIVE_PATH}"

@@ -187,6 +187,8 @@ pub enum ResponseFilterActionConfig {
     #[default]
     Redact,
     Reject,
+    RejectAndExpireCredential,
+    RejectAndCooldownChannel,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1680,6 +1682,7 @@ fn kind_as_config(kind: FailureKind) -> &'static str {
         FailureKind::QuotaExhausted => "quota_exhausted",
         FailureKind::RelayBalanceUnavailable => "relay_balance_unavailable",
         FailureKind::ProviderUnavailable => "provider_unavailable",
+        FailureKind::ResponseFilterRejected => "response_filter_rejected",
         FailureKind::ClientError => "client_error",
         FailureKind::Unknown => "unknown",
     }
@@ -1936,6 +1939,8 @@ impl ResponseFilterActionConfig {
         match self {
             Self::Redact => ResponseFilterAction::Redact,
             Self::Reject => ResponseFilterAction::Reject,
+            Self::RejectAndExpireCredential => ResponseFilterAction::RejectAndExpireCredential,
+            Self::RejectAndCooldownChannel => ResponseFilterAction::RejectAndCooldownChannel,
         }
     }
 }

@@ -403,9 +403,9 @@ pub fn response_filter_contamination_alerts_for_state(
         BTreeMap::new();
 
     for event in snapshot {
-        if !matches!(event.action.as_str(), "redact" | "reject") {
+        let Some(action_class) = response_filter_alert_action_class(&event.action) else {
             continue;
-        }
+        };
         if now.saturating_sub(event.created_at_unix_seconds) > window_seconds {
             continue;
         }
@@ -418,7 +418,7 @@ pub fn response_filter_contamination_alerts_for_state(
                 rule_id: event.rule_id.clone(),
                 ..Default::default()
             });
-        match event.action.as_str() {
+        match action_class {
             "redact" => bucket.redact_count = bucket.redact_count.saturating_add(1),
             "reject" => bucket.reject_count = bucket.reject_count.saturating_add(1),
             _ => {}
@@ -454,6 +454,14 @@ pub fn response_filter_contamination_alerts_for_state(
             credentials: RuntimeCredentialCounts::default(),
         })
         .collect()
+}
+
+fn response_filter_alert_action_class(action: &str) -> Option<&'static str> {
+    match action {
+        "redact" => Some("redact"),
+        "reject" | "reject_and_expire_credential" | "reject_and_cooldown_channel" => Some("reject"),
+        _ => None,
+    }
 }
 
 fn current_unix_seconds() -> u64 {

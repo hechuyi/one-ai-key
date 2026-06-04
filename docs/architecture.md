@@ -96,8 +96,9 @@ When every scoped route target has been excluded by active selected-channel cool
 
 Phase 1B stops at selected-channel transient suppression. Phase 2 retry
 telemetry/retry-pressure counters and Phase 3 guarded-success 2xx
-classification are separate layers on the proxy path; Phase 4 response-filter
-lifecycle mutation remains outside the current lifecycle boundary.
+classification are separate layers on the proxy path. Phase 4 response-filter
+lifecycle handling is inside the boundary only for explicit pre-commit rejecting
+actions; response-filter events and alerts remain observability-only.
 
 Phase 2 adds observability and hard bounds to the existing retry boundary
 without broadening which responses are classified as failures. Every

@@ -204,6 +204,7 @@ fn failure_kind_code(kind: FailureKind) -> &'static str {
         FailureKind::QuotaExhausted => "quota_exhausted",
         FailureKind::RelayBalanceUnavailable => "relay_balance_unavailable",
         FailureKind::ProviderUnavailable => "provider_unavailable",
+        FailureKind::ResponseFilterRejected => "response_filter_rejected",
         FailureKind::ClientError => "client_error",
         FailureKind::Unknown => "unknown",
     }

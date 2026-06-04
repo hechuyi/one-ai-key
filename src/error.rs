@@ -13,6 +13,7 @@ pub enum FailureKind {
     QuotaExhausted,
     RelayBalanceUnavailable,
     ProviderUnavailable,
+    ResponseFilterRejected,
     ClientError,
     Unknown,
 }

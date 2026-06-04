@@ -32,11 +32,12 @@ and keeps guard/filter inspection bounded.
 
 It is also suitable for relay hardening when the relay behavior can be expressed
 as typed status/code/limit evidence, selected-channel transient suppression,
-bounded pre-output 2xx success-guard classification, and management-only
-response-filter events and alerts. The intended operating model is low surprise:
-no hidden upstream catalog fan-out for client requests, no request-path storage
-joins, no full-response buffering, and no automatic lifecycle mutation from
-contaminated output unless a later explicit design adds that policy.
+bounded pre-output 2xx success-guard classification, management-only
+response-filter events and alerts, and explicit pre-commit rejecting lifecycle
+actions. The intended operating model is low surprise: no hidden upstream
+catalog fan-out for client requests, no request-path storage joins, no
+full-response buffering, and no automatic lifecycle mutation from contaminated
+output except configured explicit pre-commit rejecting actions.
 
 This project is not suitable as a multi-tenant billing platform, hosted control
 plane, UI product, price/catalog synchronization service, active health-check
@@ -150,10 +151,10 @@ Manual or configured channel disablement remains authoritative: automatic relay
 balance suppression and cooldown expiry do not re-enable disabled or configured
 disabled channels.
 
-This Phase 1B behavior is intentionally narrower than later relay-hardening
-work: Phase 2 retry telemetry and Phase 3 guarded 2xx response classification
-are layered on the proxy path, while Phase 4 response-filter-driven lifecycle
-mutation remains out of scope.
+This Phase 1B behavior predates later relay-hardening work: Phase 2 retry
+telemetry and Phase 3 guarded 2xx response classification are layered on the
+proxy path, while Phase 4-style response-filter lifecycle handling is limited to
+explicit pre-commit rejecting actions.
 
 Phase 2 documents the retry boundary and risk observability contract. Retry
 decision telemetry is emitted as bounded management data with request/channel
@@ -182,8 +183,12 @@ success guard before success accounting: body-bearing
 top-level structured error envelopes are classified with
 `failure_source=guarded_success_envelope`, and pass-through outcomes replay the
 peeked prefix exactly once through the response filter with stale body headers
-stripped. No-body success responses skip the guard. Response-filter-driven
-lifecycle mutation and live `/v1/models` aggregation remain unimplemented.
+stripped. No-body success responses skip the guard. Response filters can remain
+purely observational (`redact`/`reject`), or an operator can opt a high-confidence
+rule into pre-commit lifecycle handling with `reject_and_expire_credential` or
+`reject_and_cooldown_channel`; those actions record redacted evidence and retry
+only through the same bounded Phase 2 gates. Live `/v1/models` aggregation
+remains unimplemented.
 
 Inspect effective policies through the existing management endpoints:
 

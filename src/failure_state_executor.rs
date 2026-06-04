@@ -153,6 +153,21 @@ pub fn apply_state_mutation(
                 )];
             }
         }
+        StateMutation::MarkChannelCoolingDown { until, reason, .. } => {
+            let health = ChannelHealth::CoolingDown {
+                until,
+                reason: reason_text(reason).to_string(),
+            };
+            let applied = pool_state.apply_automatic_channel_health_transition(
+                snapshot.channel_health_generation,
+                health.clone(),
+            );
+            if applied {
+                return vec![channel_health_transition_telemetry(
+                    snapshot, &health, reason,
+                )];
+            }
+        }
         StateMutation::Noop { .. } => {}
     }
     Vec::new()
@@ -249,6 +264,7 @@ fn reason_text(reason: FailureReason) -> &'static str {
         FailureReason::UpstreamQuotaExhausted => "upstream reported quota exhausted",
         FailureReason::RelayBalanceUnavailable => "relay balance unavailable",
         FailureReason::UpstreamProviderUnavailable => "upstream provider unavailable",
+        FailureReason::ResponseFilterRejected => "response filter rejected upstream response",
         FailureReason::KeySwitchCooldown => "upstream key switch cooldown",
         FailureReason::ClientOrModelError => "client or model error",
         FailureReason::Unknown => "unknown upstream failure",
@@ -262,6 +278,7 @@ fn reason_code(reason: FailureReason) -> &'static str {
         FailureReason::UpstreamQuotaExhausted => "upstream_quota_exhausted",
         FailureReason::RelayBalanceUnavailable => "relay_balance_unavailable",
         FailureReason::UpstreamProviderUnavailable => "upstream_provider_unavailable",
+        FailureReason::ResponseFilterRejected => "response_filter_rejected",
         FailureReason::KeySwitchCooldown => "key_switch_cooldown",
         FailureReason::ClientOrModelError => "client_or_model_error",
         FailureReason::Unknown => "unknown",

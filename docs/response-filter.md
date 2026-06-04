@@ -38,7 +38,9 @@ Rule fields:
 - `value`: required for literal rule kinds.
 - `pattern`: required for regex rule kinds.
 - `case_sensitive`: applies to literal rule kinds and defaults to `false`.
-- `action`: `redact` by default, or `reject` for stricter fail-closed behavior.
+- `action`: `redact` by default, `reject` for stricter fail-closed behavior, or
+  one of the explicit lifecycle actions `reject_and_expire_credential` and
+  `reject_and_cooldown_channel`.
 
 Rule semantics:
 
@@ -61,22 +63,45 @@ When no effective rules are configured, successful responses use the same direct
 - If no event boundary arrives, pending bytes are capped. The filter releases a prefix and keeps a small overlap window for later chunk-spanning matches.
 - Non-UTF-8 chunks are passed through unchanged.
 
-`redact` preserves the response status and headers and replaces matched content in the body. `reject` emits a local JSON error payload in the response stream. Because headers may already have been sent for a streaming success response, `reject` is a content-level block rather than an HTTP status rewrite.
+`redact` preserves the response status and headers and replaces matched content
+in the body. `reject` emits a local JSON error payload in the response stream.
+Because headers may already have been sent for a streaming success response,
+`reject` is a content-level block rather than an HTTP status rewrite.
+
+For body-bearing non-streaming JSON/SSE responses covered by the bounded 2xx
+success guard, the peeked prefix is also checked before response body commit.
+If a rejecting rule matches that prefix, the proxy records a redacted event with
+`body_committed=false` and returns a local sanitized error. Required-rule misses
+can trigger this pre-commit path only when the guard has a complete pass result;
+cap, deadline, unsupported, compressed, and partial prefixes are not treated as
+proof that the full response lacks a required marker. The plain `reject` action
+stops there. The explicit lifecycle actions additionally synthesize a
+high-confidence `response_filter_rejected` failure and pass it through the same
+Phase 2 retry gates as upstream failures:
+
+- `reject_and_expire_credential` marks the selected credential expired and may
+  retry a frozen clean credential when same-request credential retry is enabled.
+- `reject_and_cooldown_channel` cools down the selected channel and may fall
+  back to another route target when route-target retry is enabled.
+
+Streaming requests, non-replayable bodies, matches after any body bytes have
+been committed, compressed/non-UTF-8 responses, and prefix misses remain bounded
+content filtering only; they do not perform post-output transparent fallback.
 
 ## Event Boundary
 
-When response-filter event capture is enabled, the proxy writes only bounded metadata to the in-memory `response_filter_events` ring after a rule outcome is known. This is an observability boundary, not a control boundary: the event records that filtering happened, but it is not replayed into route planning, credential selection, retry policy, or channel-health transitions. `GET /management/response-filter-events` exposes:
+When response-filter event capture is enabled, the proxy writes only bounded metadata to the in-memory `response_filter_events` ring after a rule outcome is known. The event is not itself replayed into routing or lifecycle decisions. Only the explicit `reject_and_expire_credential` and `reject_and_cooldown_channel` actions can create lifecycle evidence, and only while the guarded prefix is still pre-commit. `GET /management/response-filter-events` exposes:
 
 `event_id`, `created_at_unix_seconds`, `request_id`, `channel_id`, `public_model`, `rule_id`, `action`, `content_kind`, `reason_code`, `outcome`, and `body_committed`.
 
 The event stream never stores matched text, raw chunks, request bodies, response bodies, upstream keys, client tokens, credential ids, or absolute key paths. Ring capacity defaults to 1024 events and is updated by runtime reload.
 
-`GET /management/alerts` derives a management-only `response_filter_contamination` alert when at least three `redact` or `reject` events for the same `(channel_id, rule_id)` occur inside `response_filter.alert_window_seconds`, which defaults to 900 seconds. The alert includes channel id, rule id, redact/reject counts, reason codes, and the window size. Alerts decay when matching events age out of the window. Alerts summarize operator-visible contamination signals only; they are not routing telemetry and are not lifecycle evidence.
+`GET /management/alerts` derives a management-only `response_filter_contamination` alert when at least three filter events for the same `(channel_id, rule_id)` occur inside `response_filter.alert_window_seconds`, which defaults to 900 seconds. The alert includes channel id, rule id, redact/reject counts, reason codes, and the window size. Alerts decay when matching events age out of the window. Alerts summarize operator-visible contamination signals only; they are not routing telemetry and are not lifecycle evidence.
 
 ## Boundaries
 
-Response filtering must not query credential storage, registry storage, upstream model catalogs, or management APIs on the request path. It must not mutate credential lifecycle state, channel health, routing telemetry, or failure domains. It must not log or persist matched untrusted text.
+Response filtering must not query credential storage, registry storage, upstream model catalogs, or management APIs on the request path. It must not log or persist matched untrusted text.
 
-Response-filter events and alerts are observability only. They are not retry input, routing input, lifecycle evidence, channel-health evidence, routing telemetry, channel lifecycle input, failure-domain state, or credential-selection input.
+Response-filter events and alerts are observability only. They are not retry input, routing input, lifecycle evidence, channel-health evidence, routing telemetry, channel lifecycle input, failure-domain state, or credential-selection input. Lifecycle mutation is available only through the explicit pre-commit rejecting actions described above.
 
 Use conservative rules. Literal and regex blacklists are suitable for known relay contamination markers. Required rules are useful for strict deployments that expect a narrow response shape, but they can reject or redact legitimate model output if configured too broadly.

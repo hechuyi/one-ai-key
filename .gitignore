@@ -20,6 +20,7 @@
 /keys/
 /config/*.yaml
 /config/*.json
+/config/*.toml
 /scripts/one_ai_key_keys.py
 
 # Secret material.

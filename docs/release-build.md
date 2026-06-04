@@ -19,6 +19,12 @@ host entrypoint. It rejects non-Linux hosts, non-`x86_64` machines, and
 environments without Nix, Cargo, or rustc from the active Nix shell. The default
 target is `x86_64-unknown-linux-gnu`.
 
+The container entrypoint builds the locked Cargo package, stages only the release
+binary, and writes a deterministic tar/gzip archive. Tar entries are sorted by
+name, owner and group are fixed to `0`, mtimes use `SOURCE_DATE_EPOCH` (default
+`0`), and gzip runs with `-n`. The `.sha256` sidecar is generated from inside
+`dist/`, so it contains only the archive basename.
+
 Do not build release artifacts on `rtoc-gateway`, another VPS, a random Linux
 host, a Debian/Ubuntu Rust image, or an ad hoc remote builder. The gateway
 server consumes published release artifacts; it does not compile them.

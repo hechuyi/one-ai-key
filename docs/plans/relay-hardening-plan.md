@@ -19,7 +19,7 @@ The original relay critique and the first plan were reviewed by read-only specia
 - Operations/security review: management security was too late and too vague; local x86_64 NixOS container build, release artifact identity, repo hygiene, audit schema, allowlist behavior, and unknown-field rejection were not executable gates.
 - Test/phase-slicing review: phases were too large, stop nodes were concept-level rather than red/green stop cards, and endpoint/schema assertions were missing.
 
-The plan below adopts those blocking findings. It does not adopt scope-expanding ideas such as live upstream model aggregation, persistent model-discovery state machines, UI work, multi-tenant billing, heavyweight control-plane databases, active probe daemons, hedging, or automatic response-filter-driven channel lifecycle mutation.
+The plan below adopts those blocking findings. It does not adopt scope-expanding ideas such as live upstream model aggregation, persistent model-discovery state machines, UI work, multi-tenant billing, heavyweight control-plane databases, active probe daemons, hedging, or alert/post-output response-filter-driven channel lifecycle mutation.
 
 ## Relation To Models
 
@@ -64,7 +64,7 @@ OpenTelemetry contributes the event-contract lesson: events need stable names, b
 | `guard outcome: pass` | The success guard found no decisive error before its cap/deadline and reconstructs the exact peeked prefix plus remaining stream. |
 | `guard outcome: classified` | The success guard found typed structured error evidence before output and sent it through the normal routing failure path. |
 | `guard outcome: cap_exhausted` | The guard reached byte or time cap without a decisive envelope and passed through with exact prefix replay. |
-| `response-filter event` | A bounded management-visible event recording rule id, action, channel/request context, and reason code. It is not input to routing, credential lifecycle, or channel health. |
+| `response-filter event` | A bounded management-visible event recording rule id, action, channel/request context, and reason code. The event and alert projections are observability only. Lifecycle isolation can occur only from the explicit pre-commit rejecting actions before any response bytes are sent to the client. |
 
 ## Locked Invariants
 
@@ -74,7 +74,7 @@ OpenTelemetry contributes the event-contract lesson: events need stable names, b
 4. All retry and fallback decisions use one attempt-state path with bounded attempts, replayability checks, effective deadline checks, and observable denial reasons.
 5. A body-bearing 2xx response may be inspected only in a bounded pre-output window. After any byte is sent to the client, the gateway must not fallback, retry, rewrite status, or mutate routing state from that response body.
 6. Guard pass-through reconstructs bytes exactly: the peeked prefix is emitted once, then the remaining upstream stream. The reconstructed stream then enters the response filter exactly once.
-7. Response filtering remains a stream-boundary safety feature. Its events and alerts do not mutate credential lifecycle, channel health, routing failure domains, or retry policy in this roadmap.
+7. Response filtering remains a stream-boundary safety feature. Its events and alerts do not mutate credential lifecycle, channel health, routing failure domains, or retry policy. Only explicit pre-commit rejecting actions may create typed lifecycle evidence, and they must reuse the normal bounded retry path.
 8. `/health` is process liveness; `/ready` remains serving readiness for compatibility; management health endpoints carry the finer serving/resilience semantics.
 9. `/v1/models` remains compiled-runtime-only. Model discovery remains management-only and explicit.
 10. Management mutation routes are default-deny by role, auditable, redacted, and protected by a peer-address allowlist when management is exposed on a non-loopback listener.
@@ -89,7 +89,7 @@ OpenTelemetry contributes the event-contract lesson: events need stable names, b
 | Free-form message matcher on request path | Reject | High false-positive and injection risk; conflicts with structured-evidence boundary. |
 | HTTP 2xx success guard | Adopt after retry observability | Detect clear structured errors before output without full buffering or parallel routing. |
 | Broad schema validation | Reject for this roadmap | Valid relay streams vary too much; only clear error envelopes and first data-bearing SSE event are inspected. |
-| Response filter health mutation | Reject for this roadmap | First build bounded events and alerts. Lifecycle mutation from filter hits needs a separate design. |
+| Response filter health mutation | Adopt only for explicit pre-commit rejecting actions | Free-form, alert-driven, automatic disablement, and post-output mutation remain rejected. The accepted slice is bounded to configured actions that produce typed evidence before body commit. |
 | Conservative retry/risk telemetry | Adopt before 2xx fallback | Guarded fallback can have unknown charge status; denial and risk fields must exist first. |
 | Management roles, allowlist, audit | Adopt in Phase 0 | Management writes already have high blast radius; hardening must precede new relay mutation surfaces. |
 | Model discovery states | Park | Not required for relay hardening and requires a durable catalog state model. |
@@ -221,7 +221,7 @@ Endpoint/schema acceptance:
 - [x] Add an effective request deadline for retry/fallback if not already present in the selected timeout profile. Fallback must not start if it cannot fit inside the effective deadline.
 - [x] Add duplicate-charge risk fields for fallback after upstream transaction failure or guarded 2xx failure when charge status is unknown.
 - [x] Add bounded retry-pressure counters/events to prevent silent traffic amplification.
-- [x] Keep HTTP 2xx success-guard classification, response-filter lifecycle mutation, and live `/v1/models` aggregation out of Phase 2.
+- [x] Keep HTTP 2xx success-guard classification, response-filter lifecycle actions, and live `/v1/models` aggregation out of Phase 2.
 
 Stable telemetry schema additions:
 
@@ -239,7 +239,7 @@ The effective-deadline gate is evaluated before every fallback attempt. It uses 
 
 Retry-pressure observability is bounded. Implementations may use an in-memory ring, windowed counters, or equivalent capped structure, but `/management/runtime` must expose the configured capacity and recent counts without unbounded cardinality from model ids, upstream text, credentials, request ids, or raw provider payloads.
 
-**Phase 2 stop card:** red tests cover each denial reason, duplicate-charge risk for guarded and non-2xx fallback classes, effective-deadline denial, bounded retry-pressure capacity, schemas above, and existing same-request retry behavior. Tests must also assert that Phase 2 does not implement HTTP 2xx success-guard classification, response-filter-driven lifecycle mutation, or live `/v1/models` aggregation. Complete only when local CI and x86_64 build pass.
+**Phase 2 stop card:** red tests cover each denial reason, duplicate-charge risk for guarded and non-2xx fallback classes, effective-deadline denial, bounded retry-pressure capacity, schemas above, and existing same-request retry behavior. Tests must also assert that Phase 2 does not implement HTTP 2xx success-guard classification, response-filter lifecycle actions, or live `/v1/models` aggregation. Complete only when local CI and x86_64 build pass.
 
 ## Phase 3: HTTP 2xx Success Guard
 
@@ -309,7 +309,7 @@ Stop-card tests:
 
 ## Phase 4: Response Filter Events And Protocol Framing
 
-**Purpose:** make contaminated successful responses visible without mutating routing health, and make response-filter body mutation protocol-correct.
+**Purpose:** make contaminated successful responses visible without event/alert-driven routing-health mutation, add explicit pre-commit lifecycle actions, and make response-filter body mutation protocol-correct.
 
 **Likely files:** `src/response_filter.rs`, `src/upstream_response.rs`, `src/events.rs`, `src/management_alerts.rs`, `src/management_runtime.rs`, `docs/response-filter.md`, tests.
 
@@ -319,13 +319,13 @@ Event ownership:
 - `upstream_response.rs` owns stream framing and body/header mutation behavior.
 - The forwarding context attaches request id, channel id, public model, and route target context before enqueueing the event.
 - `AppState` owns a bounded in-memory `response_filter_events` ring, default capacity 1024.
-- Management projections expose events and alerts. These events are not routing telemetry and are not replay input for credential/channel lifecycle.
+- Management projections expose events and alerts. These projections are not routing telemetry and are not replay input for credential/channel lifecycle.
 
 Event schema at `GET /management/response-filter-events`:
 
-`event_id`, `created_at_unix_seconds`, `request_id`, `channel_id`, `public_model`, `rule_id`, `action: redact|reject`, `content_kind: json|sse|bytes|unknown`, `reason_code: rule_matched|required_rule_missing`, `outcome: redacted|rejected`, `body_committed: true|false`.
+`event_id`, `created_at_unix_seconds`, `request_id`, `channel_id`, `public_model`, `rule_id`, `action: redact|reject|reject_and_expire_credential|reject_and_cooldown_channel`, `content_kind: json|sse|bytes|unknown`, `reason_code: rule_matched|required_rule_missing`, `outcome: redacted|rejected`, `body_committed: true|false`.
 
-Alert aggregation at `GET /management/alerts`: if a channel has at least three response-filter reject/redact events with the same rule id inside `response_filter.alert_window_seconds` (default 900), expose a `response_filter_contamination` alert with channel id, rule id, action counts, window seconds, and severity. Alerts decay by time window; no lifecycle mutation occurs.
+Alert aggregation at `GET /management/alerts`: if a channel has at least three response-filter reject/redact events with the same rule id inside `response_filter.alert_window_seconds` (default 900), expose a `response_filter_contamination` alert with channel id, rule id, action counts, window seconds, and severity. Alerts decay by time window and never mutate lifecycle state.
 
 Framing/header contract:
 
@@ -335,7 +335,7 @@ Framing/header contract:
 - Non-UTF-8 bytes pass through unchanged and do not create matched-text events.
 - Response-filter events never store matched text, raw chunks, request bodies, response bodies, upstream keys, client tokens, or absolute paths.
 
-**Phase 4 stop card:** red tests cover event schema/redaction, ring capacity, alert decay window, SSE redaction/rejection framing, non-SSE rejection headers, content-length stripping on mutation, guard-prefix filtering exactly once, no lifecycle/channel mutation from filter events, no routing telemetry writes from filter hits, and local build gates.
+**Phase 4 stop card:** red tests cover event schema/redaction, ring capacity, alert decay window, SSE redaction/rejection framing, non-SSE rejection headers, content-length stripping on mutation, guard-prefix filtering exactly once, no lifecycle/channel mutation from filter events or alerts, explicit pre-commit lifecycle actions through the unified retry gates, no routing telemetry writes from ordinary filter hits, and local build gates.
 
 ## Phase 5: Explanation, Documentation, And Final Boundary Hardening
 
@@ -348,7 +348,7 @@ Framing/header contract:
 - [x] Ensure `GET /management/health/serving` and `GET /management/health/resilience` include relay suppression, retry pressure, credential-set spare capacity, and response-filter alert summaries.
 - [x] Update README with a clear suitable/not-suitable boundary.
 - [x] Update performance docs with composed guard/filter byte and latency budgets.
-- [x] Update response-filter docs to state the event boundary and the explicit non-input to routing/channel lifecycle.
+- [x] Update response-filter docs to state the event/alert boundary and the explicit pre-commit lifecycle-action exception.
 
 Explain endpoint schemas must be redacted: no raw tokens, token hashes, upstream keys, raw request/response bodies, matched text, absolute key paths, URL userinfo, or token-like query parameters.
 
@@ -365,16 +365,20 @@ Reopen this boundary only if a new user goal explicitly asks for durable model t
 | Item | Why parked | Revisit trigger | Visibility |
 | --- | --- | --- | --- |
 | Free-form upstream message matcher | Unsafe for hot-path lifecycle decisions and injection-prone | A separate management-only probe summarizer design | Operator-visible follow-up |
-| Automatic response-filter-driven channel cooldown/disable | Needs false-positive policy and lifecycle state design | Response-filter events show stable signal and user authorizes lifecycle mutation | Operator-visible follow-up |
+| Automatic response-filter-driven channel disable | Needs durable false-positive review and manual recovery design | User explicitly needs auto-disable beyond bounded pre-commit cooldown | Operator-visible follow-up |
 | Account/provider balance scope | Suppression domain is broader than current roadmap | User explicitly needs shared-account suppression beyond selected channel | Architecture follow-up |
 | Persistent model verification states | Requires durable catalog and product policy | New explicit model trust goal | Product/architecture follow-up |
 | UI, billing, price sync, PostgreSQL, plugin ecosystems | Outside lightweight router boundary | New product goal | Out of scope |
 
 ## Production Bug Backlog
 
-| Bug | Observed behavior | Required behavior | Planned owner phase |
-| --- | --- | --- | --- |
-| Contaminated 2xx completion does not isolate the selected credential or fallback to a clean credential | A real relay completion returned HTTP 200 with a normal-looking chat completion envelope but contaminated assistant content. The selected credential stayed available, so importing a replacement key did not automatically move traffic away from the contaminated credential; manual credential expiration was required. | A configured high-confidence response-filter rejection must occur before body commit when possible, record redacted evidence, mark the selected credential or channel according to an explicit operator policy, and retry only through the unified Phase 2 retry gates. If no clean candidate exists, return a local sanitized error instead of forwarding contaminated content. | Post-Phase 4 follow-up, after response-filter events and framing are implemented. |
+No open production bugs remain inside this roadmap. The contaminated 2xx
+completion item was closed by the post-Phase-4 follow-up: guarded success
+prefixes are checked by response-filter rules before body commit, explicit
+`reject_and_expire_credential` and `reject_and_cooldown_channel` actions create
+redacted lifecycle evidence, and retry proceeds only through the unified Phase 2
+gates. If no clean candidate exists, the proxy returns a local sanitized error
+instead of forwarding contaminated content.
 
 ## Global Verification Commands
 
@@ -413,14 +417,14 @@ This roadmap has hard stopping points. Do not continue into the next phase when 
 | Phase 2 | Retry denial, duplicate-charge risk, retry pressure, and effective deadline schemas pass | Guarded fallback needs behavior not representable by the unified retry path. |
 | Phase 3 | 2xx guard passes byte/time/SSE/prefix/retry tests without full buffering | Guard requires broad schema validation, full buffering, or fallback after output. |
 | Phase 3B | Pre-output credential retry and frozen route-target fallback exhaust eligible candidates for replayable non-streaming requests before client errors | Reliability acceptance requires mid-stream continuation fallback, free-text keyword disablement, live model aggregation, active probe daemons, request-path storage joins, full successful-response buffering, or post-output transparent fallback. |
-| Phase 4 | Response-filter events, alerts, framing, and no-lifecycle-mutation tests pass | Filter hits need automatic channel mutation to satisfy acceptance. |
+| Phase 4 | Response-filter events, alerts, framing, and explicit pre-commit lifecycle action tests pass | Filter hits need post-output mutation, automatic disablement, or full successful-response buffering to satisfy acceptance. |
 | Phase 5 | Explain, docs, health truth table, and final release hygiene pass | New product surfaces such as UI, billing, or persistent model trust are required. |
 
-The whole roadmap stops after Phase 5. Any work on automatic filter-to-health mutation, account/provider balance suppression, persistent model discovery states, or remote deployment requires a new explicit goal.
+The whole roadmap stops after Phase 5. Any work on post-output filter-to-health mutation, automatic response-filter-driven disablement, account/provider balance suppression, persistent model discovery states, or remote deployment requires a new explicit goal.
 
 ## Implementation Progress
 
-Current implementation has passed through Phase 5. Phase 3B now includes the post-plan stability correction for single-candidate upstream jitter: non-streaming replayable requests may perform one same-target pre-output retry for a channel-scoped provider failure when no route fallback candidate remains and no cooldown evidence is present. The directive is observable as `retry_same_target`; upstream 5xx retries retain `duplicate_charge_risk=unknown`, local transport retries retain `duplicate_charge_risk=none`, and guarded-success 2xx, streaming, non-replayable, partial-output, cooldown, and post-output paths remain terminal under the existing gates. Phase 4 is implemented as a response-filter observability and framing node: response-filter matches write bounded safe metadata to an in-memory ring, `/management/response-filter-events` exposes a readonly snapshot, repeated `(channel_id, rule_id)` hits produce management-only contamination alerts with time-window decay, resilience health counts those alerts as degradation, and tests assert no lifecycle, channel-health, credential-state, or routing-telemetry mutation from filter hits.
+Current implementation has passed through Phase 5. Phase 3B now includes the post-plan stability correction for single-candidate upstream jitter: non-streaming replayable requests may perform one same-target pre-output retry for a channel-scoped provider failure when no route fallback candidate remains and no cooldown evidence is present. The directive is observable as `retry_same_target`; upstream 5xx retries retain `duplicate_charge_risk=unknown`, local transport retries retain `duplicate_charge_risk=none`, and guarded-success 2xx, streaming, non-replayable, partial-output, cooldown, and post-output paths remain terminal under the existing gates. Phase 4 is implemented as a response-filter observability and framing node, with an explicit post-Phase-4 lifecycle follow-up for pre-commit contamination: response-filter matches write bounded safe metadata to an in-memory ring, `/management/response-filter-events` exposes a readonly snapshot, repeated `(channel_id, rule_id)` hits produce management-only contamination alerts with time-window decay, resilience health counts those alerts as degradation, default `redact`/`reject` actions remain non-mutating, and explicit `reject_and_expire_credential` / `reject_and_cooldown_channel` actions can mark the selected credential or channel before body commit and retry only through the unified Phase 2 gates.
 
 Phase 5 is implemented as the final explanation, documentation, and boundary-hardening node: `/management/explain/runtime` reports the compiled runtime and staged-vs-runtime state with redacted source summaries, routing preview remains the model-route explanation surface, management health projections expose serving/resilience distinctions and response-filter alert summaries, README/performance/response-filter documentation records the lightweight-router boundary, and the final local CI plus x86_64 Docker/Nix release gate produced a versioned artifact with SHA256 verification.
 

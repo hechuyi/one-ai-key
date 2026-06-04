@@ -87,6 +87,10 @@ fn release_script_is_local_x86_64_linux_nix_command_gnu_packaging_contract() {
         "{path} must require rustc to be available in the active toolchain"
     );
     assert!(
+        script.contains("gzip --version"),
+        "{path} must require gzip for deterministic compression"
+    );
+    assert!(
         !script.contains("/etc/os-release") && !script.to_ascii_lowercase().contains("nixos"),
         "{path} must not require /etc/os-release to identify as NixOS"
     );
@@ -118,6 +122,23 @@ fn release_script_is_local_x86_64_linux_nix_command_gnu_packaging_contract() {
         script.contains("sha256"),
         "{path} must generate a SHA-256 checksum"
     );
+    assert!(
+        script.contains("SOURCE_DATE_EPOCH"),
+        "{path} must expose SOURCE_DATE_EPOCH for deterministic archive metadata"
+    );
+    for required in [
+        "--sort=name",
+        "--mtime=\"@${SOURCE_DATE_EPOCH}\"",
+        "--owner=0",
+        "--group=0",
+        "--numeric-owner",
+        "gzip -n -9",
+    ] {
+        assert!(
+            script.contains(required),
+            "{path} must include deterministic archive option `{required}`"
+        );
+    }
     assert!(
         !script.contains(r#"sha256sum "${ARCHIVE_PATH}" > "${ARCHIVE_PATH}.sha256""#),
         "{path} must not checksum ARCHIVE_PATH directly because that records an absolute path in the sidecar"
@@ -237,4 +258,15 @@ fn gitignore_ignores_local_dist_release_output() {
         gitignore.lines().any(|line| line.trim() == "/dist/"),
         ".gitignore must ignore /dist/ release output"
     );
+}
+
+#[test]
+fn dockerignore_excludes_local_config_files_from_release_build_context() {
+    let dockerignore = read_repo_file(".dockerignore");
+    for pattern in ["config/*.yaml", "config/*.json", "config/*.toml"] {
+        assert!(
+            dockerignore.lines().any(|line| line.trim() == pattern),
+            ".dockerignore must exclude local config pattern `{pattern}` from Docker build context"
+        );
+    }
 }

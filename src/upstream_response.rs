@@ -389,10 +389,7 @@ fn emit_response_filter_events(
 }
 
 fn response_filter_action_name(action: ResponseFilterAction) -> &'static str {
-    match action {
-        ResponseFilterAction::Redact => "redact",
-        ResponseFilterAction::Reject => "reject",
-    }
+    action.as_str()
 }
 
 impl ResponseContentKind {

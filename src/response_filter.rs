@@ -4,6 +4,31 @@ use regex::{Regex, RegexBuilder};
 pub enum ResponseFilterAction {
     Redact,
     Reject,
+    RejectAndExpireCredential,
+    RejectAndCooldownChannel,
+}
+
+impl ResponseFilterAction {
+    pub fn is_rejecting(self) -> bool {
+        !matches!(self, Self::Redact)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Redact => "redact",
+            Self::Reject => "reject",
+            Self::RejectAndExpireCredential => "reject_and_expire_credential",
+            Self::RejectAndCooldownChannel => "reject_and_cooldown_channel",
+        }
+    }
+
+    pub fn lifecycle_failure_scope(self) -> Option<crate::error::FailureScope> {
+        match self {
+            Self::RejectAndExpireCredential => Some(crate::error::FailureScope::Credential),
+            Self::RejectAndCooldownChannel => Some(crate::error::FailureScope::Channel),
+            Self::Redact | Self::Reject => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +217,22 @@ impl ResponseFilterPolicy {
     }
 
     pub fn inspect_text(&self, text: &str) -> ResponseFilterDecision {
+        self.inspect_text_with_required_missing(text, true)
+    }
+
+    pub fn inspect_text_for_precommit(
+        &self,
+        text: &str,
+        allow_required_missing: bool,
+    ) -> ResponseFilterDecision {
+        self.inspect_text_with_required_missing(text, allow_required_missing)
+    }
+
+    fn inspect_text_with_required_missing(
+        &self,
+        text: &str,
+        allow_required_missing: bool,
+    ) -> ResponseFilterDecision {
         if !self.enabled || self.rules.is_empty() || text.is_empty() {
             return ResponseFilterDecision::Unchanged;
         }
@@ -213,7 +254,7 @@ impl ResponseFilterPolicy {
                         rule.id.clone(),
                         rule.action,
                     ));
-                    if rule.action == ResponseFilterAction::Reject {
+                    if rule.action.is_rejecting() {
                         return ResponseFilterDecision::Rejected { matches };
                     }
                     redacted_text =
@@ -227,7 +268,7 @@ impl ResponseFilterPolicy {
                         rule.id.clone(),
                         rule.action,
                     ));
-                    if rule.action == ResponseFilterAction::Reject {
+                    if rule.action.is_rejecting() {
                         return ResponseFilterDecision::Rejected { matches };
                     }
                     redacted_text = regex
@@ -242,11 +283,14 @@ impl ResponseFilterPolicy {
                     if normalized_text.contains(normalized_value) {
                         continue;
                     }
+                    if !allow_required_missing {
+                        continue;
+                    }
                     matches.push(ResponseFilterMatch::required_rule_missing(
                         rule.id.clone(),
                         rule.action,
                     ));
-                    if rule.action == ResponseFilterAction::Reject {
+                    if rule.action.is_rejecting() {
                         return ResponseFilterDecision::Rejected { matches };
                     }
                     redacted_text = self.replacement.clone();
@@ -255,11 +299,14 @@ impl ResponseFilterPolicy {
                     if regex.is_match(text) {
                         continue;
                     }
+                    if !allow_required_missing {
+                        continue;
+                    }
                     matches.push(ResponseFilterMatch::required_rule_missing(
                         rule.id.clone(),
                         rule.action,
                     ));
-                    if rule.action == ResponseFilterAction::Reject {
+                    if rule.action.is_rejecting() {
                         return ResponseFilterDecision::Rejected { matches };
                     }
                     redacted_text = self.replacement.clone();

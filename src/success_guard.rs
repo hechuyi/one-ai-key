@@ -75,7 +75,6 @@ pub struct GuardStreamInput<'a> {
 
 pub enum GuardResult {
     PassThrough {
-        #[cfg(test)]
         outcome: GuardOutcome,
         prefix: Bytes,
         stream: UpstreamByteStream,
@@ -363,7 +362,6 @@ fn pass_through(
         );
     }
     GuardResult::PassThrough {
-        #[cfg(test)]
         outcome,
         prefix,
         stream,

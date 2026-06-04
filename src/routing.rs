@@ -143,6 +143,7 @@ pub enum FailureReason {
     UpstreamQuotaExhausted,
     RelayBalanceUnavailable,
     UpstreamProviderUnavailable,
+    ResponseFilterRejected,
     KeySwitchCooldown,
     ClientOrModelError,
     Unknown,
@@ -153,14 +154,19 @@ pub enum FailureSource {
     UpstreamTransaction,
     LocalTransport,
     GuardedSuccessEnvelope,
+    ResponseFilterPrecommit,
 }
 
-pub const FAILURE_SOURCE_TELEMETRY_CONTRACT: [(FailureSource, &str); 3] = [
+pub const FAILURE_SOURCE_TELEMETRY_CONTRACT: [(FailureSource, &str); 4] = [
     (FailureSource::UpstreamTransaction, "upstream_transaction"),
     (FailureSource::LocalTransport, "local_transport"),
     (
         FailureSource::GuardedSuccessEnvelope,
         "guarded_success_envelope",
+    ),
+    (
+        FailureSource::ResponseFilterPrecommit,
+        "response_filter_precommit",
     ),
 ];
 
@@ -201,6 +207,11 @@ pub enum StateMutation {
         provider_id: String,
         account_id: String,
         until: Option<Instant>,
+        reason: FailureReason,
+    },
+    MarkChannelCoolingDown {
+        channel_id: ChannelId,
+        until: Instant,
         reason: FailureReason,
     },
 }
@@ -311,6 +322,24 @@ pub fn transition_after_failure(input: TransitionInput<'_>) -> TransitionResult 
                 account_id: input.snapshot.account_id.clone(),
                 until: input.failure.cooldown.map(|cooldown| input.now + cooldown),
                 reason: FailureReason::UpstreamProviderUnavailable,
+            }
+        }
+        (FailureKind::ResponseFilterRejected, FailureScope::Credential) => {
+            StateMutation::ExpireCredential {
+                channel_id: input.snapshot.channel_id.clone(),
+                credential_id: input.snapshot.credential_id.clone(),
+                reason: FailureReason::ResponseFilterRejected,
+            }
+        }
+        (FailureKind::ResponseFilterRejected, FailureScope::Channel) => {
+            StateMutation::MarkChannelCoolingDown {
+                channel_id: input.snapshot.channel_id.clone(),
+                until: input.now
+                    + input
+                        .failure
+                        .cooldown
+                        .unwrap_or(input.policy.default_credential_cooldown),
+                reason: FailureReason::ResponseFilterRejected,
             }
         }
         (FailureKind::KeySwitchCooldown, _) => StateMutation::Noop {
@@ -440,6 +469,7 @@ fn duplicate_charge_risk(
         (FailureSource::UpstreamTransaction, _) => DuplicateChargeRisk::Unknown,
         (FailureSource::LocalTransport, _) => DuplicateChargeRisk::None,
         (FailureSource::GuardedSuccessEnvelope, _) => DuplicateChargeRisk::Unknown,
+        (FailureSource::ResponseFilterPrecommit, _) => DuplicateChargeRisk::Unknown,
     }
 }
 
@@ -457,7 +487,7 @@ fn same_target_transient_retry_allowed(input: &TransitionInput<'_>) -> bool {
                 .failure
                 .upstream_status
                 .is_some_and(|status| (500..=599).contains(&status)),
-            FailureSource::GuardedSuccessEnvelope => false,
+            FailureSource::GuardedSuccessEnvelope | FailureSource::ResponseFilterPrecommit => false,
         }
 }
 
@@ -808,7 +838,8 @@ mod tests {
             } => pool.apply_credential_quota_exhausted(&credential_id, format!("{reason:?}")),
             StateMutation::Noop { .. }
             | StateMutation::MarkRelayBalanceChannelCoolingDown { .. }
-            | StateMutation::MarkProviderAccountChannelCoolingDownOrDegraded { .. } => {
+            | StateMutation::MarkProviderAccountChannelCoolingDownOrDegraded { .. }
+            | StateMutation::MarkChannelCoolingDown { .. } => {
                 crate::pool::SwitchOutcome::StaleFailure
             }
         }

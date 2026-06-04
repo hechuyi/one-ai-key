@@ -11,6 +11,7 @@ use reqwest::Body as ReqwestBody;
 use crate::{
     auth::{authorize_client, json_error, json_error_with_code},
     credentials::CredentialId,
+    error::{ClassifiedFailure, FailureConfidence, FailureKind, FailureScope},
     events::RoutingTelemetry,
     failure_observer::{
         record_routing_telemetry, transition_observed_failure, transition_observed_upstream_failure,
@@ -20,6 +21,7 @@ use crate::{
         bytes_from_body_for_context, EndpointKind, InboundProtocol, NamedPoolRequestMode,
         ProviderAdapter,
     },
+    response_filter::{ResponseFilterDecision, ResponseFilterMatch},
     route_plan::{
         plan_route, preview_route, ChannelRouteState, RouteCandidate, RoutePlan, RoutePlanInput,
         RoutePreview, RoutePreviewInput, RoutePreviewReason,
@@ -29,7 +31,9 @@ use crate::{
         RequestSelectionSnapshot, RetryAttemptContinuation, SelectionReason,
     },
     state::{AppState, ChannelId, PoolState},
-    success_guard::{guard_success_response, should_guard_success_status, GuardResult},
+    success_guard::{
+        guard_success_response, should_guard_success_status, GuardOutcome, GuardResult,
+    },
     upstream_response::{
         prefixed_body_stream, read_limited_body, response_with_headers,
         stream_response_from_byte_stream_with_filter_events, stream_response_with_filter_events,
@@ -105,6 +109,142 @@ fn guarded_success_envelope_response() -> Response {
         StatusCode::BAD_GATEWAY,
         "guarded_success_envelope",
         "upstream returned a structured error envelope with success status",
+    )
+}
+
+struct PrecommitFilterRejection {
+    failure: Option<ClassifiedFailure>,
+    response: Response,
+}
+
+fn inspect_response_filter_before_commit(
+    state: &AppState,
+    route_plan: &FrozenRoutePlan,
+    snapshot: &RequestSelectionSnapshot,
+    headers: &HeaderMap,
+    guard_outcome: GuardOutcome,
+    prefix: &Bytes,
+) -> Option<PrecommitFilterRejection> {
+    if has_non_identity_content_encoding(headers) {
+        return None;
+    }
+    let Ok(text) = std::str::from_utf8(prefix) else {
+        return None;
+    };
+    let policy = state
+        .response_filter
+        .read()
+        .expect("response filter lock poisoned")
+        .clone();
+    let ResponseFilterDecision::Rejected { matches } =
+        policy.inspect_text_for_precommit(text, matches!(guard_outcome, GuardOutcome::Pass))
+    else {
+        return None;
+    };
+    emit_precommit_response_filter_events(state, route_plan, snapshot, headers, &matches);
+    let failure =
+        (snapshot.body_replayable && !snapshot.streaming && !snapshot.partial_output_started)
+            .then(|| {
+                matches
+                    .iter()
+                    .find_map(|matched| {
+                        matched
+                            .action
+                            .lifecycle_failure_scope()
+                            .map(|scope| (matched, scope))
+                    })
+                    .map(|(matched, scope)| response_filter_failure(snapshot, matched, scope))
+            })
+            .flatten();
+    Some(PrecommitFilterRejection {
+        failure,
+        response: response_filter_precommit_rejected_response(),
+    })
+}
+
+fn emit_precommit_response_filter_events(
+    state: &AppState,
+    route_plan: &FrozenRoutePlan,
+    snapshot: &RequestSelectionSnapshot,
+    headers: &HeaderMap,
+    matches: &[ResponseFilterMatch],
+) {
+    let context = response_filter_event_options(state, route_plan, snapshot).context;
+    let content_kind = response_filter_content_kind(headers);
+    if let Ok(mut events) = state.response_filter_events.lock() {
+        for matched_rule in matches {
+            events.push(crate::events::ResponseFilterEventInput {
+                request_id: context.request_id.clone(),
+                channel_id: context.channel_id.clone(),
+                public_model: context.public_model.clone(),
+                rule_id: matched_rule.rule_id.clone(),
+                action: matched_rule.action.as_str().to_string(),
+                content_kind: content_kind.to_string(),
+                reason_code: matched_rule.reason_code.to_string(),
+                outcome: "rejected".to_string(),
+                body_committed: false,
+            });
+        }
+    }
+}
+
+fn response_filter_content_kind(headers: &HeaderMap) -> &'static str {
+    let media_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if media_type == "text/event-stream" {
+        "sse"
+    } else if media_type == "application/json" || media_type.ends_with("+json") {
+        "json"
+    } else {
+        "unknown"
+    }
+}
+
+fn has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .any(|value| !value.eq_ignore_ascii_case("identity"))
+        })
+        .unwrap_or(false)
+}
+
+fn response_filter_failure(
+    snapshot: &RequestSelectionSnapshot,
+    matched: &ResponseFilterMatch,
+    scope: FailureScope,
+) -> ClassifiedFailure {
+    ClassifiedFailure {
+        kind: FailureKind::ResponseFilterRejected,
+        primary_scope: scope,
+        retryable: true,
+        cooldown: None,
+        retry_after_source: None,
+        confidence: FailureConfidence::High,
+        upstream_status: Some(200),
+        upstream_code: None,
+        upstream_limit_type: None,
+        classifier_id: snapshot.classifier_id.clone(),
+        classifier_version: snapshot.classifier_version.clone(),
+        adaptation_rule_id: Some(matched.rule_id.clone()),
+    }
+}
+
+fn response_filter_precommit_rejected_response() -> Response {
+    json_error_with_code(
+        StatusCode::BAD_GATEWAY,
+        "response_filter_rejected",
+        "upstream response content was blocked by response filter",
     )
 }
 
@@ -821,7 +961,31 @@ async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response 
                 .await;
                 return guarded_success_envelope_response();
             }
-            Ok(GuardResult::PassThrough { prefix, stream, .. }) => {
+            Ok(GuardResult::PassThrough {
+                outcome,
+                prefix,
+                stream,
+            }) => {
+                if let Some(rejection) = inspect_response_filter_before_commit(
+                    &state,
+                    &route_plan,
+                    &snapshot,
+                    &response_headers,
+                    outcome,
+                    &prefix,
+                ) {
+                    if let Some(failure) = rejection.failure {
+                        let _ = transition_observed_failure(
+                            &state,
+                            &pool_state,
+                            &snapshot,
+                            failure,
+                            FailureSource::ResponseFilterPrecommit,
+                        )
+                        .await;
+                    }
+                    return rejection.response;
+                }
                 pool_state
                     .failure_domains
                     .record_success(&pool_state.provider_id, &pool_state.account_id);
@@ -1180,7 +1344,52 @@ async fn forward_with_pool(
                     }
                     return PoolForwardResult::Response(response);
                 }
-                Ok(GuardResult::PassThrough { prefix, stream, .. }) => {
+                Ok(GuardResult::PassThrough {
+                    outcome,
+                    prefix,
+                    stream,
+                }) => {
+                    if let Some(rejection) = inspect_response_filter_before_commit(
+                        state,
+                        route_plan,
+                        &snapshot,
+                        &response_headers,
+                        outcome,
+                        &prefix,
+                    ) {
+                        if let Some(failure) = rejection.failure {
+                            let directive = transition_observed_failure(
+                                state,
+                                &pool_state,
+                                &snapshot,
+                                failure,
+                                FailureSource::ResponseFilterPrecommit,
+                            )
+                            .await;
+                            match apply_retry_directive_to_attempt_state(
+                                directive,
+                                &mut frozen_retry_candidates,
+                                &mut attempt,
+                            ) {
+                                RetryAttemptContinuation::RetryCredential { credential_id } => {
+                                    retry_credential_id = Some(credential_id);
+                                    continue;
+                                }
+                                RetryAttemptContinuation::RetryRouteTarget => {
+                                    return PoolForwardResult::RouteFallback(rejection.response);
+                                }
+                                RetryAttemptContinuation::RetrySameTarget => continue,
+                                RetryAttemptContinuation::ReturnCurrentError { .. } => {}
+                                RetryAttemptContinuation::FrozenCandidateDrift { .. } => {
+                                    return PoolForwardResult::Response(json_error(
+                                        StatusCode::BAD_GATEWAY,
+                                        "retry candidate drifted from frozen request selection",
+                                    ));
+                                }
+                            }
+                        }
+                        return PoolForwardResult::Response(rejection.response);
+                    }
                     pool_state
                         .failure_domains
                         .record_success(&pool_state.provider_id, &pool_state.account_id);
