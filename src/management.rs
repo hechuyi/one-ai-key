@@ -69,7 +69,7 @@ use crate::{
     management_runtime::{
         readiness_response, reload_runtime as reload_runtime_state, resilience_health_response,
         response_filter_events_snapshot_response, routing_telemetry_snapshot_response,
-        runtime_response_for_state, serving_health_response,
+        runtime_explain_response_for_state, runtime_response_for_state, serving_health_response,
     },
     model_discovery,
     state::AppState,
@@ -1430,6 +1430,19 @@ pub async fn runtime(State(state): State<AppState>, headers: HeaderMap) -> Respo
     let _principal_context = (&principal.id, &principal.name, &principal.role);
 
     match runtime_response_for_state(&state).await {
+        Ok(runtime) => Json(runtime).into_response(),
+        Err(err) => service_error(err),
+    }
+}
+
+pub async fn explain_runtime(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match authorize_management(&state, &headers) {
+        Ok(principal) => principal,
+        Err(resp) => return *resp,
+    };
+    let _principal_context = (&principal.id, &principal.name, &principal.role);
+
+    match runtime_explain_response_for_state(&state).await {
         Ok(runtime) => Json(runtime).into_response(),
         Err(err) => service_error(err),
     }

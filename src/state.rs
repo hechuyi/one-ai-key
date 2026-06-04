@@ -55,6 +55,7 @@ pub struct AppState {
     pub client_token_store: ClientTokenStoreHandle,
     pub registry_store: RegistryStoreHandle,
     pub active_registry_version: Arc<StdRwLock<Option<u64>>>,
+    pub runtime_reload_status: Arc<StdRwLock<RuntimeReloadStatus>>,
     pub registry_validation_bootstrap: Arc<RegistryDocument>,
     pub runtime_catalogs: RuntimeCatalogs,
     pub channels: ChannelRegistry,
@@ -62,6 +63,12 @@ pub struct AppState {
     pub events: EventLog,
     pub routing_telemetry: Arc<StdMutex<RoutingTelemetryBuffer>>,
     pub lifecycle_persistence: LifecyclePersistenceQueue,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeReloadStatus {
+    pub last_reload_at_unix_seconds: Option<u64>,
+    pub last_reload_error_reason_code: Option<String>,
 }
 
 #[derive(Clone)]
@@ -647,6 +654,7 @@ impl AppState {
             client_token_store,
             registry_store,
             active_registry_version: Arc::new(StdRwLock::new(active_registry_version)),
+            runtime_reload_status: Arc::new(StdRwLock::new(RuntimeReloadStatus::default())),
             registry_validation_bootstrap: Arc::new(
                 registry_validation_bootstrap.unwrap_or_else(empty_registry_validation_bootstrap),
             ),
@@ -765,6 +773,37 @@ impl AppState {
             .write()
             .expect("active registry version lock poisoned") = active_registry_version;
         Ok(())
+    }
+
+    pub fn runtime_reload_status_snapshot(&self) -> RuntimeReloadStatus {
+        self.runtime_reload_status
+            .read()
+            .expect("runtime reload status lock poisoned")
+            .clone()
+    }
+
+    pub fn record_runtime_reload_success(&self, created_at_unix_seconds: u64) {
+        *self
+            .runtime_reload_status
+            .write()
+            .expect("runtime reload status lock poisoned") = RuntimeReloadStatus {
+            last_reload_at_unix_seconds: Some(created_at_unix_seconds),
+            last_reload_error_reason_code: None,
+        };
+    }
+
+    pub fn record_runtime_reload_failure(
+        &self,
+        created_at_unix_seconds: u64,
+        reason_code: impl Into<String>,
+    ) {
+        *self
+            .runtime_reload_status
+            .write()
+            .expect("runtime reload status lock poisoned") = RuntimeReloadStatus {
+            last_reload_at_unix_seconds: Some(created_at_unix_seconds),
+            last_reload_error_reason_code: Some(reason_code.into()),
+        };
     }
 }
 

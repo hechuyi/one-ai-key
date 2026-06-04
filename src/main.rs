@@ -326,6 +326,11 @@ const MANAGEMENT_ROUTE_SPECS: &[ManagementRouteSpec] = &[
     },
     ManagementRouteSpec {
         method: "GET",
+        path: "/management/explain/runtime",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
         path: "/management/health/serving",
         minimum_role: ManagementRole::Readonly,
     },
@@ -723,6 +728,10 @@ fn app_without_test_peer_default(state: AppState) -> Router {
             get(management::routing_preview),
         )
         .route("/management/runtime", get(management::runtime))
+        .route(
+            "/management/explain/runtime",
+            get(management::explain_runtime),
+        )
         .route(
             "/management/health/serving",
             get(management::serving_health),
@@ -10197,6 +10206,11 @@ pools:
             ("GET", "/management/runtime", ManagementRole::Readonly),
             (
                 "GET",
+                "/management/explain/runtime",
+                ManagementRole::Readonly,
+            ),
+            (
+                "GET",
                 "/management/health/serving",
                 ManagementRole::Readonly,
             ),
@@ -10419,6 +10433,16 @@ pools:
             management_role_matrix_response(
                 "GET",
                 "/management/health/resilience",
+                Some(fixture_readonly_management_token()),
+                Body::empty()
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            management_role_matrix_response(
+                "GET",
+                "/management/explain/runtime",
                 Some(fixture_readonly_management_token()),
                 Body::empty()
             )
@@ -19337,6 +19361,209 @@ pools:
         );
         assert_eq!(runtime["request_limits"]["max_route_candidates"], 16);
         assert_eq!(runtime["timeout_seconds"]["connect"], 10);
+    }
+
+    #[tokio::test]
+    async fn management_explain_runtime_reports_current_runtime_decision_inputs_without_secret_material(
+    ) {
+        let response = app(read_only_test_state_with_api_base("https://example.com/v1"))
+            .oneshot(
+                Request::builder()
+                    .uri("/management/explain/runtime")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        for forbidden in [
+            "upstream-key",
+            fixture_admin_token().as_str(),
+            fixture_client_token().as_str(),
+            "fingerprint",
+            "credential_id",
+            "keys_file",
+            "/tmp/",
+        ] {
+            assert!(
+                !body_text.contains(forbidden),
+                "runtime explain leaked forbidden material {forbidden}"
+            );
+        }
+        let explain = serde_json::from_str::<Value>(&body_text).unwrap();
+        assert!(explain["active_registry_generation"].as_u64().unwrap() > 0);
+        assert!(explain["active_registry_version"].is_null());
+        assert!(explain["staged_registry_version"].is_null());
+        assert_eq!(explain["runtime_reload_required"], false);
+        assert_eq!(
+            explain["registry_source"]["source_kind"],
+            "read_only_bootstrap"
+        );
+        assert_eq!(explain["registry_source"]["writable"], false);
+        assert_eq!(explain["registry_source"]["persisted"], false);
+        assert_eq!(
+            explain["credential_source"]["source_kind"],
+            "file_bootstrap"
+        );
+        assert_eq!(explain["credential_source"]["writable"], false);
+        assert_eq!(explain["credential_source"]["persisted"], false);
+        assert_eq!(
+            explain["credential_source"]["lifecycle_authoritative"],
+            false
+        );
+        assert_eq!(explain["client_token_source"]["source_kind"], "bootstrap");
+        assert_eq!(explain["client_token_source"]["writable"], false);
+        assert_eq!(explain["client_token_source"]["persisted"], false);
+        assert_eq!(explain["staged_vs_runtime"]["active_matches_staged"], true);
+        assert!(explain["staged_vs_runtime"]["reload_required_reason"].is_null());
+        assert!(explain["last_reload"]["last_reload_at_unix_seconds"].is_null());
+        assert!(explain["last_reload"]["last_reload_error_reason_code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn management_explain_runtime_reports_pending_registry_reload_reason() {
+        let (app, _) = registry_provider_fixture();
+        let before = management_response_json(&app, "/management/explain/runtime").await;
+        let active_registry_generation = before["active_registry_generation"].as_u64().unwrap();
+        assert_eq!(before["active_registry_version"], 1);
+        assert_eq!(before["staged_registry_version"], 1);
+        assert_eq!(before["runtime_reload_required"], false);
+        assert_eq!(
+            before["registry_source"]["source_kind"],
+            "sqlite_registry_store"
+        );
+        assert_eq!(before["registry_source"]["writable"], true);
+        assert_eq!(before["registry_source"]["persisted"], true);
+        assert_eq!(
+            before["credential_source"]["source_kind"],
+            "sqlite_credential_store"
+        );
+        assert_eq!(before["credential_source"]["lifecycle_authoritative"], true);
+        assert_eq!(
+            before["client_token_source"]["source_kind"],
+            "sqlite_client_token_store"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/registry/providers/relay/disable")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let after = management_response_json(&app, "/management/explain/runtime").await;
+        assert_eq!(
+            after["active_registry_generation"],
+            active_registry_generation
+        );
+        assert_eq!(after["active_registry_version"], 1);
+        assert_eq!(after["staged_registry_version"], 2);
+        assert_eq!(after["runtime_reload_required"], true);
+        assert_eq!(after["staged_vs_runtime"]["active_matches_staged"], false);
+        assert_eq!(
+            after["staged_vs_runtime"]["reload_required_reason"],
+            "staged_registry_differs"
+        );
+        assert!(after["last_reload"]["last_reload_at_unix_seconds"].is_null());
+        assert!(after["last_reload"]["last_reload_error_reason_code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn management_explain_runtime_updates_last_reload_status_after_success_and_failure() {
+        let (app, _) = registry_provider_fixture();
+        let before = management_response_json(&app, "/management/explain/runtime").await;
+        let active_registry_generation = before["active_registry_generation"]
+            .as_u64()
+            .expect("active generation exists");
+
+        let disable = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/registry/providers/relay/disable")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disable.status(), StatusCode::OK);
+
+        let reload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/runtime/reload")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reload.status(), StatusCode::OK);
+
+        let after_success = management_response_json(&app, "/management/explain/runtime").await;
+        assert!(
+            after_success["active_registry_generation"]
+                .as_u64()
+                .unwrap()
+                > active_registry_generation
+        );
+        assert_eq!(after_success["active_registry_version"], 2);
+        assert_eq!(after_success["staged_registry_version"], 2);
+        assert_eq!(after_success["runtime_reload_required"], false);
+        assert!(
+            after_success["last_reload"]["last_reload_at_unix_seconds"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(after_success["last_reload"]["last_reload_error_reason_code"].is_null());
+
+        let blocking_parent = temp_keys_file("not a directory\n");
+        let event_log_path = blocking_parent.join("events.jsonl");
+        let (failing_app, _) = registry_provider_fixture_with_event_log_path(event_log_path);
+        let failed_reload = failing_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/runtime/reload")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed_reload.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let after_failure =
+            management_response_json(&failing_app, "/management/explain/runtime").await;
+        assert!(
+            after_failure["last_reload"]["last_reload_at_unix_seconds"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            after_failure["last_reload"]["last_reload_error_reason_code"],
+            "runtime_reload_failed"
+        );
+        let serialized = serde_json::to_string(&after_failure).unwrap();
+        assert!(!serialized.contains("not a directory"));
+        assert!(!serialized.contains("events.jsonl"));
     }
 
     fn runtime_retry_pressure_failure(

@@ -1,11 +1,13 @@
 use std::{
     collections::BTreeMap,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
 
 use crate::{
+    client_token_store::ClientTokenStoreHandle,
+    credential_repository::CredentialStoreHandle,
     events::{
         ManagementAuditEvent, ManagementEventActor, ResponseFilterEvent, RetryPressureCounters,
         RoutingTelemetry,
@@ -17,6 +19,7 @@ use crate::{
         credential_pool_alerts, runtime_readiness_projection, CredentialPoolAlertStatus,
         CredentialSetSnapshotCache, RuntimeCredentialCounts, RuntimeReadinessProjection,
     },
+    registry_store::RegistryStoreHandle,
     state::{AppState, ChannelHealth, RuntimeTopologySummary},
 };
 
@@ -115,6 +118,43 @@ pub struct RuntimeResponse {
     pub response_filter_event_capacity: usize,
     pub request_limits: RequestLimits,
     pub timeout_seconds: TimeoutSeconds,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeExplainResponse {
+    pub active_registry_generation: u64,
+    pub active_registry_version: Option<u64>,
+    pub staged_registry_version: Option<u64>,
+    pub runtime_reload_required: bool,
+    pub registry_source: RuntimeSourceExplanation,
+    pub credential_source: RuntimeSourceExplanation,
+    pub client_token_source: RuntimeSourceExplanation,
+    pub staged_vs_runtime: StagedRuntimeExplanation,
+    pub last_reload: RuntimeReloadExplanation,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeSourceExplanation {
+    pub source_kind: &'static str,
+    pub writable: bool,
+    pub persisted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_authoritative: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StagedRuntimeExplanation {
+    pub active_matches_staged: bool,
+    pub active_registry_version: Option<u64>,
+    pub staged_registry_version: Option<u64>,
+    pub active_registry_generation: u64,
+    pub reload_required_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeReloadExplanation {
+    pub last_reload_at_unix_seconds: Option<u64>,
+    pub last_reload_error_reason_code: Option<String>,
 }
 
 pub struct RuntimeResponseParts {
@@ -233,6 +273,97 @@ pub async fn runtime_response_for_state(
         .await
         .map_err(registry_store_error)?;
     Ok(runtime_response(state, staged_registry_version).await)
+}
+
+pub async fn runtime_explain_response_for_state(
+    state: &AppState,
+) -> Result<RuntimeExplainResponse, ManagementServiceError> {
+    let staged_registry_version = state
+        .registry_store
+        .current_version()
+        .await
+        .map_err(registry_store_error)?;
+    Ok(runtime_explain_response(state, staged_registry_version).await)
+}
+
+pub async fn runtime_explain_response(
+    state: &AppState,
+    staged_registry_version: Option<u64>,
+) -> RuntimeExplainResponse {
+    let sample = collect_runtime_snapshot(state).await;
+    let runtime_reload_required = staged_registry_version != sample.active_registry_version;
+    let last_reload = state.runtime_reload_status_snapshot();
+    RuntimeExplainResponse {
+        active_registry_generation: sample.active_registry_generation,
+        active_registry_version: sample.active_registry_version,
+        staged_registry_version,
+        runtime_reload_required,
+        registry_source: registry_source_explanation(&state.registry_store),
+        credential_source: credential_source_explanation(&state.credential_store),
+        client_token_source: client_token_source_explanation(&state.client_token_store),
+        staged_vs_runtime: StagedRuntimeExplanation {
+            active_matches_staged: !runtime_reload_required,
+            active_registry_version: sample.active_registry_version,
+            staged_registry_version,
+            active_registry_generation: sample.active_registry_generation,
+            reload_required_reason: runtime_reload_required.then_some("staged_registry_differs"),
+        },
+        last_reload: RuntimeReloadExplanation {
+            last_reload_at_unix_seconds: last_reload.last_reload_at_unix_seconds,
+            last_reload_error_reason_code: last_reload.last_reload_error_reason_code,
+        },
+    }
+}
+
+fn registry_source_explanation(store: &RegistryStoreHandle) -> RuntimeSourceExplanation {
+    match store {
+        RegistryStoreHandle::ReadOnly => RuntimeSourceExplanation {
+            source_kind: "read_only_bootstrap",
+            writable: false,
+            persisted: false,
+            lifecycle_authoritative: None,
+        },
+        RegistryStoreHandle::Sqlite(_) => RuntimeSourceExplanation {
+            source_kind: "sqlite_registry_store",
+            writable: true,
+            persisted: true,
+            lifecycle_authoritative: None,
+        },
+    }
+}
+
+fn credential_source_explanation(store: &CredentialStoreHandle) -> RuntimeSourceExplanation {
+    match store {
+        CredentialStoreHandle::ReadOnlyFileBootstrap => RuntimeSourceExplanation {
+            source_kind: "file_bootstrap",
+            writable: false,
+            persisted: false,
+            lifecycle_authoritative: Some(false),
+        },
+        CredentialStoreHandle::Sqlite(_) => RuntimeSourceExplanation {
+            source_kind: "sqlite_credential_store",
+            writable: true,
+            persisted: true,
+            lifecycle_authoritative: Some(store.has_lifecycle_snapshot_authority()),
+        },
+    }
+}
+
+fn client_token_source_explanation(store: &ClientTokenStoreHandle) -> RuntimeSourceExplanation {
+    match store {
+        ClientTokenStoreHandle::ReadOnlyBootstrap => RuntimeSourceExplanation {
+            source_kind: "bootstrap",
+            writable: false,
+            persisted: false,
+            lifecycle_authoritative: None,
+        },
+        ClientTokenStoreHandle::Sqlite(_) => RuntimeSourceExplanation {
+            source_kind: "sqlite_client_token_store",
+            writable: true,
+            persisted: true,
+            lifecycle_authoritative: None,
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -446,6 +577,23 @@ pub fn runtime_reload_response(parts: RuntimeReloadResponseParts) -> RuntimeRelo
 }
 
 pub async fn reload_runtime(
+    state: &AppState,
+    actor: ManagementEventActor,
+) -> Result<RuntimeReloadResponse, ManagementServiceError> {
+    let result = apply_runtime_reload(state, actor).await;
+    match result {
+        Ok(response) => {
+            state.record_runtime_reload_success(current_unix_seconds());
+            Ok(response)
+        }
+        Err(err) => {
+            state.record_runtime_reload_failure(current_unix_seconds(), "runtime_reload_failed");
+            Err(err)
+        }
+    }
+}
+
+async fn apply_runtime_reload(
     state: &AppState,
     actor: ManagementEventActor,
 ) -> Result<RuntimeReloadResponse, ManagementServiceError> {
@@ -690,6 +838,13 @@ pub struct TimeoutSeconds {
 
 pub fn duration_secs(duration: Duration) -> u64 {
     duration.as_secs()
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
