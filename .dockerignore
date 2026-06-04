@@ -42,3 +42,10 @@ scripts/one_ai_key_keys.py
 .DS_Store
 __pycache__/
 *.py[cod]
+
+# Local documentation renders/exports.
+docs/export/
+docs/rendered/
+docs/screenshots/
+*.docx
+*.pdf

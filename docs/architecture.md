@@ -116,9 +116,9 @@ only when the body is replayable, no client output has started, the attempt
 budget and policy allow it, a frozen candidate exists, and the effective request
 deadline can still contain the next attempt. `duplicate_charge_risk` is
 conservative telemetry for retry after upstream transaction failure: `none`
-means no completed upstream transaction is suspected, `known_no_charge` means
-typed evidence proves the failed attempt could not have charged, and `unknown`
-means the gateway cannot prove whether the upstream charged before failure.
+means no completed upstream transaction is suspected or no retry is attempted,
+and `unknown` means the gateway cannot prove whether the upstream charged before
+failure. The current runtime does not emit a separate `known_no_charge` state.
 Retry pressure is exposed through bounded recent counters and a configured
 capacity in management runtime state. Phase 3 reuses this retry boundary for
 guarded body-bearing HTTP 2xx responses: the proxy performs a bounded
@@ -163,7 +163,7 @@ The pool keeps a selector-local index of available credential positions and cool
 
 Credential persistence belongs behind the credential store boundary; `pool.rs` remains runtime selection state only. HTTP forwarding should not know whether credentials came from a file, SQLite, or Postgres.
 
-Management writes use a per-channel mutation gate to serialize precondition checks, durable persistence, audit event append, and state application without holding the credential pool lock across JSONL or store I/O. In writable-store mode, lifecycle snapshot persistence must succeed before a credential mutation is accepted; JSONL remains audit/display and is not the lifecycle replay authority. Rejected or idempotent commands do not enter the replay log.
+Management writes use a per-channel mutation gate to serialize precondition checks, durable persistence, audit event append, and state application without holding the credential pool lock across JSONL or store I/O. In writable-store mode, lifecycle snapshot persistence must succeed before a credential mutation is accepted; JSONL remains audit/display for credential lifecycle and is not the lifecycle replay authority. Without snapshot authority, persisted management events remain a compatibility replay source for credential lifecycle and channel enable/disable state during startup. Rejected or idempotent commands do not enter the replay log.
 
 ### Configuration Layer
 
@@ -195,7 +195,7 @@ Planned storage migration:
 
 1. Keep YAML for service settings and provider definitions.
 2. Use SQLite-backed credential bootstrap and management credential import for local deployment.
-3. Persist management-driven credential lifecycle snapshots behind the same credential store boundary. In writable-store mode, those snapshots become startup authority for durable credential state; JSONL remains audit/display and does not also replay credential lifecycle state.
+3. Persist management-driven credential lifecycle snapshots behind the same credential store boundary. In writable-store mode, those snapshots become startup authority for durable credential state; JSONL remains audit/display for credential lifecycle. When snapshot authority is unavailable, startup can still replay persisted management events as the compatibility source for credential lifecycle and channel enable/disable state.
 4. Add a registry store boundary for provider, account, channel, model-route, policy-profile, and routing-profile configuration writes. Registry writes should apply typed commands in a transaction, produce a full `RegistryDocument`, and resolve that document successfully before the write is accepted. The first local adapter should be SQLite; the boundary should not be named around SQLite.
 5. Promote upstream credentials from secret rows plus selector snapshots into explicit credential resources with import batches, redacted source lineage, structured transition evidence, and optional validation probe summaries. This resource model still belongs behind `CredentialStore`; registry storage should only reference credential-set ids.
 6. Add PostgreSQL behind the same repository boundary only if multi-process deployment, concurrent writers, or remote database operation needs it.

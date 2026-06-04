@@ -1,218 +1,119 @@
 # one-ai-key
 
-Small Rust HTTP router for managing multiple upstream API key pools.
+`one-ai-key` is a lightweight AI API key router for personal and small-team
+deployments. Clients use one OpenAI-compatible base URL and one client token;
+the router selects an upstream channel, credential set, and real upstream
+credential behind that stable client-facing endpoint.
 
-It is not limited to OpenAI. It supports:
+The project is intentionally backend-first. It is not a hosted multi-tenant API
+platform, billing system, UI product, active health-check cluster, or live model
+catalog aggregator.
 
-- OpenAI-compatible automatic pool selection via `/v1/*` and request `model`.
-- Direct named pool routing via `/pools/{pool}/...` for other protocols.
-- Different upstream auth headers such as `Authorization: Bearer` or `x-api-key`.
-- Built-in upstream templates for common relay/provider shapes so API base,
-  auth header, policy profile, credential set, channel, and model route wiring
-  are not hand-copied for every site.
-- Sticky-until-error key behavior: keep using the current key, cool it down on configured switchable errors, then move to the next available key.
-- YAML-configurable upstream error adaptation rules for relay-specific cooldown semantics.
-- Management endpoints for redacted channel/credential status, routing preview, model discovery, manual expiration, restore, disable, enable, channel health reset, and cooldown reset.
-- SQLite-backed virtual key management for creating, disabling, enabling, and rescoping client-facing keys without restarting the router.
-- SQLite-backed management import for adding credentials to an existing credential set without editing key files.
-- Configured request/error body limits and streamed successful responses.
+## What It Does
 
-Architecture notes live in `docs/architecture.md`.
+- Exposes OpenAI-compatible `/v1/*` routes for normal AI clients.
+- Supports direct named-pool forwarding through `/pools/{pool}/...`.
+- Maps public client model ids to explicit local route targets.
+- Keeps upstream credentials out of client configuration.
+- Supports multiple upstream auth shapes, including bearer and API-key headers.
+- Imports replacement upstream credentials through the management API when a
+  writable credential store is configured.
+- Tracks credential lifecycle state such as available, cooling down, expired,
+  quota exhausted, and disabled.
+- Applies relay-specific error semantics through typed profiles and structured
+  rules instead of free-form upstream text matching.
+- Streams successful responses while keeping bounded pre-output guards for
+  obvious upstream error envelopes and configured response-filter rejections.
+- Serves `/v1/models` from compiled local runtime state. It does not call
+  upstream `/v1/models` on the request path.
 
-## Fit Boundary
+## Fit
 
-This project is suitable when you want a lightweight personal or small-team
-gateway that presents one OpenAI-compatible base URL, routes public model ids to
-explicit local channel candidates, rotates credentials after typed upstream
-failures, and exposes redacted management views for operator decisions. It is
-designed for deployments where startup and management paths may parse YAML,
-query local SQLite stores, import credentials, and probe model catalogs, while
-the request path reads compiled in-memory state, streams successful responses,
-and keeps guard/filter inspection bounded.
+Use this project when you want:
 
-It is also suitable for relay hardening when the relay behavior can be expressed
-as typed status/code/limit evidence, selected-channel transient suppression,
-bounded pre-output 2xx success-guard classification, management-only
-response-filter events and alerts, and explicit pre-commit rejecting lifecycle
-actions. The intended operating model is low surprise: no hidden upstream
-catalog fan-out for client requests, no request-path storage joins, no
-full-response buffering, and no automatic lifecycle mutation from contaminated
-output except configured explicit pre-commit rejecting actions.
+- one client-facing API key and base URL for several official APIs or relays;
+- local or private-network routing for personal or small-team usage;
+- explicit model-to-channel routing instead of live upstream catalog fan-out;
+- lightweight failover before client-visible output when retry gates allow it;
+- redacted management APIs for credential import, lifecycle operations, model
+  discovery, route preview, runtime reload, and health inspection.
 
-This project is not suitable as a multi-tenant billing platform, hosted control
-plane, UI product, price/catalog synchronization service, active health-check
-cluster, mid-stream fallback engine, or remote deployment orchestrator. It is
-also not suitable if routing correctness depends on live `/v1/models`
-aggregation, free-form upstream message parsing, account/provider-wide balance
-suppression, persistent model trust states, request-path database access, or
-response-filter hits automatically disabling credentials or channels.
+Do not use it as:
 
-Local development:
+- a public multi-tenant gateway;
+- a billing, quota resale, or price synchronization platform;
+- a full API gateway like Kong, Envoy, or HAProxy;
+- a LiteLLM/New API replacement with teams, UI, budgets, or provider catalogs;
+- a background probing service that continuously scans every upstream key;
+- a system that must retry after streaming output has already begun.
+
+## Install
+
+Download a Linux x86_64 release artifact from:
+
+```text
+https://github.com/hechuyi/one-ai-key/releases
+```
+
+Then unpack the tarball and run the `one-ai-key` binary with a local
+configuration file:
 
 ```bash
-export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
-HTTPS_PROXY=http://127.0.0.1:10808 \
-HTTP_PROXY=http://127.0.0.1:10808 \
-CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
+tar -xzf one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz
+./one-ai-key --config config/local.yaml
+```
+
+For development, run from source:
+
+```bash
 cargo run -- --config config/local.yaml
 ```
 
-## Local x86_64 Linux Release Build
+## Quick Start
 
-The only supported release gate for the Linux x86_64 artifact is the local
-Docker/Nix wrapper. From the repository root on the macOS host, run:
-
-```bash
-scripts/build-release-x86_64-linux-docker.sh
-```
-
-The full build contract is in `docs/release-build.md`. The short rule is:
-build locally through this wrapper, publish the resulting `dist/` artifact to a
-GitHub release, and let servers consume the release artifact. Do not compile on
-`rtoc-gateway` or any other remote server.
-
-The wrapper runs Docker with `--platform linux/amd64`, starts
-`nixos/nix:latest`, mounts this repository at `/work`, mounts the named Nix
-store volume `rtoc-monitor-nix-amd64:/nix`, and then runs
-`scripts/build-release-x86_64-linux.sh` inside the Nix shell. The inner script
-is not the host entrypoint.
-
-The build writes `dist/one-ai-key-<version>-<target>.tar.gz` and a matching
-`dist/one-ai-key-<version>-<target>.tar.gz.sha256`. The sha256 sidecar must
-record only the archive basename, not an absolute path or `dist/`-prefixed
-path.
-
-Do not upload or commit `dist/`, runtime config, SQLite databases, keys, tokens,
-JSONL logs, or `AGENTS.md`. A slow first run is expected while Docker populates
-the `rtoc-monitor-nix-amd64` volume; it is not a reason to switch build paths.
-
-Runtime configuration is intentionally local. Keep operator config, key files,
-SQLite databases, and other mutable state in ignored paths such as
-`config/local.yaml` and `data/`. Do not commit deploy or runtime secrets.
-
-When SQLite-backed credential, registry, or client-token storage is configured,
-the local SQLite stores are authoritative for their respective mutable state.
-For example, once the `client_tokens` table has rows, it is authoritative for
-virtual key scope; editing YAML `client_tokens.allowed_model_groups` will not
-rewrite an existing stored virtual key. Use the management API to change model
-or channel scope.
-
-Upstreams can be declared through the `upstreams` shortcut in YAML. Startup
-expands these templates into the normal provider, account, credential-set,
-channel, policy-profile, and model-route resources before validation. The
-request path only sees the expanded in-memory resources.
+Example `config/local.yaml`:
 
 ```yaml
-upstreams:
-  xiaomi_mimo_token_plan_cn:
-    template: xiaomi_mimo_token_plan_cn
-    credential_set: xiaomi_token_plan
-    keys_file: /data/xiaomi-token-plan-key.txt
-```
+listen: 127.0.0.1:4101
 
-`models` may contain plain public model names or structured entries when a
-relay needs an upstream model rewrite:
+client_tokens:
+  - name: local-client
+    token: <client-token>
 
-```yaml
+management:
+  admin_token: <admin-token>
+
+default_pool: relay
+default_routing_profile: default-routing
+
+routing_profiles:
+  default-routing:
+    key_selection: sticky_until_failure
+    default_credential_cooldown_seconds: 20
+    same_request_credential_retry:
+      enabled: false
+      max_retries: 0
+    route_target_retry:
+      enabled: true
+
 upstreams:
   relay:
     template: openai_compatible_bearer
     api_base: https://relay.example/v1
-    keys_file: /data/relay-key.txt
+    credential_set: relay_credentials
+    keys_file: /data/relay-keys.txt
     models:
-      - public_model: gpt-5.4-mini
-        upstream_model: provider/gpt-5.4-mini
+      - public_model: gpt-example
+        upstream_model: provider/gpt-example
 ```
 
-Relay error semantics can be selected with `relay_profile` in a policy profile,
-channel-local `error_rules`, or an `upstreams` shortcut. Phase 1A supports three
-profiles: `official_openai`, `generic_relay`, and `untrusted_relay`.
-`official_openai` preserves the default behavior where bare `401`/`403` means
-the selected credential is invalid. The relay profiles treat bare `401`/`403`
-conservatively as request-only client errors unless structured invalid-key
-evidence is present. All profiles keep structured invalid-key evidence
-credential-scoped, bare `429` credential-scoped, and code-less top-level error
-objects request-only.
-
-`balance_scope` defaults to `credential`. Credential-scoped structured quota
-evidence may use durable `quota_exhausted` lifecycle semantics for the selected
-credential. In Phase 1B, `balance_scope: channel` means selected-channel
-transient suppression: structured relay balance evidence cools down only the
-channel that was selected for the failed attempt, without quota-exhausting the
-credential and without suppressing other channels that share the same account,
-provider, or credential set. Account, provider, credential-set, and client-token
-balance scopes remain rejected. Error rules match structured status, upstream
-code, and limit-type evidence only; there is no free-form upstream message
-matcher on the request path.
-
-If every scoped route target is excluded by active selected-channel cooldown,
-the router fails closed with `503` and JSON error `code: no_route_candidate`.
-Manual or configured channel disablement remains authoritative: automatic relay
-balance suppression and cooldown expiry do not re-enable disabled or configured
-disabled channels.
-
-This Phase 1B behavior predates later relay-hardening work: Phase 2 retry
-telemetry and Phase 3 guarded 2xx response classification are layered on the
-proxy path, while Phase 4-style response-filter lifecycle handling is limited to
-explicit pre-commit rejecting actions.
-
-Phase 2 documents the retry boundary and risk observability contract. Retry
-decision telemetry is emitted as bounded management data with request/channel
-context, failure classification, the selected directive, denial reason,
-duplicate-charge risk, and effective-deadline budget. The `denial_reason` enum
-is intentionally closed to policy and safety gates: `failure_not_retryable`,
-`body_not_replayable`, `streaming_not_retryable`, `partial_output_started`,
-`attempt_limit_reached`, `policy_disabled`, `no_frozen_candidate`,
-`effective_deadline_exhausted`, `route_target_retry_disabled`, and
-`no_route_candidate`. `duplicate_charge_risk` is a conservative retry evidence
-field, not billing truth: `none` means the gateway has no completed upstream
-transaction to suspect, `known_no_charge` means typed upstream evidence proves
-the failed attempt could not have charged, and `unknown` means the retry may
-duplicate an upstream transaction because charge status cannot be proven.
-Fallback must not start unless the selected timeout profile leaves enough
-effective deadline for another attempt, and retry-pressure counters are bounded
-so fallback amplification is visible without unbounded memory growth. Phase 3
-also includes a single same-target transient retry for non-streaming replayable
-requests when a channel-scoped provider failure has no `Retry-After` cooldown
-and no frozen route target remains. It is reported as `retry_same_target`; a
-5xx upstream transaction keeps `duplicate_charge_risk=unknown`, while a local
-transport failure keeps `duplicate_charge_risk=none`. This is only a pre-output
-stability guard, not mid-stream continuation. Phase 3 adds a bounded HTTP 2xx
-success guard before success accounting: body-bearing
-2xx JSON/SSE responses are peeked up to 8192 bytes and 200 ms, obvious
-top-level structured error envelopes are classified with
-`failure_source=guarded_success_envelope`, and pass-through outcomes replay the
-peeked prefix exactly once through the response filter with stale body headers
-stripped. No-body success responses skip the guard. Response filters can remain
-purely observational (`redact`/`reject`), or an operator can opt a high-confidence
-rule into pre-commit lifecycle handling with `reject_and_expire_credential` or
-`reject_and_cooldown_channel`; those actions record redacted evidence and retry
-only through the same bounded Phase 2 gates. Live `/v1/models` aggregation
-remains unimplemented.
-
-Inspect effective policies through the existing management endpoints:
-
-```text
-GET /management/channels/{channel_id}/error-rules
-GET /management/policy-profiles/{profile_id}
-GET /management/channels/{channel_id}
-GET /management/routing/preview?model={model}
-GET /management/alerts
-```
-
-Example request:
+Send a request:
 
 ```bash
 curl http://localhost:4101/v1/chat/completions \
   -H 'Authorization: Bearer <client-token>' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.4-mini","messages":[{"role":"user","content":"ok"}]}'
-```
-
-For non-OpenAI-compatible upstreams, target a named pool:
-
-```bash
-curl http://localhost:4101/pools/anthropic/v1/messages ...
+  -d '{"model":"gpt-example","messages":[{"role":"user","content":"ok"}]}'
 ```
 
 Client configuration:
@@ -220,140 +121,134 @@ Client configuration:
 ```text
 Base URL: http://localhost:4101/v1
 API Key: <client-token>
-Model: gpt-5.4-mini or mimo-v2.5-pro
+Model: gpt-example
 ```
 
-Update a client virtual key's model scope without restarting:
+## Configuration Model
+
+The `upstreams` shortcut is a convenience layer. At startup it expands into the
+normal registry resources: provider, account, credential set, channel, policy
+profile, routing profile, and model route references. The request path sees only
+the resolved in-memory runtime state.
+
+Important resource types:
+
+- `client_tokens`: client-facing API keys and model/channel scope.
+- `credential_sets`: upstream credential sources.
+- `upstreams`: concise upstream/channel declarations.
+- `model_routes`: explicit public model ids and ordered route targets.
+- `policy_profiles`: upstream error classification and relay semantics.
+- `routing_profiles`: key selection, same-request credential retry, and
+  route-target retry behavior.
+- `response_filter`: optional successful-response redaction or rejection rules.
+
+Local mutable files should stay out of Git. Keep runtime config, key files,
+SQLite databases, JSONL logs, and generated release artifacts under ignored
+paths such as `config/`, `data/`, `db/`, `logs/`, and `dist/`.
+
+For field-level configuration notes, see
+[docs/configuration.md](docs/configuration.md).
+
+## Routing And Failure Handling
+
+The default model is conservative:
+
+- a selected credential stays sticky until typed failure evidence changes its
+  lifecycle state;
+- same-request credential retry is opt-in and only applies before response bytes
+  are sent to the client;
+- route-target retry can move to another frozen route candidate when enabled and
+  the request is replayable;
+- streaming, non-replayable, and partial-output paths do not transparently
+  fallback;
+- duplicate-charge risk is recorded as telemetry when retrying after an upstream
+  transaction whose charge status cannot be proven.
+
+Relay behavior is configured through structured evidence. The built-in
+`relay_profile` values are `official_openai`, `generic_relay`, and
+`untrusted_relay`. `balance_scope: credential` treats structured quota evidence
+as selected-credential lifecycle state. `balance_scope: channel` treats
+structured relay balance evidence as transient selected-channel suppression.
+
+For the complete runtime contract, see
+[docs/technical-design.md](docs/technical-design.md).
+
+## Operations
+
+Management endpoints require the management bearer token and are redaction
+boundaries. They expose stable ids, counts, states, reason codes, health,
+runtime reload, discovery, route preview, and lifecycle operations. They must
+not expose raw upstream keys, raw client tokens, raw request bodies, raw response
+bodies, absolute key-file paths, or token-like URL components.
+
+Model discovery is management-only and does not change client traffic by itself.
+Use sync planning/apply and runtime reload only when discovered models should be
+staged as explicit public routes.
+
+Core health endpoints:
+
+- `GET /health`: process liveness.
+- `GET /ready`: serving readiness compatibility endpoint.
+- `GET /management/health/serving`: authenticated serving explanation.
+- `GET /management/health/resilience`: authenticated resilience summary.
+- `GET /management/alerts`: operator-input and degraded-state alerts.
+
+`/ready` can remain ready while `/management/alerts` reports that a credential
+set needs replacement credentials. That means the process can still serve some
+traffic, but operator action is needed to restore spare capacity.
+
+For the management endpoint matrix and runtime-state semantics, see
+[docs/architecture.md](docs/architecture.md). For response-filter operations,
+see [docs/response-filter.md](docs/response-filter.md).
+
+## Local Verification
+
+Run the full local check before committing behavior changes:
 
 ```bash
-curl -sS http://localhost:4101/management/client-tokens/{token_id} \
-  -X PATCH \
-  -H 'Authorization: Bearer <admin-token>' \
-  -H 'Content-Type: application/json' \
-  -d '{"allowed_model_groups":["gpt-5.4-mini","mimo-v2.5-pro"]}' | jq
+scripts/local-ci.sh
 ```
 
-`allowed_model_groups` and `allowed_channels` are partial-update fields. Omit a
-field to keep its current value. Pass an empty array deliberately to make that
-dimension unrestricted.
+The script runs formatting, locked dependency checking, clippy with warnings as
+errors, and the full test suite.
 
-Discover models exposed by one OpenAI-compatible upstream channel without
-changing routing or persistent config:
+## Release Build
+
+The only supported Linux x86_64 release path is the local Docker/Nix wrapper:
 
 ```bash
-curl -sS http://localhost:4101/management/channels/ai2_hhhl/model-discovery \
-  -X POST \
-  -H 'Authorization: Bearer <admin-token>' | jq
+scripts/build-release-x86_64-linux-docker.sh
 ```
 
-The discovery response is redacted and read-only. Use it to decide which
-`model_routes` and client-token scopes to manage; it does not auto-add routes.
-If an upstream returns a 2xx response that is not an OpenAI-style model catalog,
-the response keeps `models` empty and reports a structured
-`catalog_unsupported_or_malformed` error instead of guessing model names from
-free-form provider output.
+The build writes:
 
-Preview how discovered models would map into explicit model routes without
-writing registry state:
-
-```bash
-curl -sS http://localhost:4101/management/model-discovery/sync-plan \
-  -X POST \
-  -H 'Authorization: Bearer <admin-token>' \
-  -H 'Content-Type: application/json' \
-  -d '{"channel_ids":["ai2_hhhl"]}' | jq
+```text
+dist/one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz
+dist/one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
-The sync plan returns `would_create_route`, `would_add_target`, or `unchanged`
-actions for each discovered model/channel pair. It is intentionally read-only:
-use `sync-apply` when you want discovery to stage route changes in the writable
-registry store.
+Publish those files to a GitHub release. Servers should consume the release
+artifact; do not compile on low-resource gateway hosts. Details are in
+[docs/release-build.md](docs/release-build.md).
 
-Apply discovered route changes to the staged registry without hot-reloading
-runtime:
+## Documentation
 
-```bash
-curl -sS http://localhost:4101/management/model-discovery/sync-apply \
-  -X POST \
-  -H 'Authorization: Bearer <admin-token>' \
-  -H 'Content-Type: application/json' \
-  -d '{"channel_ids":["ai2_hhhl"]}' | jq
-```
+- [Technical design](docs/technical-design.md): concepts, request lifecycle,
+  routing, credential lifecycle, management state, and extension rules.
+- [Configuration](docs/configuration.md): YAML resource model, upstream
+  shortcuts, profiles, stores, limits, and local secret handling.
+- [Architecture notes](docs/architecture.md): deeper module-level design and
+  management API boundaries.
+- [Response filter](docs/response-filter.md): successful-response filtering,
+  pre-commit rejection actions, event boundaries, and alert semantics.
+- [Performance budget](docs/performance-budget.md): request-path and memory
+  constraints.
+- [Release build](docs/release-build.md): local x86_64 Docker/Nix release
+  contract.
 
-`sync-apply` creates missing routes and appends missing channel targets in one
-validated registry transaction. It does not update virtual-key scope and does
-not affect client traffic until `POST /management/runtime/reload` or a process
-restart applies the staged registry.
+## Project Metadata
 
-Client-facing `/v1/models` remains a compiled runtime projection over explicit
-`model_routes` filtered by the authenticated client token. It does not call
-upstream `/v1/models`; upstream discovery is available only through the
-management-only discovery and sync endpoints above.
-
-Credential rotation runbook:
-
-If local configuration enables a writable SQLite credential store, replacement
-keys can be added through the management API without editing the original key
-files or restarting the router.
-
-Check whether operator input is needed:
-
-```bash
-curl -sS http://localhost:4101/management/alerts \
-  -H 'Authorization: Bearer <admin-token>' | jq
-```
-
-In a local configuration where a credential set has only one credential,
-`/ready` can still report `ready` while `/management/alerts` reports a
-`credential_set_transition_required` warning. That means the router is serving,
-but the upstream has no spare validated key. Import at least one replacement
-credential per affected set to clear the operator-input warning and make
-failover useful.
-
-Inspect one credential set's operational state:
-
-```bash
-curl -sS http://localhost:4101/management/credential-sets/ai2_test/operations \
-  -H 'Authorization: Bearer <admin-token>' | jq
-```
-
-List redacted credentials in a credential set:
-
-```bash
-curl -sS 'http://localhost:4101/management/credential-sets/ai2_test/credentials?state=all' \
-  -H 'Authorization: Bearer <admin-token>' | jq
-```
-
-Import a replacement AI2 relay key:
-
-```bash
-curl -sS http://localhost:4101/management/credential-sets/ai2_test/credentials/import \
-  -H 'Authorization: Bearer <admin-token>' \
-  -H 'Content-Type: application/json' \
-  -d '{"keys":["<upstream-api-key>"],"batch_id":"ai2-rotation-001"}' | jq
-```
-
-Import a replacement Xiaomi Token Plan key:
-
-```bash
-curl -sS http://localhost:4101/management/credential-sets/xiaomi_token_plan/credentials/import \
-  -H 'Authorization: Bearer <admin-token>' \
-  -H 'Content-Type: application/json' \
-  -d '{"keys":["<upstream-api-key>"],"batch_id":"xiaomi-rotation-001"}' | jq
-```
-
-Manually expire a known bad credential after copying its redacted `credential_id`
-from the list endpoint:
-
-```bash
-curl -sS http://localhost:4101/management/credential-sets/ai2_test/credentials/{credential_id}/expire \
-  -H 'Authorization: Bearer <admin-token>' \
-  -H 'Content-Type: application/json' \
-  -d '{"reason":"upstream key rotated"}' | jq
-```
-
-The import response includes an `operations` summary. If it reports
-`accepting_requests: true`, existing valid credentials still serve traffic while
-the pool is degraded. If it reports `accepting_requests: false`, the credential
-set is exhausted and the client API should be treated as stopped until valid
-credentials are imported or restored.
+- Source: https://github.com/hechuyi/one-ai-key
+- Releases: https://github.com/hechuyi/one-ai-key/releases
+- Issues: https://github.com/hechuyi/one-ai-key/issues
+- License: not declared in this repository.

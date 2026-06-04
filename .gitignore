@@ -41,6 +41,13 @@ AGENTS.md
 *.tmp
 .DS_Store
 
+# Local documentation renders/exports.
+/docs/export/
+/docs/rendered/
+/docs/screenshots/
+*.docx
+*.pdf
+
 # Python cache.
 __pycache__/
 *.py[cod]
