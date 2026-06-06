@@ -4,6 +4,7 @@ use reqwest::RequestBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::endpoint_capabilities::ResolvedEndpointCapabilities;
 use crate::error::{ClassifiedFailure, ErrorClassifier};
 use crate::model_catalog::{openai_model_catalog_from_body, ParsedModelCatalog};
 
@@ -21,6 +22,15 @@ impl ProviderKind {
         match self {
             ProviderKind::OpenAiCompatible => "openai_compatible",
             ProviderKind::GenericHttp => "generic_http",
+        }
+    }
+
+    pub fn default_endpoint_capabilities(self) -> ResolvedEndpointCapabilities {
+        match self {
+            ProviderKind::OpenAiCompatible => {
+                ResolvedEndpointCapabilities::openai_compatible_default()
+            }
+            ProviderKind::GenericHttp => ResolvedEndpointCapabilities::generic_http_default(),
         }
     }
 }

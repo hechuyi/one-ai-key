@@ -90,7 +90,7 @@ enum UpstreamCommonAdapterKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedUpstreamSiteKind {
-    Ai2Hhhl,
+    GenericRelayCn,
     DeepseekOfficial,
     XiaomiMimoTokenPlanCn,
 }
@@ -144,8 +144,8 @@ const UPSTREAM_COMMON_ADAPTER_REGISTRY: &[UpstreamCommonAdapterTemplateEntry] = 
 
 const MANAGED_UPSTREAM_SITE_REGISTRY: &[ManagedUpstreamSiteTemplateEntry] = &[
     ManagedUpstreamSiteTemplateEntry {
-        name: "ai2_hhhl",
-        kind: ManagedUpstreamSiteKind::Ai2Hhhl,
+        name: "generic_relay_cn",
+        kind: ManagedUpstreamSiteKind::GenericRelayCn,
         adapter_kind: UpstreamCommonAdapterKind::OpenAiCompatibleBearer,
     },
     ManagedUpstreamSiteTemplateEntry {
@@ -269,6 +269,11 @@ fn expand_in_value(
             "pools",
             channel_id.clone(),
             PoolConfig {
+                endpoint_capabilities: template
+                    .adapter
+                    .provider_kind
+                    .default_endpoint_capabilities()
+                    .to_config(),
                 enabled: upstream.enabled,
                 account: Some(account_id),
                 policy_profile: policy_profile_id,
@@ -410,19 +415,19 @@ impl ManagedUpstreamSiteKind {
 
     fn site_override(self) -> UpstreamSiteOverride {
         match self {
-            Self::Ai2Hhhl => ai2_hhhl_site_override(),
+            Self::GenericRelayCn => generic_relay_cn_site_override(),
             Self::DeepseekOfficial => deepseek_official_site_override(),
             Self::XiaomiMimoTokenPlanCn => xiaomi_mimo_token_plan_cn_site_override(),
         }
     }
 }
 
-fn ai2_hhhl_site_override() -> UpstreamSiteOverride {
+fn generic_relay_cn_site_override() -> UpstreamSiteOverride {
     UpstreamSiteOverride {
-        provider_id: Some("ai2_hhhl"),
-        api_base: Some("https://ai2.hhhl.cc/v1"),
-        policy_profile_id: Some("hhhl-openai-compatible"),
-        policy_profile: Some(hhhl_policy_profile()),
+        provider_id: Some("generic_relay_cn"),
+        api_base: Some("https://relay.example/v1"),
+        policy_profile_id: Some("generic-relay-cn"),
+        policy_profile: Some(generic_relay_cn_policy_profile()),
         default_models: &[],
     }
 }
@@ -555,7 +560,7 @@ fn section_mapping_mut<'a>(
         .ok_or_else(|| anyhow::anyhow!("{section} must be a YAML mapping"))
 }
 
-fn hhhl_policy_profile() -> PolicyProfileConfig {
+fn generic_relay_cn_policy_profile() -> PolicyProfileConfig {
     PolicyProfileConfig {
         error_rules: ErrorRulesConfig {
             relay_profile: None,
@@ -679,10 +684,10 @@ management:
         for template_token in [
             "openai_compatible_bearer",
             "openai_compatible_api_key",
-            "ai2_hhhl",
+            "generic_relay_cn",
             "deepseek_official",
             "xiaomi_mimo_token_plan_cn",
-            "ai2.hhhl.cc",
+            "relay.example",
             "api.deepseek.com",
             "xiaomimimo.com",
         ] {
@@ -768,6 +773,41 @@ upstreams:
         assert_eq!(cfg.model_routes["relay-model"].targets[0].channel, "relay");
         assert!(!cfg.providers.contains_key("xiaomi_mimo"));
         assert!(!cfg.policy_profiles.contains_key("xiaomi-mimo-token-plan"));
+    }
+
+    #[test]
+    fn endpoint_capabilities_expand_template_defaults() {
+        let raw = local_fixture_config_yaml(
+            r#"
+default_pool: relay
+upstreams:
+  relay:
+    template: openai_compatible_bearer
+    api_base: https://relay.example/v1
+    keys_file: data/relay-key.txt
+    models:
+      - relay-model
+"#,
+        );
+
+        let expanded = expand_raw_yaml(&raw).unwrap();
+        let cfg: AppConfig = serde_yaml::from_str(&expanded).unwrap();
+        let capabilities = &cfg.pools["relay"].endpoint_capabilities;
+
+        assert_eq!(
+            capabilities.chat_completions,
+            Some(crate::endpoint_capabilities::EndpointSupport::Supported)
+        );
+        assert_eq!(
+            capabilities.responses,
+            Some(crate::endpoint_capabilities::EndpointSupport::Unknown)
+        );
+        assert_eq!(
+            capabilities.models,
+            Some(crate::endpoint_capabilities::ModelsEndpointCapability::LocalProjection)
+        );
+        assert!(!expanded.contains("deepseek-chat"));
+        assert!(!expanded.contains("deepseek-reasoner"));
     }
 
     #[test]

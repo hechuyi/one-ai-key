@@ -456,6 +456,49 @@ impl CredentialStoreHandle {
         }
     }
 
+    pub async fn load_credential_resource_by_position(
+        &self,
+        credential_set_id: CredentialSetId,
+        position: usize,
+    ) -> Result<Option<CredentialResourceRecord>, CredentialStoreError> {
+        match self {
+            CredentialStoreHandle::ReadOnlyFileBootstrap => Err(CredentialStoreError::NotWritable),
+            CredentialStoreHandle::Sqlite(store) => {
+                let store = store.clone();
+                tokio::task::spawn_blocking(move || {
+                    store
+                        .repository
+                        .load_credential_resource_by_position(&credential_set_id, position)
+                })
+                .await
+                .map_err(|err| CredentialStoreError::Persistence(err.to_string()))?
+                .map_err(|err| CredentialStoreError::Persistence(err.to_string()))
+            }
+        }
+    }
+
+    pub async fn load_credential_positions_for_credentials(
+        &self,
+        credential_set_id: CredentialSetId,
+        credential_ids: Vec<CredentialId>,
+    ) -> Result<HashMap<CredentialId, usize>, CredentialStoreError> {
+        match self {
+            CredentialStoreHandle::ReadOnlyFileBootstrap => Err(CredentialStoreError::NotWritable),
+            CredentialStoreHandle::Sqlite(store) => {
+                let store = store.clone();
+                tokio::task::spawn_blocking(move || {
+                    store.repository.load_credential_positions_for_credentials(
+                        &credential_set_id,
+                        &credential_ids,
+                    )
+                })
+                .await
+                .map_err(|err| CredentialStoreError::Persistence(err.to_string()))?
+                .map_err(|err| CredentialStoreError::Persistence(err.to_string()))
+            }
+        }
+    }
+
     pub async fn update_credential_operator_metadata(
         &self,
         credential_set_id: CredentialSetId,
@@ -885,6 +928,30 @@ impl SqliteCredentialRepository {
         let connection = self.connect()?;
         initialize_schema(&connection)?;
         load_sqlite_credential_resource(&connection, credential_set_id, credential_id)
+    }
+
+    pub fn load_credential_resource_by_position(
+        &self,
+        credential_set_id: &CredentialSetId,
+        position: usize,
+    ) -> anyhow::Result<Option<CredentialResourceRecord>> {
+        let connection = self.connect()?;
+        initialize_schema(&connection)?;
+        load_sqlite_credential_resource_by_position(&connection, credential_set_id, position)
+    }
+
+    pub fn load_credential_positions_for_credentials(
+        &self,
+        credential_set_id: &CredentialSetId,
+        credential_ids: &[CredentialId],
+    ) -> anyhow::Result<HashMap<CredentialId, usize>> {
+        let connection = self.connect()?;
+        initialize_schema(&connection)?;
+        load_sqlite_credential_positions_for_credentials(
+            &connection,
+            credential_set_id,
+            credential_ids,
+        )
     }
 
     pub fn update_credential_operator_metadata(
@@ -2267,6 +2334,103 @@ fn load_sqlite_credential_resource(
         })
         .optional()
         .map_err(Into::into)
+}
+
+fn load_sqlite_credential_resource_by_position(
+    connection: &Connection,
+    credential_set_id: &CredentialSetId,
+    position: usize,
+) -> anyhow::Result<Option<CredentialResourceRecord>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            credential_id,
+            source_path,
+            source_line,
+            batch_id,
+            fingerprint,
+            label,
+            note,
+            position,
+            first_imported_at_unix_seconds,
+            last_seen_at_unix_seconds
+        FROM credentials
+        WHERE credential_set_id = ?1 AND position = ?2
+        "#,
+    )?;
+    statement
+        .query_row(params![credential_set_id.0, position as i64], |row| {
+            let stored_credential_id: String = row.get(0)?;
+            let source_path: Option<String> = row.get(1)?;
+            let source_line: Option<i64> = row.get(2)?;
+            let batch_id: Option<String> = row.get(3)?;
+            let fingerprint: String = row.get(4)?;
+            let label: Option<String> = row.get(5)?;
+            let note: Option<String> = row.get(6)?;
+            let position: i64 = row.get(7)?;
+            let first_imported_at_unix_seconds: i64 = row.get(8)?;
+            let last_seen_at_unix_seconds: i64 = row.get(9)?;
+            Ok(CredentialResourceRecord {
+                credential_set_id: credential_set_id.clone(),
+                credential_id: CredentialId(stored_credential_id),
+                fingerprint,
+                label,
+                note,
+                source_ref: source_path
+                    .as_deref()
+                    .and_then(|path| redacted_source_ref(std::path::Path::new(path))),
+                source_line: source_line.map(|line| line as usize),
+                batch_id,
+                position: position as usize,
+                first_imported_at_unix_seconds,
+                last_seen_at_unix_seconds,
+            })
+        })
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_sqlite_credential_positions_for_credentials(
+    connection: &Connection,
+    credential_set_id: &CredentialSetId,
+    credential_ids: &[CredentialId],
+) -> anyhow::Result<HashMap<CredentialId, usize>> {
+    if credential_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let requested: Vec<&CredentialId> = credential_ids
+        .iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let placeholders = (0..requested.len())
+        .map(|index| format!("?{}", index + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT credential_id, position
+        FROM credentials
+        WHERE credential_set_id = ?1 AND credential_id IN ({placeholders})
+        "#
+    );
+    let mut query_params = Vec::with_capacity(requested.len() + 1);
+    query_params.push(Value::Text(credential_set_id.0.clone()));
+    query_params.extend(
+        requested
+            .iter()
+            .map(|credential_id| Value::Text(credential_id.0.clone())),
+    );
+
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(query_params.iter()), |row| {
+        let credential_id: String = row.get(0)?;
+        let position: i64 = row.get(1)?;
+        Ok((CredentialId(credential_id), position as usize))
+    })?;
+    let positions = rows.collect::<rusqlite::Result<HashMap<_, _>>>()?;
+    Ok(positions)
 }
 
 fn insert_probe_result(

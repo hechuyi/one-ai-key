@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 
 use crate::{
     config::ResolvedClientToken,
+    endpoint_capabilities::EndpointCapabilitiesStatus,
     management_errors::ManagementServiceError,
     management_status::{
         add_key_pool_snapshot_counts, channel_health_status, channel_health_status_from_health,
@@ -37,6 +38,8 @@ pub struct ModelRouteTargetStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
     pub provider_kind: ProviderKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_capabilities: Option<EndpointCapabilitiesStatus>,
     pub priority: u16,
     pub weight: u16,
     pub enabled: bool,
@@ -45,6 +48,8 @@ pub struct ModelRouteTargetStatus {
 
 pub async fn model_routes_response(state: &AppState) -> ModelRoutesResponse {
     let context = state.channels.model_routes_context();
+    let endpoint_capabilities =
+        endpoint_capabilities_by_channel(state, context.registry_generation);
     let routes = context
         .routes
         .into_iter()
@@ -56,11 +61,17 @@ pub async fn model_routes_response(state: &AppState) -> ModelRoutesResponse {
                 .targets
                 .into_iter()
                 .map(|target| {
+                    let channel_id = target.channel_id.0;
                     let health = route_context_health_status(
-                        route_context.target_health[&target.channel_id].clone(),
+                        route_context
+                            .target_health
+                            .get(&ChannelId(channel_id.clone()))
+                            .cloned()
+                            .flatten(),
                     );
                     ModelRouteTargetStatus {
-                        channel_id: target.channel_id.0,
+                        endpoint_capabilities: endpoint_capabilities.get(&channel_id).cloned(),
+                        channel_id,
                         upstream_model: target.upstream_model,
                         provider_kind: target.provider_kind,
                         priority: target.priority,
@@ -321,8 +332,12 @@ pub async fn routing_preview_for_model(
         candidate_limit: state.routing.max_route_candidates,
     });
 
-    let channel_statuses =
-        routing_preview_channel_statuses_for_candidates(state, &preview.candidates).await;
+    let channel_statuses = routing_preview_channel_statuses_for_candidates(
+        state,
+        preview.registry_generation,
+        &preview.candidates,
+    )
+    .await;
     let policy_summary = routing_preview_policy_summary(
         &channel_statuses,
         &preview.candidates,
@@ -354,6 +369,8 @@ pub struct RoutingPreviewCandidateStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
     pub provider_kind: ProviderKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_capabilities: Option<EndpointCapabilitiesStatus>,
     pub priority: u16,
     pub weight: u16,
     pub target_enabled: bool,
@@ -372,11 +389,13 @@ pub fn routing_preview_candidate_status(
     candidate: RoutePreviewCandidate,
     status: RoutingPreviewChannelStatus,
 ) -> RoutingPreviewCandidateStatus {
+    let channel_id = candidate.channel_id.0;
     RoutingPreviewCandidateStatus {
         target_index: candidate.target_index,
-        channel_id: candidate.channel_id.0,
+        channel_id,
         upstream_model: candidate.upstream_model,
         provider_kind: candidate.provider_kind,
+        endpoint_capabilities: status.endpoint_capabilities,
         priority: candidate.priority,
         weight: candidate.weight,
         target_enabled: candidate.target_enabled,
@@ -398,6 +417,7 @@ pub fn routing_preview_candidate_status(
 #[derive(Debug, Clone)]
 pub struct RoutingPreviewChannelStatus {
     pub health: ChannelHealthStatus,
+    pub endpoint_capabilities: Option<EndpointCapabilitiesStatus>,
     pub credential_set_id: String,
     pub selector_generation: u64,
     pub credentials: RuntimeCredentialCounts,
@@ -418,6 +438,7 @@ impl RoutingPreviewChannelStatus {
                 suppression_count: 0,
                 generation: 0,
             },
+            endpoint_capabilities: None,
             credential_set_id: String::new(),
             selector_generation: 0,
             credentials: RuntimeCredentialCounts::default(),
@@ -430,6 +451,7 @@ impl RoutingPreviewChannelStatus {
 
 pub async fn routing_preview_channel_statuses_for_candidates(
     state: &AppState,
+    expected_registry_generation: u64,
     candidates: &[RoutePreviewCandidate],
 ) -> HashMap<String, RoutingPreviewChannelStatus> {
     let mut channel_statuses: HashMap<String, RoutingPreviewChannelStatus> = HashMap::new();
@@ -437,7 +459,12 @@ pub async fn routing_preview_channel_statuses_for_candidates(
         if channel_statuses.contains_key(&candidate.channel_id.0) {
             continue;
         }
-        let status = routing_preview_channel_status(state, &candidate.channel_id.0).await;
+        let status = routing_preview_channel_status(
+            state,
+            expected_registry_generation,
+            &candidate.channel_id.0,
+        )
+        .await;
         channel_statuses.insert(candidate.channel_id.0.clone(), status);
     }
     channel_statuses
@@ -445,8 +472,11 @@ pub async fn routing_preview_channel_statuses_for_candidates(
 
 pub async fn routing_preview_channel_status(
     state: &AppState,
+    expected_registry_generation: u64,
     channel_id: &str,
 ) -> RoutingPreviewChannelStatus {
+    let endpoint_capabilities =
+        endpoint_capability_status_for_channel(state, channel_id, expected_registry_generation);
     match state.channels.get(channel_id) {
         Some(pool_state) => {
             let snapshot = pool_state.pool.lock().await.snapshot();
@@ -454,6 +484,7 @@ pub async fn routing_preview_channel_status(
             add_key_pool_snapshot_counts(&mut credentials, snapshot);
             RoutingPreviewChannelStatus {
                 health: channel_health_status(&pool_state),
+                endpoint_capabilities,
                 credential_set_id: pool_state.credential_set_id.0.clone(),
                 selector_generation: pool_state.selector_generation.load(Ordering::Acquire),
                 credentials,
@@ -465,6 +496,38 @@ pub async fn routing_preview_channel_status(
         }
         None => RoutingPreviewChannelStatus::unknown_channel(),
     }
+}
+
+fn endpoint_capabilities_by_channel(
+    state: &AppState,
+    expected_registry_generation: u64,
+) -> HashMap<String, EndpointCapabilitiesStatus> {
+    let (registry_generation, capabilities) =
+        state.runtime_catalogs.channel_endpoint_capabilities();
+    if registry_generation != expected_registry_generation {
+        return HashMap::new();
+    }
+    capabilities
+        .into_iter()
+        .map(|(channel_id, capabilities)| {
+            (channel_id, EndpointCapabilitiesStatus::from(&capabilities))
+        })
+        .collect()
+}
+
+fn endpoint_capability_status_for_channel(
+    state: &AppState,
+    channel_id: &str,
+    expected_registry_generation: u64,
+) -> Option<EndpointCapabilitiesStatus> {
+    let (registry_generation, capabilities) =
+        state.runtime_catalogs.channel_endpoint_capabilities();
+    if registry_generation != expected_registry_generation {
+        return None;
+    }
+    capabilities
+        .get(channel_id)
+        .map(EndpointCapabilitiesStatus::from)
 }
 
 pub fn routing_preview_policy_summary(

@@ -6,19 +6,27 @@
 # Runtime state and local databases.
 /data/
 /postgres_data/
+*.keys
 *.sqlite
+*.sqlite*
 *.sqlite3
+*.sqlite3*
 *.db
+*.db*
 *.db-*
+*.wal
+*.shm
 
 # Local deployment/configuration with real credentials.
 /.env
 /.env.*
+/.env*
 /config.yaml
 /docker-compose.override.yml
 /key-pool-router/
 /keys/
 /config/*.yaml
+/config/*.yml
 /config/*.json
 /config/*.toml
 /scripts/one_ai_key_keys.py
@@ -36,6 +44,7 @@ AGENTS.md
 /db/
 /logs/
 *.log
+*.log*
 *.log.*
 *.pid
 *.tmp
@@ -45,6 +54,10 @@ AGENTS.md
 /docs/export/
 /docs/rendered/
 /docs/screenshots/
+/snapshots/
+/golden/
+/tests/snapshots/
+/tests/golden/
 *.docx
 *.pdf
 

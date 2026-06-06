@@ -53,7 +53,8 @@ if [[ -z "${PACKAGE_NAME}" || -z "${VERSION}" ]]; then
 fi
 TARGET=${TARGET:-x86_64-unknown-linux-gnu}
 DIST_DIR="${REPO_ROOT}/dist"
-BUILD_BIN="${REPO_ROOT}/target/${TARGET}/release/${PACKAGE_NAME}"
+CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/one-ai-key-cargo-target}
+BUILD_BIN="${CARGO_TARGET_DIR}/${TARGET}/release/${PACKAGE_NAME}"
 ARCHIVE_NAME="${PACKAGE_NAME}-${VERSION}-${TARGET}.tar.gz"
 ARCHIVE_PATH="${DIST_DIR}/${ARCHIVE_NAME}"
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}

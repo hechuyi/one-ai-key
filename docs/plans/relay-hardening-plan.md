@@ -1,6 +1,6 @@
 # Relay Hardening Implementation Plan
 
-> **Execution rule:** implement this plan task-by-task with review between phases. This document is a plan only; it does not authorize remote-server changes, SSH testing, or server-side builds.
+> **Execution rule:** implement this plan task-by-task with review between phases. This document is a plan only; it does not authorize deployment-server changes, SSH testing, or server-side builds.
 
 **Goal:** harden one-ai-key for real relay usage while preserving its lightweight personal/small-team AI key router boundary.
 
@@ -43,8 +43,8 @@ OpenTelemetry contributes the event-contract lesson: events need stable names, b
 
 ## Non-Negotiable Constraints
 
-- Do not touch the remote gateway server during implementation or testing for this roadmap.
-- Build and test locally. Release artifacts must be built in the local x86_64 NixOS container, not on the gateway server or a remote builder.
+- Do not touch deployment servers during implementation or testing for this roadmap.
+- Build and test locally. Release artifacts must be built in the local x86_64 NixOS container, not on deployment servers or remote builders.
 - Do not commit raw upstream keys, client tokens, management tokens, local config, SQLite databases, JSONL event logs, release artifacts, private agent files, or generated `dist/` output.
 - Do not make `/v1/models` call upstream providers. It remains a compiled runtime projection filtered by the authenticated client token.
 - Do not add request-path disk I/O, request-path YAML/registry/client-token/credential-store joins, request-path upstream model discovery, or full buffering of successful responses.

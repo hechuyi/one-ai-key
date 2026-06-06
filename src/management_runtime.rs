@@ -586,15 +586,19 @@ pub fn runtime_reload_response(parts: RuntimeReloadResponseParts) -> RuntimeRelo
 pub async fn reload_runtime(
     state: &AppState,
     actor: ManagementEventActor,
+    expected_staged_registry_version: Option<u64>,
 ) -> Result<RuntimeReloadResponse, ManagementServiceError> {
-    let result = apply_runtime_reload(state, actor).await;
+    let result = apply_runtime_reload(state, actor, expected_staged_registry_version).await;
     match result {
         Ok(response) => {
             state.record_runtime_reload_success(current_unix_seconds());
             Ok(response)
         }
         Err(err) => {
-            state.record_runtime_reload_failure(current_unix_seconds(), "runtime_reload_failed");
+            if err.records_runtime_reload_failure() {
+                state
+                    .record_runtime_reload_failure(current_unix_seconds(), "runtime_reload_failed");
+            }
             Err(err)
         }
     }
@@ -603,12 +607,23 @@ pub async fn reload_runtime(
 async fn apply_runtime_reload(
     state: &AppState,
     actor: ManagementEventActor,
+    expected_staged_registry_version: Option<u64>,
 ) -> Result<RuntimeReloadResponse, ManagementServiceError> {
     let staged_registry_version = state
         .registry_store
         .current_version()
         .await
         .map_err(registry_store_error)?;
+    let Some(expected_staged_registry_version) = expected_staged_registry_version else {
+        return Err(ManagementServiceError::PreconditionFailed(
+            "runtime reload requires expected_staged_registry_version precondition".to_string(),
+        ));
+    };
+    if staged_registry_version != Some(expected_staged_registry_version) {
+        return Err(ManagementServiceError::PreconditionFailed(format!(
+            "runtime reload precondition failed: staged registry version changed from {expected_staged_registry_version} to {staged_registry_version:?}"
+        )));
+    }
     let Some(staged_registry_document) = state
         .registry_store
         .load_registry_for_validation()

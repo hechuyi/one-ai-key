@@ -15,6 +15,7 @@ use crate::{
     credential_repository::{
         CredentialRepository, CredentialSetId, CredentialSetSource, KeyImport, KeyImportReport,
     },
+    endpoint_capabilities::{EndpointCapabilitiesConfig, ResolvedEndpointCapabilities},
     error::{
         BalanceScope, ErrorAdaptationAction, ErrorAdaptationMatcher, ErrorAdaptationRule,
         ErrorClassifier, ErrorClassifierSpec, FailureKind, FailureScope, RelayProfile,
@@ -215,6 +216,8 @@ pub struct AccountConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PoolConfig {
+    #[serde(default)]
+    pub endpoint_capabilities: EndpointCapabilitiesConfig,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default)]
@@ -532,6 +535,7 @@ pub struct ResolvedPoolConfig {
     pub routing_policy_sources: ResolvedRoutingPolicySources,
     pub credential_set_id: CredentialSetId,
     pub provider_kind: ProviderKind,
+    pub endpoint_capabilities: ResolvedEndpointCapabilities,
     pub auth_header: String,
     pub auth_prefix: String,
     pub error_classifier: ErrorClassifier,
@@ -1028,6 +1032,11 @@ impl AppConfig {
         for (name, pool) in pool_entries {
             let credential_set_id = resolve_pool_credential_set_id(&name, &pool)?;
             let resolved_account = resolve_pool_account(&name, &pool, &providers, &accounts)?;
+            let endpoint_capabilities = pool.endpoint_capabilities.resolve_with_base(
+                resolved_account
+                    .provider_kind
+                    .default_endpoint_capabilities(),
+            )?;
             let routing_profile_id =
                 resolve_pool_routing_profile_id(&name, &pool, default_routing_profile.as_deref())?;
             let routing_profile = routing_profiles.get(&routing_profile_id).ok_or_else(|| {
@@ -1065,15 +1074,16 @@ impl AppConfig {
             pools.insert(
                 name.clone(),
                 ResolvedPoolConfig {
-                    config_generation: channel_config_generation(
-                        &name,
-                        pool.enabled,
-                        &resolved_account,
-                        &credential_set_id,
-                        &routing_profile_id,
-                        &routing_policy,
-                        &effective_error_rules,
-                    ),
+                    config_generation: channel_config_generation(ChannelConfigGenerationInput {
+                        channel_id: &name,
+                        configured_enabled: pool.enabled,
+                        account: &resolved_account,
+                        endpoint_capabilities: &endpoint_capabilities,
+                        credential_set_id: &credential_set_id,
+                        routing_profile_id: &routing_profile_id,
+                        routing_policy: &routing_policy,
+                        error_rules: &effective_error_rules,
+                    }),
                     configured_enabled: pool.enabled,
                     provider_id: resolved_account.provider_id,
                     account_id: resolved_account.account_id,
@@ -1089,6 +1099,7 @@ impl AppConfig {
                         profile_id: routing_profile_id,
                     },
                     provider_kind: resolved_account.provider_kind,
+                    endpoint_capabilities,
                     auth_header: resolved_account.endpoint.auth_header,
                     auth_prefix: resolved_account.endpoint.auth_prefix,
                     error_classifier: effective_error_rules.into_classifier_with_context(
@@ -1801,37 +1812,53 @@ fn resolve_pool_account(
     })
 }
 
-fn channel_config_generation(
-    channel_id: &str,
+struct ChannelConfigGenerationInput<'a> {
+    channel_id: &'a str,
     configured_enabled: bool,
-    account: &ResolvedUpstreamAccount,
-    credential_set_id: &CredentialSetId,
-    routing_profile_id: &str,
-    routing_policy: &RoutingPolicy,
-    error_rules: &ErrorRulesConfig,
-) -> u64 {
+    account: &'a ResolvedUpstreamAccount,
+    endpoint_capabilities: &'a ResolvedEndpointCapabilities,
+    credential_set_id: &'a CredentialSetId,
+    routing_profile_id: &'a str,
+    routing_policy: &'a RoutingPolicy,
+    error_rules: &'a ErrorRulesConfig,
+}
+
+fn channel_config_generation(input: ChannelConfigGenerationInput<'_>) -> u64 {
     let mut hasher = DefaultHasher::new();
-    channel_id.hash(&mut hasher);
-    configured_enabled.hash(&mut hasher);
-    account.provider_id.hash(&mut hasher);
-    account.account_id.hash(&mut hasher);
-    account.account_enabled.hash(&mut hasher);
-    account.provider_kind.stable_id_fragment().hash(&mut hasher);
-    account.endpoint.api_base.hash(&mut hasher);
-    account.endpoint.auth_header.hash(&mut hasher);
-    account.endpoint.auth_prefix.hash(&mut hasher);
-    credential_set_id.0.hash(&mut hasher);
-    routing_profile_id.hash(&mut hasher);
-    routing_policy
+    input.channel_id.hash(&mut hasher);
+    input.configured_enabled.hash(&mut hasher);
+    input.account.provider_id.hash(&mut hasher);
+    input.account.account_id.hash(&mut hasher);
+    input.account.account_enabled.hash(&mut hasher);
+    input
+        .account
+        .provider_kind
+        .stable_id_fragment()
+        .hash(&mut hasher);
+    input.account.endpoint.api_base.hash(&mut hasher);
+    input.account.endpoint.auth_header.hash(&mut hasher);
+    input.account.endpoint.auth_prefix.hash(&mut hasher);
+    input.endpoint_capabilities.hash(&mut hasher);
+    input.credential_set_id.0.hash(&mut hasher);
+    input.routing_profile_id.hash(&mut hasher);
+    input
+        .routing_policy
         .retry_switched_key_in_same_request
         .hash(&mut hasher);
-    routing_policy.max_same_request_retries.hash(&mut hasher);
-    routing_policy.route_target_retry_enabled.hash(&mut hasher);
-    routing_policy
+    input
+        .routing_policy
+        .max_same_request_retries
+        .hash(&mut hasher);
+    input
+        .routing_policy
+        .route_target_retry_enabled
+        .hash(&mut hasher);
+    input
+        .routing_policy
         .default_credential_cooldown
         .as_secs()
         .hash(&mut hasher);
-    format!("{error_rules:?}").hash(&mut hasher);
+    format!("{:?}", input.error_rules).hash(&mut hasher);
     match hasher.finish() {
         0 => 1,
         generation => generation,
@@ -2226,6 +2253,73 @@ pools:
         assert!(
             err.to_string().contains("unknown field"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn endpoint_capabilities_parse_static_config() {
+        let keys_file = temp_keys_file("synthetic-upstream-key\n");
+        let raw = format!(
+            r#"
+listen: 127.0.0.1:0
+client_tokens:
+  - name: local-client
+    token: synthetic-client-token
+management:
+  admin_token: synthetic-management-token
+default_pool: relay
+credential_sets:
+  relay_credentials:
+    keys_file: {}
+default_routing_profile: default-routing
+routing_profiles:
+  default-routing:
+    key_selection: sticky_until_failure
+    default_credential_cooldown_seconds: 20
+    same_request_credential_retry:
+      enabled: false
+      max_retries: 0
+    route_target_retry:
+      enabled: true
+pools:
+  relay:
+    provider_kind: openai_compatible
+    api_base: https://relay.example.test/v1
+    credential_set: relay_credentials
+    endpoint_capabilities:
+      chat_completions: supported
+      responses: unsupported
+      embeddings: unknown
+      models: local_projection
+      diagnostic_labels:
+        - relay
+        - no_responses
+"#,
+            keys_file.display()
+        );
+
+        let resolved = resolve_config(&raw).expect("static endpoint capabilities should resolve");
+        let capabilities = &resolved.pools["relay"].endpoint_capabilities;
+
+        assert_eq!(
+            capabilities.chat_completions,
+            crate::endpoint_capabilities::EndpointSupport::Supported
+        );
+        assert_eq!(
+            capabilities.responses,
+            crate::endpoint_capabilities::EndpointSupport::Unsupported
+        );
+        assert_eq!(
+            capabilities.embeddings,
+            crate::endpoint_capabilities::EndpointSupport::Unknown
+        );
+        assert_eq!(
+            capabilities.models,
+            crate::endpoint_capabilities::ModelsEndpointCapability::LocalProjection
+        );
+        assert_eq!(
+            capabilities.diagnostic_labels,
+            ["no_responses", "openai_compatible", "relay"]
         );
     }
 

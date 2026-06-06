@@ -113,6 +113,18 @@ Management writes can stage registry changes in writable stores. Staged changes
 do not affect client traffic until runtime reload or process restart applies the
 new compiled runtime.
 
+Static endpoint capabilities are resolved with pool/channel configuration.
+Provider-kind defaults and `upstreams` template defaults may populate
+`endpoint_capabilities`, and explicit pool configuration may override those
+fields. The capability model is deliberately endpoint-family metadata:
+chat completions, Responses, embeddings, local models projection, and diagnostic
+labels. It is not a provider/model catalog and must not contain model ids,
+pricing, context windows, tool support, or other model-specific facts.
+Static endpoint capabilities must not authorize Responses-to-Chat conversion,
+missing-model defaulting, or endpoint-family fallback. Responses defaulting and
+Responses-to-Chat adapters are parked follow-up work, not part of this M1-M4
+implementation plan.
+
 The request path must not:
 
 - parse YAML;
@@ -120,6 +132,10 @@ The request path must not:
 - query credential storage;
 - inspect profile provenance;
 - discover upstream models;
+- evaluate static endpoint capabilities;
+- read default-model configuration to fill a missing `model` field;
+- use static endpoint capabilities to bridge protocol families;
+- rewrite Responses requests into Chat Completions requests;
 - scan all credentials in a set;
 - infer state from free-form upstream text.
 
@@ -129,12 +145,15 @@ OpenAI-compatible requests enter through `/v1/*`.
 
 1. The proxy authenticates the client token.
 2. The provider adapter extracts the requested public model when the endpoint
-   needs model routing.
+   needs model routing. The model id must come from the client request; the
+   proxy does not inject a configured default model when that field is absent.
 3. Route planning reads the compiled model route and client token scope.
 4. The route planner builds a bounded frozen candidate set.
 5. The selected channel's pool chooses an available credential.
 6. The provider adapter rewrites upstream auth headers and, when configured,
-   rewrites the model id for that route target.
+   rewrites the model id for that route target. It does not convert Responses
+   requests to Chat Completions or use endpoint capability metadata to choose a
+   different protocol.
 7. The proxy sends the upstream request.
 8. Before sending bytes to the client, the proxy may classify transport
    failures, non-2xx upstream responses, guarded 2xx error envelopes, or
@@ -144,6 +163,12 @@ OpenAI-compatible requests enter through `/v1/*`.
    `return_error`.
 10. Once a response body has been committed to the client, retry and fallback
     stop for that request.
+
+Any future default-model exception requires a separate protocol/request-path
+plan proving disabled-by-default behavior, explicit public route ids,
+client-token scope enforcement, no YAML/store/upstream reads on the hot path, no
+Responses authorization by static capability metadata, and no successful-response
+buffering beyond the existing bounded guards.
 
 Named-pool requests through `/pools/{pool}/...` select the named channel
 directly instead of resolving a public model route. Provider adapters still
@@ -349,8 +374,8 @@ The supported Linux x86_64 release artifact is built locally through:
 scripts/build-release-x86_64-linux-docker.sh
 ```
 
-The gateway server should consume GitHub release assets. It should not compile
-the project locally.
+Deployment hosts should consume GitHub release assets instead of compiling the
+project locally.
 
 Release assets are:
 

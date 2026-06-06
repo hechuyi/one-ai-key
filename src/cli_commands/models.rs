@@ -1,0 +1,1246 @@
+use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelsListOptions {
+    pub connection: crate::cli::OperatorConnectionOptions,
+    pub client_token_ref: Option<String>,
+    pub output: crate::cli_report::OutputFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelsExplainOptions {
+    pub connection: crate::cli::OperatorConnectionOptions,
+    pub model: String,
+    pub client_token_ref: Option<String>,
+    pub output: crate::cli_report::OutputFormat,
+}
+
+pub async fn run_list(
+    options: ModelsListOptions,
+) -> Result<String, crate::operator_client::OperatorClientError> {
+    let client = crate::cli_commands::operator_client_from_connection(&options.connection)?;
+    let model_routes = client
+        .get_json(crate::operator_client::ReadOnlyEndpoint::ModelRoutes)
+        .await?;
+    Ok(render_models_list_report(
+        &model_routes,
+        options.client_token_ref.as_deref(),
+        options.output,
+    ))
+}
+
+pub async fn run_explain(
+    options: ModelsExplainOptions,
+) -> Result<String, crate::operator_client::OperatorClientError> {
+    let client = crate::cli_commands::operator_client_from_connection(&options.connection)?;
+    let preview = client
+        .get_json(crate::operator_client::ReadOnlyEndpoint::RoutingPreview {
+            model: options.model.clone(),
+            client_token_ref: options.client_token_ref.clone(),
+        })
+        .await?;
+    let runtime_projection =
+        crate::cli_commands::runtime_reload_projection::fetch_runtime_reload_projection(&client)
+            .await?;
+    Ok(render_models_explain_report_with_management_projection(
+        &preview,
+        runtime_projection.as_ref(),
+        options.output,
+    ))
+}
+
+pub fn render_models_list_report(
+    model_routes: &Value,
+    client_token_ref: Option<&str>,
+    output: crate::cli_report::OutputFormat,
+) -> String {
+    match output {
+        crate::cli_report::OutputFormat::Json => {
+            render_models_list_json(model_routes, client_token_ref)
+        }
+        crate::cli_report::OutputFormat::Table => {
+            render_models_list_table(model_routes, client_token_ref)
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn render_models_explain_report(
+    preview: &Value,
+    output: crate::cli_report::OutputFormat,
+) -> String {
+    render_models_explain_report_with_management_projection(preview, None, output)
+}
+
+fn render_models_explain_report_with_management_projection(
+    preview: &Value,
+    management_projection: Option<&Value>,
+    output: crate::cli_report::OutputFormat,
+) -> String {
+    match output {
+        crate::cli_report::OutputFormat::Json => {
+            render_models_explain_json(preview, management_projection)
+        }
+        crate::cli_report::OutputFormat::Table => {
+            render_models_explain_table(preview, management_projection)
+        }
+    }
+}
+
+fn render_models_list_json(model_routes: &Value, client_token_ref: Option<&str>) -> String {
+    let report = sanitized_models_list_report(model_routes, client_token_ref);
+    serde_json::to_string_pretty(&report).expect("models list json report should serialize")
+}
+
+fn sanitized_models_list_report(model_routes: &Value, client_token_ref: Option<&str>) -> Value {
+    let models = model_routes
+        .get("routes")
+        .and_then(Value::as_array)
+        .map(|routes| routes.iter().map(sanitize_model_route).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let model_count = models.len();
+    let visible_model_count = models
+        .iter()
+        .filter(|model| {
+            model
+                .get("visible_target_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                > 0
+        })
+        .count();
+    let status = if model_count == 0 {
+        "empty"
+    } else if visible_model_count == 0 {
+        "blocked"
+    } else {
+        "ok"
+    };
+    let data = serde_json::json!({
+        "command": "models list",
+        "reload_diff_status": "unavailable_until_m4",
+        "capability_status": "unavailable_until_m4",
+        "client_token_ref": client_token_ref,
+        "client_token_scope_status": models_list_client_scope_status(client_token_ref),
+        "model_count": model_count,
+        "visible_model_count": visible_model_count,
+        "default_channel": model_routes.get("default_channel").and_then(Value::as_str),
+        "unmapped_model_policy": model_routes
+            .get("unmapped_model_policy")
+            .and_then(Value::as_str),
+        "models": models,
+    });
+    crate::cli_report::report_envelope_with_legacy_fields(crate::cli_report::ReportEnvelope {
+        status,
+        reason: models_list_reason(status),
+        reason_code: models_list_reason_code(status),
+        effect: crate::cli_effects::runtime_readonly_effect(),
+        scope: serde_json::json!({
+            "client_token_ref": client_token_ref,
+            "projection": "model_routes",
+        }),
+        window: Value::Null,
+        next_action: models_list_next_action(status, client_token_ref),
+        data,
+    })
+}
+
+fn models_list_reason_code(status: &str) -> &'static str {
+    match status {
+        "empty" => "no_model_routes_configured",
+        "blocked" => "no_runtime_visible_model_routes",
+        _ => "model_routes_available",
+    }
+}
+
+fn models_list_reason(status: &str) -> &'static str {
+    match status {
+        "empty" => "No compiled runtime model routes are available.",
+        "blocked" => "Compiled model routes exist, but none have a runtime-visible target.",
+        _ => "Compiled runtime model routes are available.",
+    }
+}
+
+fn models_list_client_scope_status(client_token_ref: Option<&str>) -> &'static str {
+    if client_token_ref.is_some() {
+        "not_evaluated_for_list_use_models_explain"
+    } else {
+        "not_requested"
+    }
+}
+
+fn models_list_next_action(status: &str, client_token_ref: Option<&str>) -> Value {
+    match status {
+        "empty" => serde_json::json!({
+            "summary": "No compiled runtime model routes are available. Add explicit model routes, then run check-config. Reload status is unavailable until M4.",
+            "template_id": "check_config",
+            "safe_argv": ["one-ai-key", "check-config", "--config", "<config>"],
+            "side_effect_class": "offline_readonly",
+            "requires_confirmation": false,
+            "reload_status": "unavailable_until_m4",
+        }),
+        "blocked" => serde_json::json!({
+            "summary": "Compiled model routes exist, but none have a runtime-visible enabled target in this bounded projection. Use models explain for a single public model.",
+            "template_id": "models_explain",
+            "safe_argv": model_explain_argv(client_token_ref),
+            "side_effect_class": "runtime_readonly",
+            "requires_confirmation": false,
+        }),
+        _ => serde_json::json!({
+            "summary": "Compiled runtime model routes are available. Use models explain for a single public model and optional client-token reference.",
+            "template_id": "models_explain",
+            "safe_argv": model_explain_argv(client_token_ref),
+            "side_effect_class": "runtime_readonly",
+            "requires_confirmation": false,
+        }),
+    }
+}
+
+fn model_explain_argv(client_token_ref: Option<&str>) -> Value {
+    let mut argv = vec![
+        Value::from("one-ai-key"),
+        Value::from("models"),
+        Value::from("explain"),
+        Value::from("--management-url"),
+        Value::from("<url>"),
+        Value::from("--management-token-env"),
+        Value::from("<env>"),
+        Value::from("--model"),
+        Value::from("<public-model>"),
+    ];
+    if client_token_ref.is_some() {
+        argv.push(Value::from("--client-token-ref"));
+        argv.push(Value::from("<client-token-ref>"));
+    }
+    Value::Array(argv)
+}
+
+fn sanitize_model_route(route: &Value) -> Value {
+    let targets = route
+        .get("targets")
+        .and_then(Value::as_array)
+        .map(|targets| {
+            targets
+                .iter()
+                .map(sanitize_model_target)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let visible_target_count = targets
+        .iter()
+        .filter(|target| {
+            target.get("enabled").and_then(Value::as_bool) == Some(true)
+                && target
+                    .get("health_kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind != "disabled")
+        })
+        .count();
+    serde_json::json!({
+        "model": route.get("model").and_then(Value::as_str),
+        "strategy": route.get("strategy").and_then(Value::as_str),
+        "target_count": targets.len(),
+        "visible_target_count": visible_target_count,
+        "targets": targets,
+    })
+}
+
+fn sanitize_model_target(target: &Value) -> Value {
+    serde_json::json!({
+        "channel_id": target.get("channel_id").and_then(Value::as_str),
+        "upstream_model": target.get("upstream_model").and_then(Value::as_str),
+        "provider_kind": target.get("provider_kind").and_then(Value::as_str),
+        "priority": target.get("priority").and_then(Value::as_u64),
+        "weight": target.get("weight").and_then(Value::as_u64),
+        "enabled": target.get("enabled").and_then(Value::as_bool),
+        "health_kind": target
+            .get("health")
+            .and_then(|health| health.get("kind"))
+            .and_then(Value::as_str),
+        "health_reason_code": target
+            .get("health")
+            .and_then(|health| health.get("reason_code"))
+            .and_then(Value::as_str),
+        "health_generation": target
+            .get("health")
+            .and_then(|health| health.get("generation"))
+            .and_then(Value::as_u64),
+    })
+}
+
+fn render_models_explain_json(preview: &Value, management_projection: Option<&Value>) -> String {
+    let report = sanitized_models_explain_report(preview, management_projection);
+    serde_json::to_string_pretty(&report).expect("models explain json report should serialize")
+}
+
+fn sanitized_models_explain_report(
+    preview: &Value,
+    management_projection: Option<&Value>,
+) -> Value {
+    let client_token = sanitize_preview_client_token(preview.get("client_token"));
+    let candidates = preview
+        .get("candidates")
+        .and_then(Value::as_array)
+        .map(|candidates| {
+            candidates
+                .iter()
+                .map(sanitize_candidate)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let selected_target = sanitize_selected_target(preview.get("selected_target"));
+    let has_selected_target = !selected_target.is_null();
+    let client_scope_status = client_scope_status(&client_token, preview);
+    let status = if has_selected_target { "ok" } else { "blocked" };
+    let reason_code = models_explain_reason_code(has_selected_target, client_scope_status);
+    let capability_status =
+        crate::cli_report::endpoint_capability_status_from_candidates(&candidates);
+    let runtime_reload =
+        crate::cli_commands::runtime_reload_projection::summarize_runtime_reload_projection(
+            management_projection
+                .or_else(|| preview.get("runtime_reload_projection"))
+                .or_else(|| preview.get("runtime_reload")),
+        );
+    let data = serde_json::json!({
+        "command": "models explain",
+        "active_registry_generation": runtime_reload.active_registry_generation,
+        "active_registry_version": runtime_reload.active_registry_version,
+        "staged_registry_version": runtime_reload.staged_registry_version,
+        "runtime_reload_required": runtime_reload.runtime_reload_required,
+        "reload_diff_status": runtime_reload.reload_diff_status,
+        "reload_diff_reason_code": runtime_reload.reload_diff_reason_code,
+        "reload_diff_next_action": runtime_reload.reload_diff_next_action,
+        "capability_status": capability_status,
+        "model": preview.get("model").and_then(Value::as_str),
+        "route_kind": preview.get("route_kind").and_then(Value::as_str),
+        "registry_generation": preview.get("registry_generation").and_then(Value::as_u64),
+        "candidate_limit": preview.get("candidate_limit").and_then(Value::as_u64),
+        "client_token": client_token,
+        "client_scope_status": client_scope_status,
+        "selected_target": selected_target,
+        "candidates": candidates,
+    });
+    crate::cli_report::report_envelope_with_legacy_fields(crate::cli_report::ReportEnvelope {
+        status,
+        reason: models_explain_reason(reason_code),
+        reason_code,
+        effect: crate::cli_effects::runtime_readonly_effect(),
+        scope: serde_json::json!({
+            "model": preview.get("model").and_then(Value::as_str),
+            "client_token_ref": client_token.get("name").and_then(Value::as_str),
+        }),
+        window: Value::Null,
+        next_action: models_explain_next_action(status, preview, client_scope_status),
+        data,
+    })
+}
+
+fn client_scope_status(client_token: &Value, preview: &Value) -> &'static str {
+    if preview.get("route_kind").and_then(Value::as_str) == Some("client_model_denied") {
+        return "model_not_in_client_scope";
+    }
+    let unrestricted = client_token
+        .get("unrestricted_model_groups")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if unrestricted {
+        return "unrestricted";
+    }
+    if client_token
+        .get("allowed_model_groups")
+        .and_then(Value::as_array)
+        .is_some()
+    {
+        "allowed_by_runtime_catalog"
+    } else {
+        "unknown"
+    }
+}
+
+fn models_explain_reason_code(
+    has_selected_target: bool,
+    client_scope_status: &'static str,
+) -> &'static str {
+    if client_scope_status == "model_not_in_client_scope" {
+        "model_not_in_client_scope"
+    } else if has_selected_target {
+        "model_visible_to_client"
+    } else {
+        "no_runtime_route_candidate"
+    }
+}
+
+fn models_explain_reason(reason_code: &str) -> &'static str {
+    match reason_code {
+        "model_not_in_client_scope" => "The public model is not in this client-token scope.",
+        "no_runtime_route_candidate" => "The public model has no selected runtime route candidate.",
+        _ => "The public model has a selected runtime route candidate.",
+    }
+}
+
+fn models_explain_next_action(status: &str, preview: &Value, client_scope_status: &str) -> Value {
+    let model = preview
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("<public-model>");
+    if status == "ok" {
+        serde_json::json!({
+            "summary": "The public model has a selected runtime route candidate for this client-token scope. No repair action is required by models explain.",
+            "template_id": "no_action_required",
+            "safe_argv": [],
+            "side_effect_class": "runtime_readonly",
+            "requires_confirmation": false,
+        })
+    } else if client_scope_status == "model_not_in_client_scope" {
+        serde_json::json!({
+            "summary": format!("Public model {model} is not in this client-token scope. This command is read-only and has no client-token scope mutation CLI; edit the supported config or staged registry path, then run check-config and inspect reload status or reload diff as needed."),
+            "template_id": "check_config",
+            "safe_argv": ["one-ai-key", "check-config", "--config", "<config>"],
+            "side_effect_class": "offline_readonly",
+            "requires_confirmation": false,
+            "repair_path": "deferred_by_m1_m4",
+            "reload_status": "available",
+        })
+    } else {
+        serde_json::json!({
+            "summary": format!("Public model {model} has no selected runtime route candidate. Inspect route explain for route target and runtime channel details."),
+            "template_id": "route_explain",
+            "safe_argv": ["one-ai-key", "route", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "<public-model>"],
+            "side_effect_class": "runtime_readonly",
+            "requires_confirmation": false,
+        })
+    }
+}
+
+fn sanitize_preview_client_token(client_token: Option<&Value>) -> Value {
+    let Some(client_token) = client_token else {
+        return Value::Null;
+    };
+    serde_json::json!({
+        "id": client_token.get("id").and_then(Value::as_str),
+        "name": client_token.get("name").and_then(Value::as_str),
+        "unrestricted_model_groups": client_token
+            .get("unrestricted_model_groups")
+            .and_then(Value::as_bool),
+        "unrestricted_channels": client_token
+            .get("unrestricted_channels")
+            .and_then(Value::as_bool),
+        "allowed_model_groups": client_token
+            .get("allowed_model_groups")
+            .and_then(Value::as_array)
+            .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default(),
+        "allowed_channels": client_token
+            .get("allowed_channels")
+            .and_then(Value::as_array)
+            .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    })
+}
+
+fn sanitize_selected_target(target: Option<&Value>) -> Value {
+    let Some(target) = target else {
+        return Value::Null;
+    };
+    if target.is_null() {
+        return Value::Null;
+    }
+    serde_json::json!({
+        "channel_id": target.get("channel_id").and_then(Value::as_str),
+        "plan_position": target.get("plan_position").and_then(Value::as_u64),
+    })
+}
+
+fn sanitize_candidate(candidate: &Value) -> Value {
+    serde_json::json!({
+        "target_index": candidate.get("target_index").and_then(Value::as_u64),
+        "channel_id": candidate.get("channel_id").and_then(Value::as_str),
+        "upstream_model": candidate.get("upstream_model").and_then(Value::as_str),
+        "provider_kind": candidate.get("provider_kind").and_then(Value::as_str),
+        "priority": candidate.get("priority").and_then(Value::as_u64),
+        "weight": candidate.get("weight").and_then(Value::as_u64),
+        "target_enabled": candidate.get("target_enabled").and_then(Value::as_bool),
+        "included": candidate.get("included").and_then(Value::as_bool),
+        "selected": candidate.get("selected").and_then(Value::as_bool),
+        "plan_position": candidate.get("plan_position").and_then(Value::as_u64),
+        "reasons": candidate
+            .get("reasons")
+            .and_then(Value::as_array)
+            .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default(),
+        "health_kind": candidate
+            .get("health")
+            .and_then(|health| health.get("kind"))
+            .and_then(Value::as_str),
+        "health_reason_code": candidate
+            .get("health")
+            .and_then(|health| health.get("reason_code"))
+            .and_then(Value::as_str),
+        "health_generation": candidate
+            .get("health")
+            .and_then(|health| health.get("generation"))
+            .and_then(Value::as_u64),
+        "credential_set_id": candidate.get("credential_set_id").and_then(Value::as_str),
+        "selector_generation": candidate.get("selector_generation").and_then(Value::as_u64),
+        "credentials": sanitize_credential_counts(candidate.get("credentials")),
+        "endpoint_capabilities": crate::cli_report::sanitize_endpoint_capabilities(
+            candidate.get("endpoint_capabilities")
+        ),
+    })
+}
+
+fn sanitize_credential_counts(credentials: Option<&Value>) -> Value {
+    let Some(credentials) = credentials else {
+        return Value::Null;
+    };
+    let mut counts = serde_json::Map::new();
+    for field in [
+        "total",
+        "available",
+        "cooling_down",
+        "expired",
+        "quota_exhausted",
+        "disabled",
+    ] {
+        if let Some(value) = credentials.get(field).and_then(Value::as_u64) {
+            counts.insert(field.to_string(), Value::from(value));
+        }
+    }
+    Value::Object(counts)
+}
+
+fn render_models_list_table(model_routes: &Value, client_token_ref: Option<&str>) -> String {
+    let report = sanitized_models_list_report(model_routes, client_token_ref);
+    let mut output = String::new();
+    output.push_str("Models\n");
+    append_common_header(&mut output, &report);
+    if let Some(client_token_ref) = report.get("client_token_ref").and_then(Value::as_str) {
+        output.push_str(&format!(
+            "client_token_ref: {}\n",
+            display_value(client_token_ref)
+        ));
+        output.push_str("client_token_scope_status: not_evaluated_for_list_use_models_explain\n");
+    }
+    output.push_str(&format!(
+        "model_count: {}\n",
+        report
+            .get("model_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    ));
+    output.push_str("models:\n");
+    for model in report
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        output.push_str(&format!(
+            "- model={} strategy={} targets={} visible_targets={}\n",
+            display_value(
+                model
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>")
+            ),
+            display_value(
+                model
+                    .get("strategy")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>")
+            ),
+            model
+                .get("target_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            model
+                .get("visible_target_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        ));
+    }
+    output
+}
+
+fn render_models_explain_table(preview: &Value, management_projection: Option<&Value>) -> String {
+    let report = sanitized_models_explain_report(preview, management_projection);
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Model explanation for {}\n",
+        display_value(
+            report
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>")
+        )
+    ));
+    append_common_header(&mut output, &report);
+    output.push_str(&format!(
+        "client_scope_status: {}\n",
+        display_value(
+            report
+                .get("client_scope_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        )
+    ));
+    let selected = report
+        .get("selected_target")
+        .and_then(|target| target.get("channel_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    output.push_str(&format!("selected_target: {}\n", display_value(selected)));
+    output.push_str("candidates:\n");
+    for candidate in report
+        .get("candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        output.push_str(&format!(
+            "- channel={} included={} selected={} health={} reasons={} {}\n",
+            display_value(
+                candidate
+                    .get("channel_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>")
+            ),
+            candidate
+                .get("included")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            candidate
+                .get("selected")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            display_value(
+                candidate
+                    .get("health_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            ),
+            display_value(
+                &candidate
+                    .get("reasons")
+                    .and_then(Value::as_array)
+                    .map(|values| values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","))
+                    .unwrap_or_default()
+            ),
+            crate::cli_report::endpoint_capabilities_table_summary(
+                candidate.get("endpoint_capabilities")
+            )
+        ));
+    }
+    output
+}
+
+fn append_common_header(output: &mut String, report: &Value) {
+    crate::cli_report::append_report_envelope_table_fields(output, report);
+    crate::cli_commands::runtime_reload_projection::append_runtime_reload_table_fields(
+        output, report,
+    );
+    crate::cli_report::push_table_field(
+        output,
+        "capability_status",
+        report.get("capability_status"),
+    );
+}
+
+fn display_value(value: &str) -> String {
+    crate::cli_report::escape_table_value(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{http::StatusCode, routing::get, Json, Router};
+    use std::sync::{Arc, Mutex};
+
+    async fn spawn_management_fixture(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn models_list_json_uses_model_routes_projection_without_token_matrix() {
+        let input = serde_json::json!({
+            "default_channel": "fallback",
+            "unmapped_model_policy": "default_channel",
+            "routes": [
+                {
+                    "model": "gpt-public",
+                    "strategy": "priority",
+                    "targets": [
+                        {
+                            "channel_id": "primary",
+                            "upstream_model": "vendor-model",
+                            "provider_kind": "openai",
+                            "priority": 10,
+                            "weight": 1,
+                            "enabled": true,
+                            "token_hash": "SHOULD_NOT_RENDER_TOKEN_HASH",
+                            "health": {
+                                "kind": "ready",
+                                "reason_code": null,
+                                "generation": 3
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let rendered = render_models_list_report(
+            &input,
+            Some("local-client"),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["reason_code"], "model_routes_available");
+        assert_eq!(report["side_effect_class"], "runtime_readonly");
+        assert_eq!(report["effect_vector"]["reads_management_runtime"], true);
+        assert_eq!(report["window"], serde_json::Value::Null);
+        assert!(report["next_action"]["safe_argv"].is_array());
+        let legacy_dry_run_field = ["dry", "run", "command"].join("_");
+        assert!(report["next_action"].get(&legacy_dry_run_field).is_none());
+        assert_eq!(report["client_token_ref"], "local-client");
+        assert_eq!(
+            report["client_token_scope_status"],
+            "not_evaluated_for_list_use_models_explain"
+        );
+        assert_eq!(report["reload_diff_status"], "unavailable_until_m4");
+        assert_eq!(report["capability_status"], "unavailable_until_m4");
+        assert_eq!(report["models"][0]["model"], "gpt-public");
+        assert_eq!(report["models"][0]["visible_target_count"], 1);
+        assert!(!rendered.contains("SHOULD_NOT_RENDER_TOKEN_HASH"));
+        assert!(!rendered.contains("client_tokens"));
+    }
+
+    #[test]
+    fn models_explain_json_reports_client_scope_reason_and_structured_action() {
+        let input = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "client_model_denied",
+            "registry_generation": 7,
+            "candidate_limit": 8,
+            "client_token": {
+                "id": "local-client",
+                "name": "Local Client",
+                "token_hash": "SHOULD_NOT_RENDER_TOKEN_HASH",
+                "unrestricted_model_groups": false,
+                "unrestricted_channels": true,
+                "allowed_model_groups": ["other-model"],
+                "allowed_channels": []
+            },
+            "selected_target": null,
+            "candidates": [
+                {
+                    "target_index": 0,
+                    "channel_id": "primary",
+                    "upstream_model": "vendor-model",
+                    "provider_kind": "openai",
+                    "priority": 10,
+                    "weight": 1,
+                    "target_enabled": true,
+                    "included": false,
+                    "selected": false,
+                    "plan_position": null,
+                    "reasons": ["model_not_allowed"],
+                    "health": {
+                        "kind": "ready",
+                        "reason_code": null,
+                        "generation": 3
+                    },
+                    "credential_set_id": "primary-set",
+                    "selector_generation": 4,
+                    "credentials": {
+                        "total": 2,
+                        "available": 1,
+                        "token_hash": "SHOULD_NOT_RENDER_TOKEN_HASH"
+                    }
+                }
+            ]
+        });
+
+        let rendered = render_models_explain_report(&input, crate::cli_report::OutputFormat::Json);
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["reason_code"], "model_not_in_client_scope");
+        assert_eq!(report["side_effect_class"], "runtime_readonly");
+        assert_eq!(report["effect_vector"]["reads_management_runtime"], true);
+        assert_eq!(report["window"], serde_json::Value::Null);
+        assert_eq!(report["client_scope_status"], "model_not_in_client_scope");
+        assert_eq!(report["reload_diff_status"], "unknown");
+        assert_eq!(report["capability_status"], "unknown");
+        assert_eq!(report["next_action"]["repair_path"], "deferred_by_m1_m4");
+        assert_eq!(report["next_action"]["reload_status"], "available");
+        assert_eq!(
+            report["next_action"]["side_effect_class"],
+            "offline_readonly"
+        );
+        assert_eq!(report["candidates"][0]["credentials"]["total"], 2);
+        let legacy_safe_field = ["safe", "command"].join("_");
+        let legacy_dry_run_field = ["dry", "run", "command"].join("_");
+        assert!(report["next_action"].get(&legacy_safe_field).is_none());
+        assert!(report["next_action"].get(&legacy_dry_run_field).is_none());
+        assert_eq!(
+            report["next_action"]["safe_argv"],
+            serde_json::json!(["one-ai-key", "check-config", "--config", "<config>"])
+        );
+        assert!(!rendered.contains("SHOULD_NOT_RENDER_TOKEN_HASH"));
+        assert!(!rendered.contains("token_hash"));
+    }
+
+    #[test]
+    fn models_explain_table_reports_selected_target_when_visible() {
+        let input = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "configured",
+            "client_token": {
+                "id": "local-client",
+                "name": "Local Client",
+                "unrestricted_model_groups": true,
+                "unrestricted_channels": true,
+                "allowed_model_groups": [],
+                "allowed_channels": []
+            },
+            "selected_target": {
+                "channel_id": "primary",
+                "plan_position": 0
+            },
+            "candidates": []
+        });
+
+        let rendered = render_models_explain_report(&input, crate::cli_report::OutputFormat::Table);
+
+        assert!(rendered.contains("status: ok"));
+        assert!(rendered.contains("reason_code: model_visible_to_client"));
+        assert!(rendered.contains("side_effect_class: runtime_readonly"));
+        assert!(rendered.contains("effect.reads_management_runtime: true"));
+        assert!(rendered.contains("client_scope_status: unrestricted"));
+        assert!(rendered.contains("selected_target: primary"));
+        assert!(rendered.contains("reload_diff_status: unknown"));
+        assert!(rendered.contains("capability_status: unknown"));
+        assert!(rendered.contains("next_action.safe_argv: []"));
+    }
+
+    #[test]
+    fn endpoint_capability_cli_models_explain_shows_static_endpoint_capabilities() {
+        let input = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "configured",
+            "client_token": {
+                "id": "local-client",
+                "name": "Local Client",
+                "unrestricted_model_groups": true,
+                "unrestricted_channels": true,
+                "allowed_model_groups": [],
+                "allowed_channels": []
+            },
+            "selected_target": {
+                "channel_id": "primary",
+                "plan_position": 0
+            },
+            "candidates": [
+                {
+                    "target_index": 0,
+                    "channel_id": "primary",
+                    "upstream_model": "vendor-model",
+                    "provider_kind": "openai",
+                    "target_enabled": true,
+                    "included": true,
+                    "selected": true,
+                    "plan_position": 0,
+                    "reasons": ["available"],
+                    "health": {"kind": "ready", "generation": 3},
+                    "credential_set_id": "primary-set",
+                    "selector_generation": 4,
+                    "credentials": {"total": 2, "available": 1},
+                    "endpoint_capabilities": {
+                        "chat_completions": "supported",
+                        "responses": "unsupported",
+                        "embeddings": "unknown",
+                        "models": "local_projection",
+                        "diagnostic_labels": ["openai_compatible", "line\nlabel"],
+                        "raw_secret": "SHOULD_NOT_RENDER"
+                    }
+                }
+            ]
+        });
+
+        let rendered_json =
+            render_models_explain_report(&input, crate::cli_report::OutputFormat::Json);
+        let report: Value = serde_json::from_str(&rendered_json).unwrap();
+
+        assert_eq!(report["capability_status"], "available");
+        assert_eq!(
+            report["candidates"][0]["endpoint_capabilities"],
+            serde_json::json!({
+                "chat_completions": "supported",
+                "responses": "unsupported",
+                "embeddings": "unknown",
+                "models": "local_projection",
+                "diagnostic_labels": ["openai_compatible", "line\nlabel"]
+            })
+        );
+        assert!(report["candidates"][0]["endpoint_capabilities"]
+            .get("raw_secret")
+            .is_none());
+        assert!(!rendered_json.contains("SHOULD_NOT_RENDER"));
+
+        let rendered_table =
+            render_models_explain_report(&input, crate::cli_report::OutputFormat::Table);
+
+        assert!(rendered_table.contains("capability_status: available"));
+        assert!(rendered_table.contains(
+            "endpoint_capabilities.chat_completions=supported endpoint_capabilities.responses=unsupported endpoint_capabilities.embeddings=unknown endpoint_capabilities.models=local_projection endpoint_capabilities.diagnostic_labels=openai_compatible,line\\nlabel"
+        ));
+        assert!(!rendered_table.contains("line\nlabel"));
+    }
+
+    #[test]
+    fn endpoint_capability_cli_models_explain_ignores_illegal_capability_shapes() {
+        let input = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "configured",
+            "selected_target": null,
+            "candidates": [
+                {
+                    "channel_id": "primary",
+                    "included": false,
+                    "selected": false,
+                    "health": {"kind": "ready"},
+                    "endpoint_capabilities": ["supported"]
+                },
+                {
+                    "channel_id": "fallback",
+                    "included": false,
+                    "selected": false,
+                    "health": {"kind": "ready"},
+                    "endpoint_capabilities": {
+                        "chat_completions": {"nested": "supported"},
+                        "diagnostic_labels": "openai_compatible",
+                        "raw_secret": "SHOULD_NOT_RENDER"
+                    }
+                }
+            ]
+        });
+
+        let rendered = render_models_explain_report(&input, crate::cli_report::OutputFormat::Json);
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["capability_status"], "unknown");
+        assert!(report["candidates"][0]["endpoint_capabilities"].is_null());
+        assert!(report["candidates"][1]["endpoint_capabilities"].is_null());
+        assert!(!rendered.contains("SHOULD_NOT_RENDER"));
+    }
+
+    #[test]
+    fn models_explain_json_reports_runtime_reload_projection_without_sensitive_fields() {
+        let legacy_safe_field = ["safe", "command"].join("_");
+        let legacy_dry_run_field = ["dry", "run", "command"].join("_");
+        let input = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "configured",
+            "client_token": {
+                "id": "local-client",
+                "name": "Local Client",
+                "unrestricted_model_groups": true,
+                "unrestricted_channels": true,
+                "allowed_model_groups": [],
+                "allowed_channels": []
+            },
+            "selected_target": {
+                "channel_id": "primary",
+                "plan_position": 0
+            },
+            "candidates": []
+        });
+        let projection = serde_json::json!({
+            "status": "ok",
+            "reason_code": "reload_diff_available",
+            "active_registry_generation": 21,
+            "active_registry_version": 4,
+            "staged_registry_version": 5,
+            "runtime_reload_required": true,
+            "next_action": {
+                "safe_argv": ["unsafe-raw-path"],
+                legacy_safe_field: "DO_NOT_LEAK",
+                legacy_dry_run_field: "DO_NOT_LEAK"
+            },
+            "raw_path": "/tmp/secret-registry.yaml",
+            "raw_yaml": "RAW_YAML_SHOULD_NOT_APPEAR"
+        });
+
+        let rendered = super::render_models_explain_report_with_management_projection(
+            &input,
+            Some(&projection),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["active_registry_generation"], 21);
+        assert_eq!(report["active_registry_version"], 4);
+        assert_eq!(report["staged_registry_version"], 5);
+        assert_eq!(report["runtime_reload_required"], true);
+        assert_eq!(report["reload_diff_status"], "ok");
+        assert_eq!(report["reload_diff_reason_code"], "reload_diff_available");
+        assert_eq!(
+            report["reload_diff_next_action"]["template_id"],
+            "reload_diff_available"
+        );
+        assert_eq!(
+            report["reload_diff_next_action"]["side_effect_class"],
+            "runtime_readonly"
+        );
+        assert_eq!(
+            report["reload_diff_next_action"]["safe_argv"],
+            serde_json::json!([
+                "one-ai-key",
+                "reload",
+                "diff",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>"
+            ])
+        );
+        assert!(!rendered.contains("/tmp/secret-registry.yaml"));
+        assert!(!rendered.contains("RAW_YAML_SHOULD_NOT_APPEAR"));
+        assert!(!rendered.contains("unsafe-raw-path"));
+        assert!(!rendered.contains("DO_NOT_LEAK"));
+        assert_ne!(report["reload_diff_status"], "unavailable_until_m4");
+    }
+
+    #[tokio::test]
+    async fn endpoint_capability_cli_does_not_probe_upstream_models_explain() {
+        let seen_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let preview_seen = Arc::clone(&seen_paths);
+        let diff_seen = Arc::clone(&seen_paths);
+        let router = Router::new()
+            .route(
+                "/management/routing/preview",
+                get(move || {
+                    let preview_seen = Arc::clone(&preview_seen);
+                    async move {
+                        preview_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/routing/preview".to_string());
+                        Json(serde_json::json!({
+                            "model": "gpt-public",
+                            "selected_target": {"channel_id": "primary", "plan_position": 0},
+                            "candidates": [{
+                                "channel_id": "primary",
+                                "included": true,
+                                "selected": true,
+                                "health": {"kind": "ready"},
+                                "endpoint_capabilities": {
+                                    "chat_completions": "supported",
+                                    "responses": "unsupported",
+                                    "embeddings": "unknown",
+                                    "models": "local_projection",
+                                    "diagnostic_labels": ["openai_compatible"]
+                                }
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/management/runtime/reload-diff",
+                get(move || {
+                    let diff_seen = Arc::clone(&diff_seen);
+                    async move {
+                        diff_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/runtime/reload-diff".to_string());
+                        Json(serde_json::json!({
+                            "status": "ok",
+                            "reason_code": "reload_diff_empty",
+                            "active_registry_generation": 33,
+                            "active_registry_version": 7,
+                            "staged_registry_version": 7,
+                            "runtime_reload_required": false
+                        }))
+                    }
+                }),
+            );
+        let management_url = spawn_management_fixture(router).await;
+        let env_name = format!(
+            "ONE_AI_KEY_TEST_MODELS_EXPLAIN_TOKEN_{}",
+            std::process::id()
+        );
+        std::env::set_var(&env_name, "opaque-management-fixture");
+
+        let rendered = super::run_explain(super::ModelsExplainOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some(management_url),
+                deprecated_base_url: None,
+                management_token_env: Some(env_name.clone()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            model: "gpt-public".to_string(),
+            client_token_ref: None,
+            output: crate::cli_report::OutputFormat::Json,
+        })
+        .await
+        .unwrap();
+        std::env::remove_var(env_name);
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            *seen_paths.lock().unwrap(),
+            vec![
+                "/management/routing/preview".to_string(),
+                "/management/runtime/reload-diff".to_string(),
+            ]
+        );
+        assert_eq!(report["reload_diff_status"], "ok");
+        assert_eq!(report["reload_diff_reason_code"], "reload_diff_empty");
+        assert_eq!(report["active_registry_generation"], 33);
+        assert_eq!(report["runtime_reload_required"], false);
+        assert_eq!(report["capability_status"], "available");
+    }
+
+    #[tokio::test]
+    async fn models_explain_run_does_not_hide_reload_diff_auth_failure() {
+        let seen_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let preview_seen = Arc::clone(&seen_paths);
+        let diff_seen = Arc::clone(&seen_paths);
+        let explain_seen = Arc::clone(&seen_paths);
+        let router = Router::new()
+            .route(
+                "/management/routing/preview",
+                get(move || {
+                    let preview_seen = Arc::clone(&preview_seen);
+                    async move {
+                        preview_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/routing/preview".to_string());
+                        Json(serde_json::json!({
+                            "model": "gpt-public",
+                            "selected_target": {"channel_id": "primary", "plan_position": 0},
+                            "candidates": []
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/management/runtime/reload-diff",
+                get(move || {
+                    let diff_seen = Arc::clone(&diff_seen);
+                    async move {
+                        diff_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/runtime/reload-diff".to_string());
+                        StatusCode::UNAUTHORIZED
+                    }
+                }),
+            )
+            .route(
+                "/management/explain/runtime",
+                get(move || {
+                    let explain_seen = Arc::clone(&explain_seen);
+                    async move {
+                        explain_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/explain/runtime".to_string());
+                        Json(serde_json::json!({"runtime_reload_required": false}))
+                    }
+                }),
+            );
+        let management_url = spawn_management_fixture(router).await;
+        let env_name = format!(
+            "ONE_AI_KEY_TEST_MODELS_EXPLAIN_AUTH_TOKEN_{}",
+            std::process::id()
+        );
+        std::env::set_var(&env_name, "opaque-management-fixture");
+
+        let error = super::run_explain(super::ModelsExplainOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some(management_url),
+                deprecated_base_url: None,
+                management_token_env: Some(env_name.clone()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            model: "gpt-public".to_string(),
+            client_token_ref: None,
+            output: crate::cli_report::OutputFormat::Json,
+        })
+        .await
+        .unwrap_err();
+        std::env::remove_var(env_name);
+
+        assert_eq!(error.reason_code(), "management_unauthorized");
+        assert_eq!(
+            *seen_paths.lock().unwrap(),
+            vec![
+                "/management/routing/preview".to_string(),
+                "/management/runtime/reload-diff".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn models_table_escapes_control_characters() {
+        let input = serde_json::json!({
+            "model": "gpt\npublic\u{1b}[31m",
+            "route_kind": "configured",
+            "client_token": {
+                "id": "local-client",
+                "name": "Local Client",
+                "unrestricted_model_groups": true,
+                "unrestricted_channels": true,
+                "allowed_model_groups": [],
+                "allowed_channels": []
+            },
+            "selected_target": null,
+            "candidates": [
+                {
+                    "target_index": 0,
+                    "channel_id": "primary\rchannel",
+                    "upstream_model": "vendor-model",
+                    "provider_kind": "openai",
+                    "priority": 10,
+                    "weight": 1,
+                    "target_enabled": true,
+                    "included": false,
+                    "selected": false,
+                    "plan_position": null,
+                    "reasons": ["line\nbreak", "ansi\u{1b}[31m"],
+                    "health": {"kind": "ready", "generation": 3},
+                    "credential_set_id": "primary-set",
+                    "selector_generation": 4,
+                    "credentials": {"total": 2, "available": 1}
+                }
+            ]
+        });
+
+        let rendered = render_models_explain_report(&input, crate::cli_report::OutputFormat::Table);
+
+        assert!(rendered.contains("gpt\\npublic\\u{1b}[31m"));
+        assert!(rendered.contains("primary\\rchannel"));
+        assert!(rendered.contains("line\\nbreak,ansi\\u{1b}[31m"));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains("gpt\npublic"));
+        assert!(!rendered.contains("primary\rchannel"));
+    }
+}

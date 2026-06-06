@@ -267,6 +267,7 @@ pub struct ChannelNamedRoutePlanContext {
 }
 
 pub struct ChannelModelRoutesContext {
+    pub registry_generation: u64,
     pub default_channel: Option<String>,
     pub routes: Vec<ChannelModelRouteContext>,
 }
@@ -316,6 +317,7 @@ pub struct ChannelTopologyProjection {
     pub account_id: String,
     pub credential_set_id: CredentialSetId,
     pub provider_kind: ProviderKind,
+    pub endpoint_capabilities: crate::endpoint_capabilities::ResolvedEndpointCapabilities,
     pub api_base: String,
     pub auth_header: String,
     pub auth_prefix_configured: bool,
@@ -913,6 +915,22 @@ impl RuntimeCatalogs {
             .clone()
     }
 
+    pub fn channel_endpoint_capabilities(
+        &self,
+    ) -> (
+        u64,
+        HashMap<String, crate::endpoint_capabilities::ResolvedEndpointCapabilities>,
+    ) {
+        let snapshot = self.snapshot();
+        let capabilities = snapshot
+            .management_projection
+            .channel_topologies
+            .iter()
+            .map(|topology| (topology.id.clone(), topology.endpoint_capabilities.clone()))
+            .collect();
+        (snapshot.registry_generation, capabilities)
+    }
+
     pub fn provider_topologies(&self) -> Vec<ProviderTopologyProjection> {
         self.snapshot()
             .management_projection
@@ -1067,6 +1085,7 @@ impl ChannelRegistry {
             .collect();
         routes.sort_by(|a, b| a.route.public_model.cmp(&b.route.public_model));
         ChannelModelRoutesContext {
+            registry_generation: snapshot.registry_generation,
             default_channel: snapshot.default_channel,
             routes,
         }
@@ -1495,6 +1514,7 @@ impl ChannelTopologyProjection {
             account_id: pool_config.account_id.clone(),
             credential_set_id: pool_config.credential_set_id.clone(),
             provider_kind: pool_config.provider_kind,
+            endpoint_capabilities: pool_config.endpoint_capabilities.clone(),
             api_base: pool_config.key_pool.api_base.clone(),
             auth_header: pool_config.auth_header.clone(),
             auth_prefix_configured: !pool_config.auth_prefix.is_empty(),
@@ -1952,6 +1972,7 @@ mod tests {
         pools.insert(
             "test".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -2320,6 +2341,7 @@ mod tests {
         pools.insert(
             "test".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -2395,6 +2417,7 @@ mod tests {
         pools.insert(
             "test".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -2484,6 +2507,7 @@ mod tests {
         pools.insert(
             "test".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -2581,6 +2605,7 @@ mod tests {
         pools.insert(
             "test".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -2671,6 +2696,7 @@ mod tests {
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -2775,6 +2801,7 @@ mod tests {
             (
                 "visible".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -2790,6 +2817,7 @@ mod tests {
             (
                 "configured-disabled".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: false,
                     account: None,
                     policy_profile: None,
@@ -2805,6 +2833,7 @@ mod tests {
             (
                 "account-disabled".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: Some("disabled-account".to_string()),
                     policy_profile: None,
@@ -2820,6 +2849,7 @@ mod tests {
             (
                 "generic".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -2978,6 +3008,7 @@ mod tests {
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: name != "disabled",
                     account: None,
                     policy_profile: None,
@@ -3112,6 +3143,7 @@ mod tests {
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -3209,6 +3241,7 @@ mod tests {
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -3322,6 +3355,7 @@ mod tests {
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -3438,6 +3472,7 @@ mod tests {
             pools: HashMap::from([(
                 "test".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -3603,6 +3638,7 @@ mod tests {
             pools: HashMap::from([(
                 "test".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,

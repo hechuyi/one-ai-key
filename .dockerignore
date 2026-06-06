@@ -12,17 +12,25 @@ key-pool-router/
 # Runtime state and local databases.
 data/
 postgres_data/
+*.keys
 *.sqlite
+*.sqlite*
 *.sqlite3
+*.sqlite3*
 *.db
+*.db*
 *.db-*
+*.wal
+*.shm
 
 # Local deployment/configuration with real credentials.
 .env
 .env.*
+.env*
 config.yaml
 docker-compose.override.yml
 config/*.yaml
+config/*.yml
 config/*.json
 config/*.toml
 scripts/one_ai_key_keys.py
@@ -37,6 +45,7 @@ scripts/one_ai_key_keys.py
 
 # Logs, caches, and transient files.
 *.log
+*.log*
 *.pid
 *.tmp
 .DS_Store
@@ -47,5 +56,9 @@ __pycache__/
 docs/export/
 docs/rendered/
 docs/screenshots/
+snapshots/
+golden/
+tests/snapshots/
+tests/golden/
 *.docx
 *.pdf

@@ -71,6 +71,29 @@ cargo run -- --config config/local.yaml
 
 ## Quick Start
 
+Generate a local starter config and key file:
+
+```bash
+one-ai-key init local --out config/local.yaml --keys data/relay.keys --dry-run
+one-ai-key init local --out config/local.yaml --keys data/relay.keys --yes
+```
+
+Put at least one upstream API key in `data/relay.keys`, one key per line. The
+generated config contains placeholder client and management tokens; replace
+them with your local values before serving traffic.
+
+Check the config offline before starting the service:
+
+```bash
+one-ai-key check-config --config config/local.yaml
+one-ai-key check-config --config config/local.yaml --output json
+```
+
+`check-config` parses YAML, expands `upstreams`, validates local references,
+counts local credential lines, and reports a redacted model visibility preview.
+It does not open SQLite stores, start the HTTP server, probe upstreams, or call
+upstream `/v1/models`.
+
 Example `config/local.yaml`:
 
 ```yaml
@@ -151,7 +174,7 @@ For field-level configuration notes, see
 
 ## Routing And Failure Handling
 
-The default model is conservative:
+Default routing behavior is conservative:
 
 - a selected credential stays sticky until typed failure evidence changes its
   lifecycle state;
@@ -184,6 +207,40 @@ bodies, absolute key-file paths, or token-like URL components.
 Model discovery is management-only and does not change client traffic by itself.
 Use sync planning/apply and runtime reload only when discovered models should be
 staged as explicit public routes.
+
+`one-ai-key models explain --model <public-model>` and
+`one-ai-key route explain <public-model>` are read-only management CLI views over
+the compiled routing preview. They show selected route candidates, client-token
+scope, reload status, and static endpoint capability metadata when the active
+runtime exposes it. Capability output is diagnostic metadata only; it does not
+probe upstreams, change routing, or imply protocol conversion between endpoint
+families.
+
+`one-ai-key reload status` is a read-only operator CLI view over
+`/management/runtime` and `/management/explain/runtime`. It reports the active
+registry generation, active and staged registry versions, whether a runtime
+reload is pending, and the last reload stable reason code when present. It does
+not call reload, inspect local YAML, or make staged models visible.
+
+`one-ai-key reload diff` is also read-only. It wraps
+`/management/runtime/reload-diff` and returns a bounded, redacted typed diff when
+the registry store has a staged projection to compare against the active
+runtime. When no staged projection exists, it reports an unavailable state rather
+than inventing a local diff.
+
+`one-ai-key reload apply --dry-run` reads runtime status and reload diff data and
+prints the expected staged registry version that a later mutation must use. A
+confirmed runtime reload is explicit:
+
+```bash
+one-ai-key reload apply --yes --expected-staged-registry-version <version>
+```
+
+The CLI checks the current staged version before sending the mutation, and the
+management API enforces the same precondition at
+`POST /management/runtime/reload?expected_staged_registry_version=<version>`.
+Missing or stale preconditions fail before audit events, reload timestamps, or
+runtime state are changed.
 
 Core health endpoints:
 
@@ -227,8 +284,8 @@ dist/one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz
 dist/one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
-Publish those files to a GitHub release. Servers should consume the release
-artifact; do not compile on low-resource gateway hosts. Details are in
+Publish those files to a GitHub release. Deployment hosts should consume the
+release artifact instead of compiling locally. Details are in
 [docs/release-build.md](docs/release-build.md).
 
 ## Documentation

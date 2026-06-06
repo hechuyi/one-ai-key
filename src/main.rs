@@ -1,9 +1,15 @@
 mod auth;
+mod cli;
+mod cli_commands;
+mod cli_effects;
+mod cli_report;
 mod client_token_store;
 mod config;
+mod config_diagnostics;
 mod credential_probe;
 mod credential_repository;
 mod credentials;
+mod endpoint_capabilities;
 mod error;
 mod events;
 mod failure_observer;
@@ -12,6 +18,7 @@ mod management;
 mod management_alerts;
 mod management_client_tokens;
 mod management_commands;
+mod management_credential_refs;
 mod management_credential_sources;
 mod management_credentials;
 mod management_errors;
@@ -24,9 +31,12 @@ mod management_resource_lookup;
 mod management_resources;
 mod management_routing;
 mod management_runtime;
+mod management_runtime_diff;
 mod management_status;
 mod model_catalog;
 mod model_discovery;
+mod operator_client;
+mod operator_templates;
 mod pool;
 mod provider;
 mod proxy;
@@ -50,7 +60,6 @@ use axum::{
     routing::{any, get, patch, post, put},
     Router,
 };
-use clap::Parser;
 #[cfg(test)]
 use config::AppConfig;
 use registry::{RegistryRepository, YamlRegistryRepository};
@@ -60,16 +69,6 @@ use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
 use crate::{auth::authorize_management, config::ManagementRole};
-
-#[derive(Debug, Parser)]
-struct Args {
-    #[arg(
-        long,
-        env = "KEY_POOL_ROUTER_CONFIG",
-        default_value = "config/router.yaml"
-    )]
-    config: String,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ManagementRouteSpec {
@@ -220,6 +219,11 @@ const MANAGEMENT_ROUTE_SPECS: &[ManagementRouteSpec] = &[
         minimum_role: ManagementRole::Readonly,
     },
     ManagementRouteSpec {
+        method: "GET",
+        path: "/management/credential-sets/:id/credentials/:credential_id/apply-latest-probe/plan",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
         method: "POST",
         path: "/management/credential-sets/:id/credentials/:credential_id/apply-latest-probe",
         minimum_role: ManagementRole::Operator,
@@ -327,6 +331,11 @@ const MANAGEMENT_ROUTE_SPECS: &[ManagementRouteSpec] = &[
     ManagementRouteSpec {
         method: "GET",
         path: "/management/explain/runtime",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
+        method: "GET",
+        path: "/management/runtime/reload-diff",
         minimum_role: ManagementRole::Readonly,
     },
     ManagementRouteSpec {
@@ -508,8 +517,164 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let args = Args::parse();
-    let registry = YamlRegistryRepository::new(args.config).load_registry()?;
+    let mut action = match cli::parse_action() {
+        Ok(action) => action,
+        Err(error) => error.exit(),
+    };
+    let _effect = cli_effects::classify_action(&action);
+    apply_confirmation_gate(&mut action)?;
+
+    match action {
+        cli::CliAction::Serve { config_path } => serve(config_path).await,
+        cli::CliAction::InitLocal(options) => {
+            let output = options.output;
+            let report = operator_templates::init_local(options)?;
+            match output {
+                cli_report::OutputFormat::Table => print!("{}", report.render_table()),
+                cli_report::OutputFormat::Json => println!("{}", report.render_json()),
+            }
+            Ok(())
+        }
+        cli::CliAction::CheckConfig {
+            config_path,
+            output,
+        } => {
+            let report = config_diagnostics::check_config(config_diagnostics::CheckConfigOptions {
+                config_path,
+            });
+            match output {
+                cli_report::OutputFormat::Table => print!("{}", report.render_table()),
+                cli_report::OutputFormat::Json => println!("{}", report.render_json()),
+            }
+            let exit_code = report.exit_code();
+            if exit_code == 0 {
+                Ok(())
+            } else {
+                std::process::exit(exit_code);
+            }
+        }
+        cli::CliAction::RouteExplain(options) => {
+            let report = cli_commands::route::run(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::ModelsList(options) => {
+            let report = cli_commands::models::run_list(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::ModelsExplain(options) => {
+            let report = cli_commands::models::run_explain(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::ModelsOnboardPlan(options) => {
+            let report = cli_commands::models_onboard::run(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::ReloadStatus(options) => {
+            let report = cli_commands::reload::run_status(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::ReloadDiff(options) => {
+            let report = cli_commands::reload::run_diff(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::ReloadApply(options) => {
+            let report = cli_commands::reload::run_apply(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::ClientTokensList(options) => {
+            let report = cli_commands::client_tokens::run_list(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::Keys(command) => {
+            let report = cli_commands::keys::run(command).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::FailuresTail(options) => {
+            let report = cli_commands::failures::run_tail(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::FailuresExplain(options) => {
+            let report = cli_commands::failures::run_explain(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::Doctor(options) => {
+            let report = cli_commands::doctor::run(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+    }
+}
+
+fn apply_confirmation_gate(action: &mut cli::CliAction) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+
+    match cli_effects::confirmation_outcome(action, std::io::stdin().is_terminal()) {
+        cli_effects::ConfirmationOutcome::Allowed => Ok(()),
+        cli_effects::ConfirmationOutcome::Denied {
+            exit_code,
+            reason_code,
+        } => {
+            eprintln!("Reason code: {reason_code}");
+            eprintln!("Confirmation is required for this command. Re-run with --yes or --dry-run.");
+            std::process::exit(exit_code);
+        }
+        cli_effects::ConfirmationOutcome::PromptRequired { reason_code } => {
+            if prompt_for_confirmation(reason_code)? {
+                match action {
+                    cli::CliAction::InitLocal(options) => {
+                        options.mode = operator_templates::InitLocalMode::Write;
+                    }
+                    cli::CliAction::Keys(cli_commands::keys::KeysCommand::Import(options)) => {
+                        options.mode = cli_commands::keys::KeysImportMode::Apply;
+                    }
+                    cli::CliAction::Keys(cli_commands::keys::KeysCommand::Probe(options)) => {
+                        options.mode = cli_commands::keys::KeysProbeMode::Apply;
+                    }
+                    cli::CliAction::Keys(cli_commands::keys::KeysCommand::ProbeApply(
+                        cli_commands::keys::KeysProbeApplyCommand::Apply(options),
+                    )) => {
+                        options.mode = cli_commands::keys::KeysProbeApplyMode::Apply;
+                    }
+                    cli::CliAction::ReloadApply(options) => {
+                        options.mode = cli_commands::reload::ReloadApplyMode::Apply;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            } else {
+                eprintln!("Reason code: {reason_code}");
+                std::process::exit(3);
+            }
+        }
+    }
+}
+
+fn prompt_for_confirmation(reason_code: &str) -> anyhow::Result<bool> {
+    use std::io::{self, Write};
+
+    print!("Reason code: {reason_code}\nThis command has side effects. Continue? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+async fn serve(config_path: String) -> anyhow::Result<()> {
+    let registry = YamlRegistryRepository::new(config_path).load_registry()?;
     let registry_startup = match std::env::var_os("KEY_POOL_ROUTER_SQLITE_REGISTRY_STORE") {
         Some(path) => SqliteRegistryStore::load_or_bootstrap_startup_document(path, registry)?,
         None => registry_store::RegistryStartupDocument {
@@ -651,6 +816,10 @@ fn app_without_test_peer_default(state: AppState) -> Router {
             get(management::credential_set_credential_probes),
         )
         .route(
+            "/management/credential-sets/:id/credentials/:credential_id/apply-latest-probe/plan",
+            get(management::credential_probe_apply_plan),
+        )
+        .route(
             "/management/credential-sets/:id/credentials/:credential_id/apply-latest-probe",
             post(management::apply_latest_credential_probe),
         )
@@ -731,6 +900,10 @@ fn app_without_test_peer_default(state: AppState) -> Router {
         .route(
             "/management/explain/runtime",
             get(management::explain_runtime),
+        )
+        .route(
+            "/management/runtime/reload-diff",
+            get(management::runtime_reload_diff),
         )
         .route(
             "/management/health/serving",
@@ -879,6 +1052,9 @@ mod tests {
             SqliteCredentialRepository,
         },
         credentials::{CredentialFingerprint, CredentialId},
+        endpoint_capabilities::{
+            EndpointCapabilitiesConfig, EndpointSupport, ModelsEndpointCapability,
+        },
         error::{
             BalanceScope, ClassifiedFailure, FailureConfidence, FailureKind, FailureScope,
             RelayProfile,
@@ -906,6 +1082,48 @@ mod tests {
     };
 
     static TEMP_KEYS_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn cli_legacy_config_invocation_selects_server_mode() {
+        let action = crate::cli::parse_action_from(["one-ai-key", "--config", "config/local.yaml"])
+            .expect("legacy server invocation should parse");
+
+        assert_eq!(
+            action,
+            crate::cli::CliAction::Serve {
+                config_path: "config/local.yaml".into()
+            }
+        );
+    }
+
+    #[test]
+    fn cli_explicit_serve_invocation_selects_server_mode() {
+        let action =
+            crate::cli::parse_action_from(["one-ai-key", "serve", "--config", "config/local.yaml"])
+                .expect("explicit serve invocation should parse");
+
+        assert_eq!(
+            action,
+            crate::cli::CliAction::Serve {
+                config_path: "config/local.yaml".into()
+            }
+        );
+    }
+
+    #[test]
+    fn cli_help_does_not_render_secret_env_values() {
+        let previous = std::env::var_os("KEY_POOL_ROUTER_CONFIG");
+        std::env::set_var("KEY_POOL_ROUTER_CONFIG", "secret-config-value");
+
+        let help = crate::cli::render_help();
+
+        match previous {
+            Some(value) => std::env::set_var("KEY_POOL_ROUTER_CONFIG", value),
+            None => std::env::remove_var("KEY_POOL_ROUTER_CONFIG"),
+        }
+
+        assert!(!help.contains("secret-config-value"));
+    }
 
     fn fixture_client_token() -> String {
         fixtures().client_token.to_string()
@@ -1635,6 +1853,7 @@ pools:
 
     fn openai_pool(api_base: impl Into<String>, credential_set: impl Into<String>) -> PoolConfig {
         PoolConfig {
+            endpoint_capabilities: Default::default(),
             enabled: true,
             account: None,
             policy_profile: None,
@@ -1650,9 +1869,169 @@ pools:
 
     fn generic_pool(api_base: impl Into<String>, credential_set: impl Into<String>) -> PoolConfig {
         PoolConfig {
+            endpoint_capabilities: Default::default(),
             provider_kind: ProviderKind::GenericHttp,
             ..openai_pool(api_base, credential_set)
         }
+    }
+
+    fn endpoint_capability_projection_pool(
+        api_base: impl Into<String>,
+        credential_set: impl Into<String>,
+        label: impl Into<String>,
+        responses: EndpointSupport,
+        embeddings: EndpointSupport,
+    ) -> PoolConfig {
+        PoolConfig {
+            endpoint_capabilities: EndpointCapabilitiesConfig {
+                chat_completions: Some(EndpointSupport::Supported),
+                responses: Some(responses),
+                embeddings: Some(embeddings),
+                models: Some(ModelsEndpointCapability::LocalProjection),
+                diagnostic_labels: vec![label.into()],
+            },
+            ..openai_pool(api_base, credential_set)
+        }
+    }
+
+    fn endpoint_capability_projection_state() -> AppState {
+        let keys_file = temp_keys_file("upstream-secret-primary\nupstream-secret-fallback\n");
+        AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("primary".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets: credential_sets_from_files([("shared-credentials", keys_file)]),
+                model_routes: HashMap::from([priority_route(
+                    "gpt-capability",
+                    ["primary", "fallback"],
+                )]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([
+                    (
+                        "primary".to_string(),
+                        endpoint_capability_projection_pool(
+                            "http://127.0.0.1:1/v1?token=hidden-primary",
+                            "shared-credentials",
+                            "projection-primary",
+                            EndpointSupport::Unsupported,
+                            EndpointSupport::Unsupported,
+                        ),
+                    ),
+                    (
+                        "fallback".to_string(),
+                        endpoint_capability_projection_pool(
+                            "http://127.0.0.1:1/v1?token=hidden-fallback",
+                            "shared-credentials",
+                            "projection-fallback",
+                            EndpointSupport::Supported,
+                            EndpointSupport::Unknown,
+                        ),
+                    ),
+                ]),
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn sqlite_credential_test_app(
+        name: &str,
+        credential_set_id: &str,
+        keys: &str,
+    ) -> (Router, PathBuf) {
+        let keys_file = temp_keys_file(keys);
+        let db_path = temp_sqlite_path(name);
+        let repository = SqliteCredentialRepository::open(&db_path).unwrap();
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("primary".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets: credential_sets_from_files([(credential_set_id, keys_file)]),
+                model_routes: HashMap::new(),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([(
+                    "primary".to_string(),
+                    openai_pool("https://example.com/v1", credential_set_id),
+                )]),
+            }
+            .resolve_with_credential_repository_and_store_path(&repository, Some(db_path.clone()))
+            .unwrap(),
+        )
+        .unwrap();
+        (app(state), db_path)
     }
 
     #[test]
@@ -1879,7 +2258,7 @@ credential_sets:
   secondary-credentials:
     keys_file: {}
 policy_profiles:
-  hhhl-openai-compatible:
+  generic-relay-cn:
     error_rules:
       switch_codes:
         - rate_limit_exceeded
@@ -1906,7 +2285,7 @@ routing_profiles:
 pools:
   primary:
     account: main
-    policy_profile: hhhl-openai-compatible
+    policy_profile: generic-relay-cn
     api_base: https://unused-primary.test/v1
     credential_set: primary-credentials
     error_rules:
@@ -2150,7 +2529,7 @@ credential_sets:
   relay-credentials:
     keys_file: {}
 policy_profiles:
-  hhhl-openai-compatible:
+  generic-relay-cn:
     error_rules:
       adaptation_rules:
         - id: rate_limit_cooldown
@@ -2177,7 +2556,7 @@ pools:
     provider_kind: openai_compatible
     api_base: https://example.test/v1
     credential_set: relay-credentials
-    policy_profile: hhhl-openai-compatible
+    policy_profile: generic-relay-cn
     error_rules:
       adaptation_rules:
         - id: pool-specific-rule
@@ -2212,7 +2591,7 @@ pools:
             .any(|rule| rule.id == "pool-specific-rule"));
         assert_eq!(
             pool.error_policy_sources.profile_id.as_deref(),
-            Some("hhhl-openai-compatible")
+            Some("generic-relay-cn")
         );
         assert!(pool.error_policy_sources.has_pool_override);
         assert!(pool
@@ -2224,7 +2603,7 @@ pools:
                     && matches!(
                         source.source,
                         crate::config::ErrorPolicyRuleSource::Profile { ref profile_id }
-                            if profile_id == "hhhl-openai-compatible"
+                            if profile_id == "generic-relay-cn"
                     )
             }));
         assert!(pool
@@ -2281,7 +2660,7 @@ routing_profiles:
     route_target_retry:
       enabled: true
 pools:
-  ai2_hhhl:
+  generic_relay:
     provider_kind: openai_compatible
     api_base: https://example.test/v1
     credential_set: relay-credentials
@@ -2346,7 +2725,7 @@ pools:
         let err = resolve_policy_validation_error("", None, &pool_rules);
 
         assert!(
-            err.contains("duplicate error adaptation rule id duplicate-rule in pool ai2_hhhl"),
+            err.contains("duplicate error adaptation rule id duplicate-rule in pool generic_relay"),
             "{err}"
         );
     }
@@ -2359,7 +2738,7 @@ pools:
 
         assert!(
             err.contains(
-                "duplicate merged error adaptation rule id duplicate-rule for pool ai2_hhhl"
+                "duplicate merged error adaptation rule id duplicate-rule for pool generic_relay"
             ),
             "{err}"
         );
@@ -2658,6 +3037,133 @@ pools:
                     "{file} production source must not depend on {token}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn endpoint_capabilities_do_not_affect_request_path() {
+        for file in [
+            "src/proxy.rs",
+            "src/routing.rs",
+            "src/pool.rs",
+            "src/model_catalog.rs",
+            "src/route_plan.rs",
+        ] {
+            let source = production_source(file);
+            assert!(
+                !source.contains("endpoint_capabilities"),
+                "{file} must not read static endpoint capabilities on the request path"
+            );
+        }
+    }
+
+    #[test]
+    fn default_model_injection_remains_deferred() {
+        for file in [
+            "src/proxy.rs",
+            "src/provider.rs",
+            "src/route_plan.rs",
+            "src/routing.rs",
+            "src/model_catalog.rs",
+        ] {
+            let source = production_source(file);
+            for token in [
+                "default_model_for_endpoint",
+                "default_model_injection",
+                "inject_default_model",
+                "configured_default_model",
+            ] {
+                assert!(
+                    !source.contains(token),
+                    "{file} production source must not implement {token}"
+                );
+            }
+        }
+
+        let configuration = source_file("docs/configuration.md");
+        assert!(configuration.contains("`default_pool` is not a default model"));
+        assert!(configuration.contains("never injects a missing"));
+        assert!(configuration.contains("Clients must send explicit public model ids"));
+        assert!(configuration.contains("OpenAI-compatible requests that need model routing"));
+    }
+
+    #[test]
+    fn responses_defaulting_remains_deferred() {
+        for file in [
+            "src/proxy.rs",
+            "src/provider.rs",
+            "src/route_plan.rs",
+            "src/routing.rs",
+            "src/model_catalog.rs",
+        ] {
+            let source = production_source(file);
+            for token in [
+                "responses_to_chat_completions",
+                "responses_defaulting",
+                "responses_to_chat",
+                "chat_completions_adapter",
+            ] {
+                assert!(
+                    !source.contains(token),
+                    "{file} production source must not implement {token}"
+                );
+            }
+        }
+
+        let technical_design = source_file("docs/technical-design.md");
+        assert!(technical_design.contains(
+            "Static endpoint capabilities must not authorize Responses-to-Chat conversion"
+        ));
+        assert!(technical_design.contains("Responses defaulting and"));
+        assert!(technical_design.contains("Responses-to-Chat adapters are parked follow-up work"));
+    }
+
+    #[test]
+    fn docs_do_not_claim_default_model_injection() {
+        let docs = [
+            ("README.md", source_file("README.md")),
+            (
+                "docs/configuration.md",
+                source_file("docs/configuration.md"),
+            ),
+            (
+                "docs/technical-design.md",
+                source_file("docs/technical-design.md"),
+            ),
+        ];
+
+        for (path, source) in docs {
+            for forbidden in [
+                "default model injection is supported",
+                "automatically injects a default model",
+                "Responses-to-Chat is supported",
+                "responses_to_chat_completions is enabled",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{path} must not claim deferred protocol/default-model behavior is available"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_capabilities_do_not_create_provider_catalog() {
+        let source = production_source("src/endpoint_capabilities.rs");
+
+        for forbidden in [
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "context_length",
+            "price",
+            "pricing",
+            "model_ids",
+            "owner",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "endpoint capability schema must not become a provider/model catalog: {forbidden}"
+            );
         }
     }
 
@@ -4216,9 +4722,12 @@ pools:
             credential_source.contains("credential_set_runtime_scope(state, credential_set_id)?")
         );
         assert!(body.contains("credential_lifecycle_history_response_for_set("));
+        assert!(body.contains(
+            "credential_id_from_path_segment_response(&state, &id, credential_id).await"
+        ));
         assert!(body.contains("&state,"));
         assert!(body.contains("&id,"));
-        assert!(body.contains("CredentialId(credential_id),"));
+        assert!(body.contains("credential_id,"));
         assert!(!body.contains("ManagementService::new"));
         assert!(!body.contains("canonical_pool_for_credential_set"));
         assert!(!body.contains("credential_lifecycle_history_for_credential("));
@@ -4481,9 +4990,12 @@ pools:
         assert!(credential_body.contains("scope.pool_state"));
         assert!(!credential_body.contains("canonical_pool_for_credential_set"));
         assert!(body.contains("credential_resource_response_for_set("));
+        assert!(body.contains(
+            "credential_id_from_path_segment_response(&state, &id, credential_id).await"
+        ));
         assert!(body.contains("&state,"));
         assert!(body.contains("&id,"));
-        assert!(body.contains("CredentialId(credential_id)"));
+        assert!(body.contains("credential_id).await"));
         assert!(!body.contains("ManagementService::new"));
         assert!(!body.contains("canonical_pool_for_credential_set"));
         assert!(!body.contains("credential_resource_for_set("));
@@ -4512,9 +5024,12 @@ pools:
             credential_source.contains("credential_set_runtime_scope(state, credential_set_id)?")
         );
         assert!(body.contains("credential_probe_results_response_for_set("));
+        assert!(body.contains(
+            "credential_id_from_path_segment_response(&state, &id, credential_id).await"
+        ));
         assert!(body.contains("&state,"));
         assert!(body.contains("&id,"));
-        assert!(body.contains("CredentialId(credential_id),"));
+        assert!(body.contains("credential_id,"));
         assert!(!body.contains("ManagementService::new"));
         assert!(!body.contains("canonical_channel_pool_for_credential_set"));
         assert!(!body.contains("credential_probe_results_for_credential("));
@@ -4846,7 +5361,7 @@ pools:
         for token in [
             "state.channels.get(",
             "pool.lock().await.snapshot()",
-            "routing_preview_channel_status(state",
+            "routing_preview_channel_status(",
         ] {
             assert!(
                 !candidate_statuses_body.contains(token),
@@ -4865,7 +5380,7 @@ pools:
         for token in [
             "state.channels.get(",
             "pool.lock().await.snapshot()",
-            "routing_preview_channel_status(state",
+            "routing_preview_channel_status(",
         ] {
             assert!(
                 channel_lookup_body.contains(token),
@@ -5381,7 +5896,9 @@ pools:
             .map(|offset| reload_handler_start + offset)
             .expect("next management item exists");
         let reload_handler_body = &management_source[reload_handler_start..reload_handler_end];
-        assert!(reload_handler_body.contains("reload_runtime_state(&state, actor).await"));
+        assert!(reload_handler_body.contains(
+            "reload_runtime_state(&state, actor, query.expected_staged_registry_version).await"
+        ));
         assert!(!reload_handler_body.contains("ManagementService::new"));
         for token in [
             "load_registry_for_validation",
@@ -8035,6 +8552,7 @@ pools:
             pools: HashMap::from([(
                 "primary".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: Some("primary-account".to_string()),
                     policy_profile: None,
@@ -8185,6 +8703,7 @@ pools:
             pools: HashMap::from([(
                 "test".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: Some("relay-disabled".to_string()),
                     policy_profile: None,
@@ -8417,6 +8936,21 @@ pools:
         serde_json::from_slice::<Value>(&body).unwrap()
     }
 
+    async fn latest_probe_result_ref(
+        app: &Router,
+        credential_set_id: &str,
+        credential_id: &str,
+    ) -> String {
+        let plan = management_response_json(
+            app,
+            &format!(
+                "/management/credential-sets/{credential_set_id}/credentials/{credential_id}/apply-latest-probe/plan"
+            ),
+        )
+        .await;
+        plan["probe_result_ref"].as_str().unwrap().to_string()
+    }
+
     fn assert_management_event(
         events: &Value,
         index: usize,
@@ -8451,9 +8985,23 @@ pools:
         registry_provider_fixture_with_channel_enabled_and_event_log_path(channel_enabled, None)
     }
 
+    fn registry_provider_fixture_with_model_routes(
+        model_routes: HashMap<String, crate::config::ModelRouteConfig>,
+    ) -> (Router, PathBuf) {
+        registry_provider_fixture_with_options(true, None, model_routes)
+    }
+
     fn registry_provider_fixture_with_channel_enabled_and_event_log_path(
         channel_enabled: bool,
         event_log_path: Option<PathBuf>,
+    ) -> (Router, PathBuf) {
+        registry_provider_fixture_with_options(channel_enabled, event_log_path, HashMap::new())
+    }
+
+    fn registry_provider_fixture_with_options(
+        channel_enabled: bool,
+        event_log_path: Option<PathBuf>,
+        model_routes: HashMap<String, crate::config::ModelRouteConfig>,
     ) -> (Router, PathBuf) {
         let keys_file = temp_keys_file("upstream-key\n");
         let credential_store_path = temp_sqlite_path("registry-provider-credentials");
@@ -8498,7 +9046,7 @@ pools:
                 },
             )]),
             credential_sets: credential_sets_from_files([("test-credentials", keys_file)]),
-            model_routes: HashMap::new(),
+            model_routes,
             policy_profiles: HashMap::new(),
             default_routing_profile: Some("default-routing".to_string()),
             routing_profiles: HashMap::from([(
@@ -8517,6 +9065,7 @@ pools:
             pools: HashMap::from([(
                 "test".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: channel_enabled,
                     account: Some("relay-account".to_string()),
                     policy_profile: None,
@@ -8712,7 +9261,7 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/management/runtime/reload")
+                    .uri("/management/runtime/reload?expected_staged_registry_version=2")
                     .header(header::AUTHORIZATION, admin_bearer())
                     .body(Body::empty())
                     .unwrap(),
@@ -8748,6 +9297,123 @@ pools:
     }
 
     #[tokio::test]
+    async fn management_runtime_reload_requires_precondition_before_mutation() {
+        let (app, _) = registry_provider_fixture();
+
+        let disable = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/registry/providers/relay/disable")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disable.status(), StatusCode::OK);
+
+        let before_runtime = management_response_json(&app, "/management/runtime").await;
+        let before_explain = management_response_json(&app, "/management/explain/runtime").await;
+        assert_eq!(before_runtime["active_registry_version"], 1);
+        assert_eq!(before_runtime["staged_registry_version"], 2);
+        assert_eq!(before_runtime["runtime_reload_required"], true);
+
+        let reload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/runtime/reload")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reload.status(), StatusCode::CONFLICT);
+
+        let after_runtime = management_response_json(&app, "/management/runtime").await;
+        assert_eq!(after_runtime["active_registry_version"], 1);
+        assert_eq!(after_runtime["staged_registry_version"], 2);
+        assert_eq!(after_runtime["runtime_reload_required"], true);
+
+        let after_explain = management_response_json(&app, "/management/explain/runtime").await;
+        assert_eq!(
+            before_explain["last_reload"], after_explain["last_reload"],
+            "precondition failures must not record reload state"
+        );
+
+        let events = management_response_json(&app, "/management/events").await;
+        let event_kinds = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event.get("kind").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(!event_kinds.contains(&"runtime_reloaded"));
+    }
+
+    #[tokio::test]
+    async fn management_runtime_reload_precondition_mismatch_fails_before_mutation() {
+        let (app, _) = registry_provider_fixture();
+
+        let disable = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/registry/providers/relay/disable")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disable.status(), StatusCode::OK);
+
+        let staged = management_response_json(&app, "/management/runtime").await;
+        assert_eq!(staged["active_registry_version"], 1);
+        assert_eq!(staged["staged_registry_version"], 2);
+        assert_eq!(staged["runtime_reload_required"], true);
+        let before_explain = management_response_json(&app, "/management/explain/runtime").await;
+
+        let reload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/runtime/reload?expected_staged_registry_version=1")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reload.status(), StatusCode::CONFLICT);
+
+        let after = management_response_json(&app, "/management/runtime").await;
+        assert_eq!(after["active_registry_version"], 1);
+        assert_eq!(after["staged_registry_version"], 2);
+        assert_eq!(after["runtime_reload_required"], true);
+        let after_explain = management_response_json(&app, "/management/explain/runtime").await;
+        assert_eq!(
+            before_explain["last_reload"], after_explain["last_reload"],
+            "precondition failures must not record reload state"
+        );
+
+        let events = management_response_json(&app, "/management/events").await;
+        let event_kinds = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event.get("kind").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(!event_kinds.contains(&"runtime_reloaded"));
+    }
+
+    #[tokio::test]
     async fn failed_event_write_does_not_reload_runtime() {
         let blocking_parent = temp_keys_file("not a directory\n");
         let event_log_path = blocking_parent.join("events.jsonl");
@@ -8758,7 +9424,7 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/management/runtime/reload")
+                    .uri("/management/runtime/reload?expected_staged_registry_version=1")
                     .header(header::AUTHORIZATION, admin_bearer())
                     .body(Body::empty())
                     .unwrap(),
@@ -8869,7 +9535,13 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/management/runtime/reload")
+                    .uri({
+                        let runtime = management_response_json(&app, "/management/runtime").await;
+                        format!(
+                            "/management/runtime/reload?expected_staged_registry_version={}",
+                            runtime["staged_registry_version"].as_u64().unwrap()
+                        )
+                    })
                     .header(header::AUTHORIZATION, admin_bearer())
                     .body(Body::empty())
                     .unwrap(),
@@ -10108,6 +10780,11 @@ pools:
                 ManagementRole::Readonly,
             ),
             (
+                "GET",
+                "/management/credential-sets/:id/credentials/:credential_id/apply-latest-probe/plan",
+                ManagementRole::Readonly,
+            ),
+            (
                 "POST",
                 "/management/credential-sets/:id/credentials/:credential_id/apply-latest-probe",
                 ManagementRole::Operator,
@@ -10211,6 +10888,11 @@ pools:
             ),
             (
                 "GET",
+                "/management/runtime/reload-diff",
+                ManagementRole::Readonly,
+            ),
+            (
+                "GET",
                 "/management/health/serving",
                 ManagementRole::Readonly,
             ),
@@ -10305,6 +10987,16 @@ pools:
                 spec.path
             );
         }
+    }
+
+    #[test]
+    fn keys_probe_apply_plan_route_is_readonly_registered() {
+        assert!(management_route_specs().iter().any(|spec| {
+            spec.method == "GET"
+                && spec.path
+                    == "/management/credential-sets/:id/credentials/:credential_id/apply-latest-probe/plan"
+                && spec.minimum_role == ManagementRole::Readonly
+        }));
     }
 
     #[tokio::test]
@@ -10545,6 +11237,7 @@ pools:
         pools.insert(
             "test".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -10745,6 +11438,7 @@ pools:
             pools: HashMap::from([(
                 "test".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: Some("relay-profile".to_string()),
@@ -10868,6 +11562,7 @@ pools:
             pools: HashMap::from([(
                 "test".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: Some("relay-profile".to_string()),
@@ -11452,6 +12147,7 @@ pools:
         pools.insert(
             "test".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -12367,6 +13063,7 @@ pools:
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -12574,6 +13271,7 @@ pools:
             pools: HashMap::from([(
                 "relay".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: Some("account-a".to_string()),
                     policy_profile: None,
@@ -12670,6 +13368,7 @@ pools:
                 (
                     "primary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("relay-main".to_string()),
                         policy_profile: None,
@@ -12685,6 +13384,7 @@ pools:
                 (
                     "fallback".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("relay-main".to_string()),
                         policy_profile: None,
@@ -12826,6 +13526,7 @@ pools:
                 (
                     "primary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("relay-main".to_string()),
                         policy_profile: None,
@@ -12841,6 +13542,7 @@ pools:
                 (
                     "secondary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("relay-main".to_string()),
                         policy_profile: None,
@@ -12956,6 +13658,7 @@ pools:
                 (
                     "primary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("relay-main".to_string()),
                         policy_profile: None,
@@ -12971,6 +13674,7 @@ pools:
                 (
                     "secondary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("relay-main".to_string()),
                         policy_profile: None,
@@ -12986,6 +13690,7 @@ pools:
                 (
                     "isolated".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("relay-main".to_string()),
                         policy_profile: None,
@@ -13784,6 +14489,262 @@ pools:
     }
 
     #[tokio::test]
+    async fn keys_probe_apply_plan_is_readonly_redacted_and_uses_credential_ref() {
+        let upstream = spawn_upstream(Router::new().route(
+            "/v1/models/probe-model",
+            get(|| async { Json(serde_json::json!({"id":"probe-model","object":"model"})) }),
+        ))
+        .await;
+        let keys_file = temp_keys_file("upstream-key-a\n");
+        let db_path = temp_sqlite_path("keys-probe-apply-plan");
+        let repository = SqliteCredentialRepository::open(&db_path).unwrap();
+        let app = app(AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: vec![ManagementPrincipalConfig {
+                        name: "readonly".to_string(),
+                        token: fixture_readonly_management_token(),
+                        role: ManagementRole::Readonly,
+                        enabled: true,
+                    }],
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("primary".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets: credential_sets_from_files([("shared-credentials", keys_file)]),
+                model_routes: HashMap::new(),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([(
+                    "primary".to_string(),
+                    openai_pool(&upstream, "shared-credentials"),
+                )]),
+            }
+            .resolve_with_credential_repository_and_store_path(&repository, Some(db_path.clone()))
+            .unwrap(),
+        )
+        .unwrap());
+
+        let probe = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(
+                        "/management/credential-sets/shared-credentials/credentials/cr:v1:pos:0/probe",
+                    )
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"probe-model","timeout_seconds":2}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), StatusCode::OK);
+
+        let plan = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/management/credential-sets/shared-credentials/credentials/cr:v1:pos:0/apply-latest-probe/plan",
+                    )
+                    .header(
+                        header::AUTHORIZATION,
+                        bearer_for(&fixture_readonly_management_token()),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.status(), StatusCode::OK);
+        let plan = response_json(plan).await;
+        assert_eq!(plan["credential_set_id"], "shared-credentials");
+        assert_eq!(plan["credential_ref"], "cr:v1:pos:0");
+        assert_eq!(plan["action"], "restore");
+        assert_eq!(plan["probe"]["outcome"], "success");
+        assert!(plan["probe_result_ref"]
+            .as_str()
+            .unwrap()
+            .starts_with("pr:v1:id:"));
+        let plan_text = plan.to_string();
+        assert!(!plan_text.contains("upstream-key-a"));
+        assert!(!plan_text.contains("fingerprint"));
+        assert!(!plan_text.contains("cred_"));
+        assert!(!plan_text.contains(&db_path.to_string_lossy().to_string()));
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 1);
+        assert_eq!(events["events"][0]["kind"], "credential_probe_recorded");
+        let detail = management_response_json(
+            &app,
+            "/management/credential-sets/shared-credentials/credentials/cr:v1:pos:0",
+        )
+        .await;
+        assert_eq!(detail["credential"]["state"]["kind"], "available");
+    }
+
+    #[tokio::test]
+    async fn keys_probe_apply_plan_returns_not_found_without_latest_probe() {
+        let (app, _db_path) = sqlite_credential_test_app(
+            "keys-probe-apply-plan-missing",
+            "shared-credentials",
+            "upstream-key-a\n",
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/management/credential-sets/shared-credentials/credentials/cr:v1:pos:0/apply-latest-probe/plan",
+                    )
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn keys_probe_apply_requires_matching_probe_result_ref() {
+        let (app, db_path) = sqlite_credential_test_app(
+            "keys-probe-apply-precondition",
+            "shared-credentials",
+            "upstream-key-a\n",
+        );
+        let repository = SqliteCredentialRepository::open(&db_path).unwrap();
+        let credentials = management_response_json(
+            &app,
+            "/management/credential-sets/shared-credentials/credentials",
+        )
+        .await;
+        let credential_id = credentials["credentials"][0]["id"].as_str().unwrap();
+        repository
+            .record_probe_result(
+                crate::credential_repository::CredentialProbeResultRecordInput {
+                    credential_set_id: crate::credential_repository::CredentialSetId(
+                        "shared-credentials".to_string(),
+                    ),
+                    credential_id: crate::credentials::CredentialId(credential_id.to_string()),
+                    channel_id: "primary".to_string(),
+                    provider_id: "provider:openai_compatible".to_string(),
+                    account_id: "account:primary".to_string(),
+                    outcome: crate::credential_repository::CredentialProbeOutcome::Invalid,
+                    classifier_id: None,
+                    adaptation_rule_id: None,
+                    upstream_status: Some(401),
+                    upstream_code: Some("invalid_api_key".to_string()),
+                    upstream_limit_type: None,
+                    latency_ms: 10,
+                },
+            )
+            .unwrap();
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/management/credential-sets/shared-credentials/credentials/{credential_id}/apply-latest-probe"
+                    ))
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::CONFLICT);
+        let stale_probe_result_ref =
+            latest_probe_result_ref(&app, "shared-credentials", credential_id).await;
+
+        repository
+            .record_probe_result(
+                crate::credential_repository::CredentialProbeResultRecordInput {
+                    credential_set_id: crate::credential_repository::CredentialSetId(
+                        "shared-credentials".to_string(),
+                    ),
+                    credential_id: crate::credentials::CredentialId(credential_id.to_string()),
+                    channel_id: "primary".to_string(),
+                    provider_id: "provider:openai_compatible".to_string(),
+                    account_id: "account:primary".to_string(),
+                    outcome: crate::credential_repository::CredentialProbeOutcome::Success,
+                    classifier_id: None,
+                    adaptation_rule_id: None,
+                    upstream_status: Some(200),
+                    upstream_code: None,
+                    upstream_limit_type: None,
+                    latency_ms: 10,
+                },
+            )
+            .unwrap();
+
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/management/credential-sets/shared-credentials/credentials/{credential_id}/apply-latest-probe"
+                    ))
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"probe_result_ref":"{stale_probe_result_ref}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+        let detail = management_response_json(
+            &app,
+            &format!("/management/credential-sets/shared-credentials/credentials/{credential_id}"),
+        )
+        .await;
+        assert_eq!(detail["credential"]["state"]["kind"], "available");
+        let events = management_response_json(&app, "/management/events").await;
+        assert_eq!(events["total_events"], 0);
+    }
+
+    #[tokio::test]
     async fn failed_probe_audit_write_does_not_persist_probe_result() {
         let upstream = spawn_upstream(Router::new().route(
             "/v1/models/probe-model",
@@ -14119,6 +15080,7 @@ pools:
                 (
                     "primary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("primary-account".to_string()),
                         policy_profile: None,
@@ -14134,6 +15096,7 @@ pools:
                 (
                     "fallback".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("fallback-account".to_string()),
                         policy_profile: None,
@@ -14313,6 +15276,7 @@ pools:
         registry.pools = HashMap::from([(
             "primary".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 account: Some("primary-account".to_string()),
                 ..openai_pool(&upstream, "shared-credentials")
             },
@@ -14466,6 +15430,7 @@ pools:
             pools: HashMap::from([(
                 "primary".to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: Some("primary-account".to_string()),
                     policy_profile: None,
@@ -14681,6 +15646,7 @@ pools:
                 (
                     "primary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("primary-account".to_string()),
                         policy_profile: None,
@@ -14696,6 +15662,7 @@ pools:
                 (
                     "fallback".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("fallback-account".to_string()),
                         policy_profile: None,
@@ -14809,7 +15776,7 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/management/runtime/reload")
+                    .uri("/management/runtime/reload?expected_staged_registry_version=2")
                     .header(header::AUTHORIZATION, admin_bearer())
                     .body(Body::empty())
                     .unwrap(),
@@ -14973,6 +15940,7 @@ pools:
                 (
                     "primary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("primary-account".to_string()),
                         policy_profile: None,
@@ -14988,6 +15956,7 @@ pools:
                 (
                     "secondary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("secondary-account".to_string()),
                         policy_profile: None,
@@ -15661,10 +16630,12 @@ pools:
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"model":"probe-model","timeout_seconds":2}"#))
                     .unwrap(),
-            )
-            .await
-            .unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(probe_response.status(), StatusCode::OK);
+        let probe_result_ref =
+            latest_probe_result_ref(&app, "shared-credentials", credential_id).await;
 
         let apply_response = app
             .clone()
@@ -15676,7 +16647,9 @@ pools:
                     ))
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"reason":"apply latest probe"}"#))
+                    .body(Body::from(format!(
+                        r#"{{"reason":"apply latest probe","probe_result_ref":"{probe_result_ref}"}}"#
+                    )))
                     .unwrap(),
             )
             .await
@@ -15795,10 +16768,12 @@ pools:
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"model":"probe-model","timeout_seconds":2}"#))
                     .unwrap(),
-            )
-            .await
-            .unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(probe_response.status(), StatusCode::OK);
+        let probe_result_ref =
+            latest_probe_result_ref(&app, "shared-credentials", credential_id).await;
 
         let apply_response = app
             .clone()
@@ -15810,7 +16785,9 @@ pools:
                     ))
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{}"#))
+                    .body(Body::from(format!(
+                        r#"{{"probe_result_ref":"{probe_result_ref}"}}"#
+                    )))
                     .unwrap(),
             )
             .await
@@ -16571,6 +17548,7 @@ pools:
                 pools: HashMap::from([(
                     "primary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         policy_profile: Some("probe-policy".to_string()),
                         ..openai_pool(&upstream, "shared-credentials")
                     },
@@ -16603,6 +17581,8 @@ pools:
             .await
             .unwrap();
         assert_eq!(probe_response.status(), StatusCode::OK);
+        let probe_result_ref =
+            latest_probe_result_ref(&app, "shared-credentials", credential_id).await;
 
         let apply_response = app
             .clone()
@@ -16614,7 +17594,7 @@ pools:
                     ))
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{}"#))
+                    .body(Body::from(format!(r#"{{"probe_result_ref":"{probe_result_ref}"}}"#)))
                     .unwrap(),
             )
             .await
@@ -16709,6 +17689,7 @@ pools:
                 pools: HashMap::from([(
                     "primary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         policy_profile: Some("probe-policy".to_string()),
                         ..openai_pool(&upstream, "shared-credentials")
                     },
@@ -16741,6 +17722,8 @@ pools:
             .await
             .unwrap();
         assert_eq!(probe_response.status(), StatusCode::OK);
+        let probe_result_ref =
+            latest_probe_result_ref(&app, "shared-credentials", credential_id).await;
 
         let apply_response = app
             .clone()
@@ -16752,7 +17735,7 @@ pools:
                     ))
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{}"#))
+                    .body(Body::from(format!(r#"{{"probe_result_ref":"{probe_result_ref}"}}"#)))
                     .unwrap(),
             )
             .await
@@ -16835,6 +17818,7 @@ pools:
                 pools: HashMap::from([(
                     "primary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         policy_profile: Some("probe-policy".to_string()),
                         ..openai_pool("https://primary.example/v1", "shared-credentials")
                     },
@@ -16870,6 +17854,8 @@ pools:
                 },
             )
             .unwrap();
+        let probe_result_ref =
+            latest_probe_result_ref(&app, "shared-credentials", credential_id).await;
 
         let apply_response = app
             .clone()
@@ -16881,7 +17867,7 @@ pools:
                     ))
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{}"#))
+                    .body(Body::from(format!(r#"{{"probe_result_ref":"{probe_result_ref}"}}"#)))
                     .unwrap(),
             )
             .await
@@ -16974,6 +17960,7 @@ pools:
                 pools: HashMap::from([(
                     "primary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         policy_profile: Some("probe-policy".to_string()),
                         ..openai_pool("https://primary.example/v1", "shared-credentials")
                     },
@@ -17009,6 +17996,8 @@ pools:
                 },
             )
             .unwrap();
+        let probe_result_ref =
+            latest_probe_result_ref(&app, "shared-credentials", credential_id).await;
 
         let apply_response = app
             .clone()
@@ -17020,7 +18009,7 @@ pools:
                     ))
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{}"#))
+                    .body(Body::from(format!(r#"{{"probe_result_ref":"{probe_result_ref}"}}"#)))
                     .unwrap(),
             )
             .await
@@ -17128,6 +18117,7 @@ pools:
                 pools: HashMap::from([(
                     "primary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         policy_profile: Some("probe-policy".to_string()),
                         ..openai_pool(&upstream, "shared-credentials")
                     },
@@ -17160,6 +18150,8 @@ pools:
             .await
             .unwrap();
         assert_eq!(probe_response.status(), StatusCode::OK);
+        let probe_result_ref =
+            latest_probe_result_ref(&app, "shared-credentials", credential_id).await;
 
         let apply_response = app
             .clone()
@@ -17171,7 +18163,7 @@ pools:
                     ))
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{}"#))
+                    .body(Body::from(format!(r#"{{"probe_result_ref":"{probe_result_ref}"}}"#)))
                     .unwrap(),
             )
             .await
@@ -18519,6 +19511,7 @@ pools:
         pools.insert(
             "test".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -18604,6 +19597,7 @@ pools:
         pools.insert(
             "test".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -18730,6 +19724,123 @@ pools:
     }
 
     #[tokio::test]
+    async fn endpoint_capability_projection_management_model_routes_include_static_capabilities() {
+        let value = management_response_json(
+            &app(endpoint_capability_projection_state()),
+            "/management/model-routes",
+        )
+        .await;
+        let target = &value["routes"][0]["targets"][0];
+        assert_eq!(target["channel_id"], "primary");
+        assert_eq!(
+            target["endpoint_capabilities"]["chat_completions"],
+            "supported"
+        );
+        assert_eq!(target["endpoint_capabilities"]["responses"], "unsupported");
+        assert_eq!(target["endpoint_capabilities"]["embeddings"], "unsupported");
+        assert_eq!(
+            target["endpoint_capabilities"]["models"],
+            "local_projection"
+        );
+        assert!(target["endpoint_capabilities"]["diagnostic_labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|label| label == "projection-primary"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_capability_projection_management_routing_preview_includes_static_capabilities(
+    ) {
+        let value = management_response_json(
+            &app(endpoint_capability_projection_state()),
+            "/management/routing/preview?model=gpt-capability",
+        )
+        .await;
+
+        let candidates = value["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0]["channel_id"], "primary");
+        assert_eq!(
+            candidates[0]["endpoint_capabilities"]["responses"],
+            "unsupported"
+        );
+        assert_eq!(
+            candidates[0]["endpoint_capabilities"]["embeddings"],
+            "unsupported"
+        );
+        assert_eq!(candidates[1]["channel_id"], "fallback");
+        assert_eq!(
+            candidates[1]["endpoint_capabilities"]["responses"],
+            "supported"
+        );
+        assert_eq!(
+            candidates[1]["endpoint_capabilities"]["embeddings"],
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_capability_projection_management_channel_capabilities_are_redacted_static_metadata(
+    ) {
+        let app = app(endpoint_capability_projection_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/management/channels/primary")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("upstream-secret"));
+        assert!(!body.contains("hidden-primary"));
+        assert!(!body.contains(fixture_client_token().as_str()));
+        assert!(!body.contains(fixture_admin_token().as_str()));
+        let value = serde_json::from_str::<Value>(&body).unwrap();
+        assert_eq!(
+            value["endpoint_capabilities"]["chat_completions"],
+            "supported"
+        );
+        assert_eq!(
+            value["endpoint_capabilities"]["diagnostic_labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|label| label == &&Value::String("projection-primary".to_string()))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_capability_projection_management_does_not_probe_or_reload() {
+        let state = endpoint_capability_projection_state();
+        let runtime_generation = state.runtime_catalogs.registry_generation();
+        let channel_generation = state.channels.registry_generation();
+        let event_count = state.events.len();
+        let app = app(state.clone());
+
+        let _channels = management_response_json(&app, "/management/channels/primary").await;
+        let _routes = management_response_json(&app, "/management/model-routes").await;
+        let _preview =
+            management_response_json(&app, "/management/routing/preview?model=gpt-capability")
+                .await;
+
+        assert_eq!(
+            state.runtime_catalogs.registry_generation(),
+            runtime_generation
+        );
+        assert_eq!(state.channels.registry_generation(), channel_generation);
+        assert_eq!(state.events.len(), event_count);
+    }
+
+    #[tokio::test]
     async fn management_routing_preview_explains_route_decision_without_secrets() {
         let keys_file = temp_keys_file("upstream-secret-a\nupstream-secret-b\n");
         let mut pools = HashMap::new();
@@ -18737,6 +19848,7 @@ pools:
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -19119,6 +20231,325 @@ pools:
                 .len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn credential_ref_projection_is_not_key_derived() {
+        let (app, _db_path) = sqlite_credential_test_app(
+            "credential-ref-projection",
+            "shared-credentials",
+            "upstream-key-a\nupstream-key-b\n",
+        );
+
+        let body = management_response_json(
+            &app,
+            "/management/credential-sets/shared-credentials/credentials?limit=1",
+        )
+        .await;
+        let credential = &body["credentials"][0];
+        let credential_ref = credential["credential_ref"]
+            .as_str()
+            .expect("credential_ref should be projected");
+
+        assert_eq!(credential_ref, "cr:v1:pos:0");
+        assert_ne!(credential_ref, credential["id"].as_str().unwrap());
+        assert_ne!(credential_ref, credential["fingerprint"].as_str().unwrap());
+        assert!(!credential_ref.contains("upstream-key-a"));
+        assert!(!credential_ref.starts_with("cred_"));
+    }
+
+    #[tokio::test]
+    async fn credential_ref_is_stable_across_restart() {
+        let keys_file = temp_keys_file("upstream-key-a\nupstream-key-b\n");
+        let db_path = temp_sqlite_path("credential-ref-stable-restart");
+        let build_app = || {
+            let repository = SqliteCredentialRepository::open(&db_path).unwrap();
+            app(AppState::new(
+                AppConfig {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    client_tokens: vec![ClientTokenConfig {
+                        name: "test-client".to_string(),
+                        token: fixture_client_token(),
+                        enabled: true,
+                        allowed_model_groups: Vec::new(),
+                        allowed_channels: Vec::new(),
+                    }],
+                    management: Some(ManagementConfig {
+                        admin_token: fixture_admin_token(),
+                        ip_allowlist: None,
+                        principals: Vec::new(),
+                        event_log_path: None,
+                        event_window_capacity: None,
+                    }),
+                    max_request_body_bytes: 1024 * 1024,
+                    max_model_catalog_body_bytes: 512 * 1024,
+                    max_error_body_bytes: 1024,
+                    timeouts: TimeoutConfig::default(),
+                    routing: crate::config::RoutingConfig::default(),
+                    default_pool: Some("primary".to_string()),
+                    providers: HashMap::new(),
+                    accounts: HashMap::new(),
+                    credential_sets: credential_sets_from_files([(
+                        "shared-credentials",
+                        keys_file.clone(),
+                    )]),
+                    model_routes: HashMap::new(),
+                    policy_profiles: HashMap::new(),
+                    default_routing_profile: Some("default-routing".to_string()),
+                    routing_profiles: std::collections::HashMap::from([(
+                        "default-routing".to_string(),
+                        crate::config::RoutingProfileConfig {
+                            key_selection:
+                                crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                            default_credential_cooldown_seconds: 20,
+                            same_request_credential_retry:
+                                crate::config::SameRequestCredentialRetryConfig {
+                                    enabled: false,
+                                    max_retries: 0,
+                                },
+                            route_target_retry: crate::config::RouteTargetRetryConfig {
+                                enabled: true,
+                            },
+                        },
+                    )]),
+                    pools: HashMap::from([(
+                        "primary".to_string(),
+                        openai_pool("https://example.com/v1", "shared-credentials"),
+                    )]),
+                }
+                .resolve_with_credential_repository_and_store_path(
+                    &repository,
+                    Some(db_path.clone()),
+                )
+                .unwrap(),
+            )
+            .unwrap())
+        };
+
+        let first = management_response_json(
+            &build_app(),
+            "/management/credential-sets/shared-credentials/credentials?limit=2",
+        )
+        .await;
+        let second = management_response_json(
+            &build_app(),
+            "/management/credential-sets/shared-credentials/credentials?limit=2",
+        )
+        .await;
+
+        assert_eq!(
+            first["credentials"][0]["credential_ref"],
+            second["credentials"][0]["credential_ref"]
+        );
+        assert_eq!(first["credentials"][0]["credential_ref"], "cr:v1:pos:0");
+        assert_eq!(second["credentials"][1]["credential_ref"], "cr:v1:pos:1");
+    }
+
+    #[tokio::test]
+    async fn credential_ref_resolves_server_side_without_cli_internal_id() {
+        let (app, _db_path) = sqlite_credential_test_app(
+            "credential-ref-server-resolve",
+            "shared-credentials",
+            "upstream-key-a\n",
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/management/credential-sets/shared-credentials/credentials/cr:v1:pos:0")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(body["credential"]["credential_ref"], "cr:v1:pos:0");
+        assert_eq!(body["resource"]["credential_ref"], "cr:v1:pos:0");
+        assert!(!body.to_string().contains("upstream-key-a"));
+    }
+
+    #[tokio::test]
+    async fn credential_ref_rejects_unknown_or_cross_set_reference() {
+        let (app, _db_path) =
+            sqlite_credential_test_app("credential-ref-unknown", "shared-credentials", "a\n");
+
+        let unknown_position = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/management/credential-sets/shared-credentials/credentials/cr:v1:pos:9")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_position.status(), StatusCode::NOT_FOUND);
+
+        let unknown_set = app
+            .oneshot(
+                Request::builder()
+                    .uri("/management/credential-sets/other-credentials/credentials/cr:v1:pos:0")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_set.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn credential_ref_rejects_malformed_reference_as_bad_request() {
+        let (app, _db_path) =
+            sqlite_credential_test_app("credential-ref-malformed", "shared-credentials", "a\n");
+
+        let malformed = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/management/credential-sets/shared-credentials/credentials/cr:v1:pos:not-a-number",
+                    )
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn credential_ref_resolves_for_metadata_history_probes_and_lifecycle_paths() {
+        let (app, _db_path) = sqlite_credential_test_app(
+            "credential-ref-single-credential-subpaths",
+            "shared-credentials",
+            "upstream-key-a\n",
+        );
+
+        let metadata = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(
+                        "/management/credential-sets/shared-credentials/credentials/cr:v1:pos:0/metadata",
+                    )
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"label":"primary relay","note":"ref path"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), StatusCode::OK);
+        let metadata = response_json(metadata).await;
+        assert_eq!(metadata["credential"]["credential_ref"], "cr:v1:pos:0");
+        assert_eq!(metadata["resource"]["credential_ref"], "cr:v1:pos:0");
+        assert_eq!(metadata["resource"]["label"], "primary relay");
+
+        let probes = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/management/credential-sets/shared-credentials/credentials/cr:v1:pos:0/probes",
+                    )
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(probes.status(), StatusCode::OK);
+        let probes = response_json(probes).await;
+        assert_eq!(probes["credential_set_id"], "shared-credentials");
+
+        let expire = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(
+                        "/management/credential-sets/shared-credentials/credentials/cr:v1:pos:0/expire",
+                    )
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"reason":"ref expire"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expire.status(), StatusCode::OK);
+        let expire = response_json(expire).await;
+        assert_eq!(expire["state"]["kind"], "expired");
+
+        let history = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/management/credential-sets/shared-credentials/credentials/cr:v1:pos:0/history",
+                    )
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+        let history = response_json(history).await;
+        assert_eq!(history["history"][0]["state"]["reason"], "ref expire");
+        assert!(!history.to_string().contains("upstream-key-a"));
+    }
+
+    #[tokio::test]
+    async fn credential_ref_is_omitted_without_writable_credential_resource_position() {
+        let config = test_config_with_api_base("https://example.com/v1")
+            .resolve_with_credential_repository(
+                &crate::credential_repository::FileCredentialRepository::new(),
+            )
+            .unwrap();
+        let app = app(AppState::new(config).unwrap());
+
+        let body = management_response_json(
+            &app,
+            "/management/credential-sets/test-credentials/credentials",
+        )
+        .await;
+
+        assert!(body["credentials"][0].get("credential_ref").is_none());
+    }
+
+    #[tokio::test]
+    async fn credential_ref_projection_omits_fingerprint_hash_prefix_suffix() {
+        let (app, _db_path) = sqlite_credential_test_app(
+            "credential-ref-redaction",
+            "shared-credentials",
+            "upstream-key-a\n",
+        );
+
+        let body = management_response_json(
+            &app,
+            "/management/credential-sets/shared-credentials/credentials?limit=1",
+        )
+        .await;
+        let credential = &body["credentials"][0];
+        let credential_ref = credential["credential_ref"].as_str().unwrap();
+        let internal_id = credential["id"].as_str().unwrap();
+        let fingerprint = credential["fingerprint"].as_str().unwrap();
+
+        assert!(!credential_ref.contains(internal_id));
+        assert!(!credential_ref.contains(fingerprint));
+        assert!(!credential_ref.contains(&fingerprint[..6]));
+        assert!(!credential_ref.contains(&fingerprint[fingerprint.len() - 6..]));
+        assert!(!credential_ref.contains("upstream"));
+        assert!(!credential_ref.contains("key-a"));
     }
 
     #[tokio::test]
@@ -19506,7 +20937,7 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/management/runtime/reload")
+                    .uri("/management/runtime/reload?expected_staged_registry_version=2")
                     .header(header::AUTHORIZATION, admin_bearer())
                     .body(Body::empty())
                     .unwrap(),
@@ -19541,7 +20972,7 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/management/runtime/reload")
+                    .uri("/management/runtime/reload?expected_staged_registry_version=1")
                     .header(header::AUTHORIZATION, admin_bearer())
                     .body(Body::empty())
                     .unwrap(),
@@ -19564,6 +20995,599 @@ pools:
         let serialized = serde_json::to_string(&after_failure).unwrap();
         assert!(!serialized.contains("not a directory"));
         assert!(!serialized.contains("events.jsonl"));
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_diff_reports_unavailable_without_staged_projection() {
+        let response = app(read_only_test_state_with_api_base("https://example.com/v1"))
+            .oneshot(
+                Request::builder()
+                    .uri("/management/runtime/reload-diff")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        for forbidden in [
+            "upstream-key",
+            fixture_admin_token().as_str(),
+            fixture_client_token().as_str(),
+            "keys_file",
+            "/tmp/",
+            "https://example.com/v1",
+        ] {
+            assert!(
+                !body_text.contains(forbidden),
+                "reload diff leaked forbidden material {forbidden}"
+            );
+        }
+        let diff = serde_json::from_str::<Value>(&body_text).unwrap();
+        assert_eq!(diff["status"], "unavailable");
+        assert_eq!(diff["reason_code"], "unavailable_without_staged_projection");
+        assert!(diff["active_registry_generation"].as_u64().unwrap() > 0);
+        assert_eq!(diff["runtime_reload_required"], false);
+        assert_eq!(diff["mutating_reload_sent"], false);
+        assert_eq!(
+            diff["next_action"]["template_id"],
+            "reload_diff_unavailable"
+        );
+        assert_eq!(diff["next_action"]["requires_confirmation"], false);
+        assert_eq!(
+            diff["reload_apply_status"],
+            "unavailable_without_staged_projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_diff_status_is_readonly() {
+        assert!(management_route_specs().iter().any(|spec| {
+            spec.method == "GET"
+                && spec.path == "/management/runtime/reload-diff"
+                && spec.minimum_role == ManagementRole::Readonly
+        }));
+
+        let app = app(management_role_matrix_state());
+        let before = management_response_json(&app, "/management/explain/runtime").await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/management/runtime/reload-diff")
+                    .header(
+                        header::AUTHORIZATION,
+                        bearer_for(&fixture_readonly_management_token()),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let diff = response_json(response).await;
+        let after = management_response_json(&app, "/management/explain/runtime").await;
+
+        assert_eq!(diff["mutating_reload_sent"], false);
+        assert_eq!(
+            before["active_registry_generation"],
+            after["active_registry_generation"]
+        );
+        assert_eq!(before["last_reload"], after["last_reload"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_diff_is_readonly() {
+        let app = app(management_role_matrix_state());
+        let before = management_response_json(&app, "/management/explain/runtime").await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/management/runtime/reload-diff")
+                    .header(
+                        header::AUTHORIZATION,
+                        bearer_for(&fixture_readonly_management_token()),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let after = management_response_json(&app, "/management/explain/runtime").await;
+        assert_eq!(
+            before["active_registry_generation"],
+            after["active_registry_generation"]
+        );
+        assert_eq!(before["last_reload"], after["last_reload"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_diff_is_bounded_and_redacted() {
+        let (app, _) = registry_provider_fixture();
+        let staged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/registry/providers/relay/disable")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/management/runtime/reload-diff")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        for forbidden in [
+            "upstream-key",
+            fixture_admin_token().as_str(),
+            fixture_client_token().as_str(),
+            "keys_file",
+            "/tmp/",
+            "https://example.com/v1",
+            "Authorization",
+            "Bearer",
+        ] {
+            assert!(
+                !body_text.contains(forbidden),
+                "reload diff leaked forbidden material {forbidden}"
+            );
+        }
+        let diff = serde_json::from_str::<Value>(&body_text).unwrap();
+
+        assert_eq!(diff["status"], "ok");
+        assert_eq!(diff["reason_code"], "reload_diff_available");
+        assert_eq!(diff["active_registry_version"], 1);
+        assert_eq!(diff["staged_registry_version"], 2);
+        assert_eq!(diff["runtime_reload_required"], true);
+        assert_eq!(diff["mutating_reload_sent"], false);
+        assert_eq!(diff["reload_apply_status"], "dry_run_available");
+        assert_eq!(diff["budget"]["truncated"], false);
+        assert_eq!(diff["next_action"]["template_id"], "reload_apply_dry_run");
+        assert_eq!(
+            diff["next_action"]["safe_argv"],
+            serde_json::json!(["one-ai-key", "reload", "apply", "--dry-run"])
+        );
+
+        let resource_types: std::collections::BTreeSet<String> = diff["resource_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|section| section["resource_type"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            resource_types,
+            std::collections::BTreeSet::from([
+                "accounts".to_string(),
+                "channels".to_string(),
+                "credential_sets".to_string(),
+                "model_routes".to_string(),
+                "policy_profiles".to_string(),
+                "providers".to_string(),
+                "routing_profiles".to_string(),
+            ])
+        );
+        let provider_section = diff["resource_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| section["resource_type"] == "providers")
+            .unwrap();
+        assert_eq!(
+            provider_section["changed"],
+            serde_json::json!([
+                {
+                    "id": "provider:relay",
+                    "changed_fields": ["enabled"]
+                }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_diff_reports_endpoint_capability_changes() {
+        let (app, _) = registry_provider_fixture();
+        let staged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/management/registry/channels/test")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "enabled":true,
+                            "account":"relay-account",
+                            "routing_profile":"default-routing",
+                            "provider_kind":"openai_compatible",
+                            "api_base":"https://legacy.example.test/v1",
+                            "credential_set":"test-credentials",
+                            "auth_header":"Authorization",
+                            "auth_prefix":"Bearer ",
+                            "error_rules":{},
+                            "endpoint_capabilities":{
+                                "chat_completions":"supported",
+                                "responses":"unsupported",
+                                "embeddings":"unknown",
+                                "models":"local_projection",
+                                "diagnostic_labels":["reload-diff"]
+                            }
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/management/runtime/reload-diff")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let diff = response_json(response).await;
+        assert_eq!(diff["reason_code"], "reload_diff_available");
+        let channel_section = diff["resource_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| section["resource_type"] == "channels")
+            .unwrap();
+        assert_eq!(
+            channel_section["changed"],
+            serde_json::json!([
+                {
+                    "id": "test",
+                    "changed_fields": ["endpoint_capabilities"]
+                }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_diff_model_routes_use_redacted_resource_refs() {
+        let (app, _) = registry_provider_fixture();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/management/registry/model-routes/sensitive-public-model")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "targets":[
+                                {
+                                    "channel":"test",
+                                    "upstream_model":"sensitive-upstream-model"
+                                }
+                            ]
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/management/runtime/reload-diff")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(!body_text.contains("sensitive-public-model"));
+        assert!(!body_text.contains("sensitive-upstream-model"));
+        assert!(!body_text.contains("omitted_change_count"));
+        let diff = serde_json::from_str::<Value>(&body_text).unwrap();
+        let model_route_section = diff["resource_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| section["resource_type"] == "model_routes")
+            .unwrap();
+        assert_eq!(
+            model_route_section["added"],
+            serde_json::json!(["model_route:0"])
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_diff_model_route_target_change_is_typed_changed_field() {
+        let mut model_routes = HashMap::new();
+        model_routes.insert(
+            "sensitive-public-model".to_string(),
+            crate::config::ModelRouteConfig {
+                strategy: None,
+                targets: vec![crate::config::ModelRouteTargetConfig {
+                    channel: "test".to_string(),
+                    upstream_model: Some("first-sensitive-upstream".to_string()),
+                    priority: 100,
+                    weight: 1,
+                    enabled: true,
+                }],
+            },
+        );
+        let (app, _) = registry_provider_fixture_with_model_routes(model_routes);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/management/registry/model-routes/sensitive-public-model")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "targets":[
+                                {
+                                    "channel":"test",
+                                    "upstream_model":"second-sensitive-upstream"
+                                }
+                            ]
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/management/runtime/reload-diff")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(!body_text.contains("sensitive-public-model"));
+        assert!(!body_text.contains("first-sensitive-upstream"));
+        assert!(!body_text.contains("second-sensitive-upstream"));
+        let diff = serde_json::from_str::<Value>(&body_text).unwrap();
+        let model_route_section = diff["resource_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| section["resource_type"] == "model_routes")
+            .unwrap();
+        assert_eq!(model_route_section["added"], serde_json::json!([]));
+        assert_eq!(model_route_section["removed"], serde_json::json!([]));
+        assert_eq!(
+            model_route_section["changed"],
+            serde_json::json!([
+                {
+                    "id": "model_route:0",
+                    "changed_fields": ["targets"]
+                }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_diff_model_route_new_route_is_added_not_changed() {
+        let mut model_routes = HashMap::new();
+        model_routes.insert(
+            "active-sensitive-model".to_string(),
+            crate::config::ModelRouteConfig {
+                strategy: None,
+                targets: vec![crate::config::ModelRouteTargetConfig {
+                    channel: "test".to_string(),
+                    upstream_model: Some("active-sensitive-upstream".to_string()),
+                    priority: 100,
+                    weight: 1,
+                    enabled: true,
+                }],
+            },
+        );
+        let (app, _) = registry_provider_fixture_with_model_routes(model_routes);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/management/registry/model-routes/staged-sensitive-model")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "targets":[
+                                {
+                                    "channel":"test",
+                                    "upstream_model":"staged-sensitive-upstream"
+                                }
+                            ]
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/management/runtime/reload-diff")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        for forbidden in [
+            "active-sensitive-model",
+            "staged-sensitive-model",
+            "active-sensitive-upstream",
+            "staged-sensitive-upstream",
+        ] {
+            assert!(!body_text.contains(forbidden));
+        }
+        let diff = serde_json::from_str::<Value>(&body_text).unwrap();
+        let model_route_section = diff["resource_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| section["resource_type"] == "model_routes")
+            .unwrap();
+        assert_eq!(model_route_section["changed"], serde_json::json!([]));
+        assert_eq!(model_route_section["removed"], serde_json::json!([]));
+        assert_eq!(
+            model_route_section["added"],
+            serde_json::json!(["model_route:0"])
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_diff_truncates_large_resource_changes() {
+        let (app, _) = registry_provider_fixture();
+        for index in 0..70 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/management/registry/providers/extra-{index}"))
+                        .header(header::AUTHORIZATION, admin_bearer())
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{
+                                "provider_kind":"openai_compatible",
+                                "enabled":true
+                            }"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/management/runtime/reload-diff")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let diff = response_json(response).await;
+
+        assert_eq!(diff["status"], "ok");
+        assert_eq!(diff["reason_code"], "reload_diff_truncated");
+        assert_eq!(diff["budget"]["max_resource_changes"], 64);
+        assert!(diff["budget"]["total_resource_changes"].as_u64().unwrap() > 64);
+        assert!(diff["budget"]["omitted_resource_changes"].as_u64().unwrap() > 0);
+        assert_eq!(diff["budget"]["truncated"], true);
+        let visible_changes: usize = diff["resource_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|section| {
+                section["added"].as_array().unwrap().len()
+                    + section["removed"].as_array().unwrap().len()
+                    + section["changed"].as_array().unwrap().len()
+            })
+            .sum();
+        assert!(visible_changes <= 64);
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_diff_does_not_invoke_reload() {
+        let (app, _) = registry_provider_fixture();
+        let staged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/registry/providers/relay/disable")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.status(), StatusCode::OK);
+        let before_runtime = management_response_json(&app, "/management/runtime").await;
+        let before_explain = management_response_json(&app, "/management/explain/runtime").await;
+        let before_events = management_response_json(&app, "/management/events").await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/management/runtime/reload-diff")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let after_runtime = management_response_json(&app, "/management/runtime").await;
+        let after_explain = management_response_json(&app, "/management/explain/runtime").await;
+        let after_events = management_response_json(&app, "/management/events").await;
+        let providers = management_response_json(&app, "/management/providers").await;
+
+        assert_eq!(before_runtime["active_registry_version"], 1);
+        assert_eq!(after_runtime["active_registry_version"], 1);
+        assert_eq!(after_runtime["staged_registry_version"], 2);
+        assert_eq!(after_runtime["runtime_reload_required"], true);
+        assert_eq!(before_explain["last_reload"], after_explain["last_reload"]);
+        assert_eq!(before_events["total_events"], after_events["total_events"]);
+        assert_eq!(providers["providers"][0]["enabled"], true);
     }
 
     fn runtime_retry_pressure_failure(
@@ -23591,6 +25615,7 @@ pools:
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -24160,6 +26185,7 @@ pools:
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -24299,6 +26325,7 @@ pools:
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -24422,6 +26449,7 @@ pools:
         pools.insert(
             "a".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -24748,6 +26776,7 @@ pools:
         pools.insert(
             "a".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -25133,6 +27162,7 @@ model_routes:
         pools.insert(
             "relay".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -25554,6 +27584,7 @@ model_routes:
                 (
                     "disabled".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("disabled-account".to_string()),
                         policy_profile: None,
@@ -25569,6 +27600,7 @@ model_routes:
                 (
                     "fallback".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("fallback-account".to_string()),
                         policy_profile: None,
@@ -25991,6 +28023,7 @@ model_routes:
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -26172,6 +28205,7 @@ model_routes:
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -27374,6 +29408,7 @@ model_routes:
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -27484,6 +29519,7 @@ model_routes:
         pools.insert(
             "default".to_string(),
             PoolConfig {
+                endpoint_capabilities: Default::default(),
                 enabled: true,
                 account: None,
                 policy_profile: None,
@@ -28163,6 +30199,7 @@ model_routes:
                 (
                     "primary".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("primary-account".to_string()),
                         policy_profile: None,
@@ -28178,6 +30215,7 @@ model_routes:
                 (
                     "fallback".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("fallback-account".to_string()),
                         policy_profile: None,
@@ -28626,6 +30664,7 @@ model_routes:
                 pools: HashMap::from([(
                     "generic".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: None,
                         policy_profile: None,
@@ -28746,6 +30785,7 @@ model_routes:
                 pools: HashMap::from([(
                     "generic".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: None,
                         policy_profile: None,
@@ -28845,6 +30885,7 @@ model_routes:
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -28978,6 +31019,7 @@ model_routes:
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -29137,6 +31179,7 @@ model_routes:
             pools.insert(
                 name.to_string(),
                 PoolConfig {
+                    endpoint_capabilities: Default::default(),
                     enabled: true,
                     account: None,
                     policy_profile: None,
@@ -31319,6 +33362,7 @@ model_routes:
                 pools: HashMap::from([(
                     "generic".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: None,
                         policy_profile: None,
@@ -31422,6 +33466,7 @@ model_routes:
                 pools: HashMap::from([(
                     "generic".to_string(),
                     PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: None,
                         policy_profile: None,

@@ -14,6 +14,27 @@ Before semantic validation, the loader expands the top-level `upstreams`
 shortcut into normal registry resources. The request path never reads the YAML
 file, expands shortcuts, or queries persistent stores.
 
+For local first-run setup, use the offline operator commands:
+
+```bash
+one-ai-key init local --out config/local.yaml --keys data/relay.keys --dry-run
+one-ai-key init local --out config/local.yaml --keys data/relay.keys --yes
+one-ai-key check-config --config config/local.yaml
+```
+
+`init local` writes placeholders only. Replace the generated client token,
+management token, and add upstream keys to the generated key file before
+expecting a serving smoke test to work.
+
+`check-config` is an offline preflight. It parses the YAML, expands
+`upstreams`, validates local references, reads local key files through a
+diagnostic placeholder loader, and reports `model_visibility_preview` for
+configured client-token references. It can also warn about obvious static
+endpoint capability mismatches, such as an embedding-looking public route whose
+enabled targets all declare `embeddings: unsupported`. It does not open SQLite
+stores, perform migrations, start a listener, probe upstreams, reload runtime,
+or call upstream model catalogs.
+
 ## Top-Level Process Fields
 
 | Field | Purpose |
@@ -40,15 +61,18 @@ The normalized registry contains these resource families:
 | `providers` | Provider kind and provider-level enablement. |
 | `accounts` | Provider account endpoint, upstream API base, auth header shape, and account enablement. |
 | `credential_sets` | File-backed bootstrap location for upstream credentials. |
-| `pools` | Runtime channels. A pool binds account/provider settings, credential set, error policy, and routing policy. |
+| `pools` | Runtime channels. A pool binds account/provider settings, credential set, error policy, routing policy, and optional static endpoint capability metadata. |
 | `policy_profiles` | Shared relay/error classification behavior. |
 | `routing_profiles` | Shared credential selection and retry behavior. |
 | `model_routes` | Client-visible public model ids and ordered route targets. |
 | `model_groups` | Optional model groups used for client-token scope. |
 
 `default_pool` is used when a request path can be served without explicit model
-routing. `default_routing_profile` provides the routing profile for channels
-that do not specify one.
+routing. `default_pool` is not a default model and never injects a missing
+`model` field. Clients must send explicit public model ids for
+OpenAI-compatible requests that need model routing; those ids are checked
+against compiled `model_routes` and client-token scope. `default_routing_profile`
+provides the routing profile for channels that do not specify one.
 
 ## Upstream Shortcuts
 
@@ -74,6 +98,55 @@ as if those resources had been written explicitly.
 Common templates include OpenAI-compatible bearer and API-key-header shapes.
 Managed-site templates can provide defaults for known relays, but local
 configuration should still make model exposure and credential sources explicit.
+
+## Endpoint Capabilities
+
+`pools.<id>.endpoint_capabilities` is static operator metadata for endpoint
+families. It is resolved at startup or runtime reload and is intended for
+diagnostics and management projections, not request-time enforcement.
+
+```yaml
+pools:
+  relay:
+    provider_kind: openai_compatible
+    api_base: https://relay.example/v1
+    credential_set: relay_credentials
+    endpoint_capabilities:
+      chat_completions: supported
+      responses: unknown
+      embeddings: unknown
+      models: local_projection
+      diagnostic_labels:
+        - relay
+```
+
+Supported values for `chat_completions`, `responses`, and `embeddings` are
+`supported`, `unsupported`, and `unknown`. Supported values for `models` are
+`local_projection`, `unsupported`, and `unknown`; `local_projection` means the
+router serves client-facing `/v1/models` from its compiled public route catalog.
+
+OpenAI-compatible upstream templates populate conservative defaults:
+`chat_completions: supported`, `responses: unknown`, `embeddings: unknown`, and
+`models: local_projection`. The metadata does not list provider models, context
+lengths, pricing, tool support, or provider-specific model features. It does not
+call upstream `/v1/models`, probe credentials, reject client requests, or bridge
+Responses API requests to Chat Completions.
+`responses: supported` is only an operator-declared endpoint-family diagnostic.
+It does not enable Responses defaulting, Responses-to-Chat conversion, missing
+model injection, or any request-path protocol adapter.
+
+Management projections and CLI explanation commands may display these fields.
+`models explain` and `route explain` read the compiled routing preview and
+report candidate endpoint capabilities as structured JSON or a table summary.
+Those commands do not query `/management/channels/{id}` per candidate, call
+upstream endpoints, mutate runtime state, or treat `unknown` as
+`unsupported`.
+
+`check-config` treats capability diagnostics as warnings only. The current
+offline check intentionally warns only for high-confidence mismatches: model
+names that strongly look like embeddings routed only through enabled targets
+whose resolved `embeddings` capability is explicitly `unsupported`. `unknown`
+does not warn, because it means the router has no static evidence either way.
 
 ## Client Tokens
 

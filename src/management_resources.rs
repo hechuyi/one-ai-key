@@ -11,6 +11,7 @@ use crate::{
         CredentialProbeSummaryRecord, CredentialSetId, CredentialStoreError, CredentialStoreHandle,
         KeyImportReport,
     },
+    endpoint_capabilities::EndpointCapabilitiesStatus,
     events::{ManagementAuditEvent, ManagementEventActor},
     management_credential_sources::{
         key_import_status, key_import_status_for_pool, KeyImportStatus,
@@ -40,6 +41,7 @@ pub struct PoolStatus {
     pub account_id: String,
     pub credential_set_id: String,
     pub provider_kind: ProviderKind,
+    pub endpoint_capabilities: EndpointCapabilitiesStatus,
     pub api_base: String,
     pub auth_header: String,
     pub auth_prefix_configured: bool,
@@ -110,6 +112,7 @@ fn pool_status_from_snapshot(
         account_id: topology.account_id.clone(),
         credential_set_id: topology.credential_set_id.0.clone(),
         provider_kind: topology.provider_kind,
+        endpoint_capabilities: EndpointCapabilitiesStatus::from(&topology.endpoint_capabilities),
         api_base: redacted_api_base(&topology.api_base),
         auth_header: topology.auth_header.clone(),
         auth_prefix_configured: topology.auth_prefix_configured,

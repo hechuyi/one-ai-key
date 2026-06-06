@@ -113,6 +113,7 @@ pub enum ProbeCredentialKindRequest {
 #[derive(Debug, Deserialize)]
 pub struct ApplyLatestProbeRequest {
     pub reason: Option<String>,
+    pub probe_result_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +126,11 @@ pub struct ImportCredentialSetCredentialsRequest {
 pub struct RoutingPreviewQuery {
     pub model: String,
     pub client_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RuntimeReloadQuery {
+    pub expected_staged_registry_version: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -24,6 +24,7 @@ use crate::management_commands::{
     credential_mutation_response, credential_set_probe_apply_command,
     execute_credential_command_for_state, CredentialMutationResponse,
 };
+use crate::management_credential_refs::credential_ref_for_position;
 use crate::management_credential_sources::{key_import_source_id_for_pool, source_id};
 use crate::management_errors::{
     credential_resource_store_error, credential_store_error, ManagementServiceError,
@@ -104,6 +105,7 @@ pub enum CredentialImportSourceKindStatus {
 pub struct CredentialResourceStatus {
     pub credential_set_id: String,
     pub credential_id: String,
+    pub credential_ref: String,
     pub fingerprint: String,
     pub label: Option<String>,
     pub note: Option<String>,
@@ -118,6 +120,8 @@ pub struct CredentialResourceStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct CredentialStatus {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
     pub fingerprint: String,
     pub state: CredentialStateSnapshot,
     pub source: CredentialSourceStatus,
@@ -652,10 +656,15 @@ pub async fn credential_resource_for_set(
         .await
         .map_err(credential_resource_store_error)?
         .map(credential_probe_result_status);
+    let credential_ref = credential_ref_for_position(resource.position);
     Ok(credential_resource_response(
         credential_set_id,
         channel_ids,
-        credential_status(snapshot),
+        credential_status_with_latest_probe_and_ref(
+            snapshot,
+            latest_probe.clone(),
+            Some(credential_ref),
+        ),
         credential_resource_status(resource),
         latest_probe,
     ))
@@ -1049,8 +1058,22 @@ pub struct CredentialProbeApplyResponse {
 }
 
 pub struct CredentialProbeApplyPlan {
+    pub probe_result_ref: String,
     pub action: CredentialProbeApplyActionStatus,
     pub probe: CredentialProbeResultStatus,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CredentialProbeApplyPlanResponse {
+    pub credential_set_id: String,
+    pub credential_ref: String,
+    pub probe_result_ref: String,
+    pub action: CredentialProbeApplyActionStatus,
+    pub probe: CredentialProbeResultStatus,
+}
+
+pub fn credential_probe_result_ref_for_id(id: i64) -> String {
+    format!("pr:v1:id:{id}")
 }
 
 pub async fn credential_probe_apply_plan_for_latest_result(
@@ -1068,8 +1091,7 @@ pub async fn credential_probe_apply_plan_for_latest_result(
         .map_err(credential_resource_store_error)?
         .ok_or_else(|| {
             ManagementServiceError::NotFound(format!(
-                "no probe result for credential {} in credential_set {credential_set_id}",
-                credential_id.0
+                "no probe result for selected credential in credential_set {credential_set_id}"
             ))
         })?;
     let action = if probe_result_is_default_key_switch_cooldown(
@@ -1080,9 +1102,41 @@ pub async fn credential_probe_apply_plan_for_latest_result(
     } else {
         probe_apply_action(probe.outcome, &pool_state.probe_result_policy)
     };
+    let probe_result_ref = credential_probe_result_ref_for_id(probe.id);
     Ok(CredentialProbeApplyPlan {
+        probe_result_ref,
         action,
         probe: credential_probe_result_status(probe),
+    })
+}
+
+pub async fn credential_probe_apply_plan_response_for_set(
+    state: &AppState,
+    credential_set_id: &str,
+    credential_id: CredentialId,
+) -> Result<CredentialProbeApplyPlanResponse, ManagementServiceError> {
+    let scope = credential_set_runtime_scope(state, credential_set_id)?;
+    let resource = credential_resource_for_set(
+        &state.credential_store,
+        &scope.credential_set_id.0,
+        scope.channel_ids,
+        &scope.pool_state,
+        credential_id.clone(),
+    )
+    .await?;
+    let plan = credential_probe_apply_plan_for_latest_result(
+        &state.credential_store,
+        &scope.credential_set_id.0,
+        &scope.pool_state,
+        credential_id,
+    )
+    .await?;
+    Ok(CredentialProbeApplyPlanResponse {
+        credential_set_id: scope.credential_set_id.0,
+        credential_ref: resource.resource.credential_ref,
+        probe_result_ref: plan.probe_result_ref,
+        action: plan.action,
+        probe: plan.probe,
     })
 }
 
@@ -1107,6 +1161,8 @@ pub async fn apply_latest_credential_probe_response_for_set(
     actor: ManagementEventActor,
     credential_set_id: &str,
     credential_id: CredentialId,
+    expected_probe_result_ref: Option<String>,
+    require_probe_result_ref: bool,
     reason: String,
 ) -> Result<CredentialProbeApplyResponse, ManagementServiceError> {
     let scope = credential_set_runtime_scope(state, credential_set_id)?;
@@ -1117,6 +1173,9 @@ pub async fn apply_latest_credential_probe_response_for_set(
         credential_id.clone(),
     )
     .await?;
+    if require_probe_result_ref {
+        validate_probe_apply_precondition(expected_probe_result_ref.as_deref(), &plan)?;
+    }
     let mutation = match credential_set_probe_apply_command(
         plan.action,
         actor.clone(),
@@ -1156,6 +1215,41 @@ pub async fn apply_latest_credential_probe_response_for_set(
         plan.probe,
         mutation,
     ))
+}
+
+fn validate_probe_apply_precondition(
+    expected_probe_result_ref: Option<&str>,
+    plan: &CredentialProbeApplyPlan,
+) -> Result<(), ManagementServiceError> {
+    let Some(expected_probe_result_ref) = expected_probe_result_ref else {
+        return Err(ManagementServiceError::Conflict(
+            "probe_result_ref is required before applying latest probe evidence".to_string(),
+        ));
+    };
+    let Some(expected_probe_result_ref) = normalize_probe_result_ref(expected_probe_result_ref)
+    else {
+        return Err(ManagementServiceError::BadRequest(
+            "probe_result_ref must use pr:v1:id:<number>".to_string(),
+        ));
+    };
+    if expected_probe_result_ref != plan.probe_result_ref {
+        return Err(ManagementServiceError::Conflict(
+            "probe_result_ref does not match the latest probe result".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_probe_result_ref(value: &str) -> Option<String> {
+    let id = value.strip_prefix("pr:v1:id:")?;
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let id = id.parse::<i64>().ok()?;
+    if id < 0 {
+        return None;
+    }
+    Some(format!("pr:v1:id:{id}"))
 }
 
 #[derive(Debug, Serialize)]
@@ -1273,6 +1367,8 @@ pub async fn apply_latest_credential_probes_response_for_set(
             actor.clone(),
             credential_set_id,
             CredentialId(credential_id.clone()),
+            None,
+            false,
             reason.clone(),
         )
         .await;
@@ -1333,12 +1429,20 @@ pub fn credential_probe_batch_apply_error(
     err: ManagementServiceError,
 ) -> CredentialProbeBatchApplyError {
     match err.into_public_error() {
+        ManagementServiceError::BadRequest(message) => CredentialProbeBatchApplyError {
+            kind: "bad_request",
+            message,
+        },
         ManagementServiceError::NotFound(message) => CredentialProbeBatchApplyError {
             kind: "not_found",
             message,
         },
         ManagementServiceError::Conflict(message) => CredentialProbeBatchApplyError {
             kind: "conflict",
+            message,
+        },
+        ManagementServiceError::PreconditionFailed(message) => CredentialProbeBatchApplyError {
+            kind: "precondition_failed",
             message,
         },
         ManagementServiceError::Persistence(message) => CredentialProbeBatchApplyError {
@@ -1682,15 +1786,17 @@ pub fn credential_import_detail_response(
 }
 
 pub fn credential_status(snapshot: CredentialSnapshot) -> CredentialStatus {
-    credential_status_with_latest_probe(snapshot, None)
+    credential_status_with_latest_probe_and_ref(snapshot, None, None)
 }
 
-pub fn credential_status_with_latest_probe(
+pub fn credential_status_with_latest_probe_and_ref(
     snapshot: CredentialSnapshot,
     latest_probe: Option<CredentialProbeResultStatus>,
+    credential_ref: Option<String>,
 ) -> CredentialStatus {
     CredentialStatus {
         id: snapshot.id,
+        credential_ref,
         fingerprint: snapshot.fingerprint,
         state: redact_credential_state(snapshot.state),
         source: CredentialSourceStatus {
@@ -1719,14 +1825,31 @@ pub async fn credential_statuses_with_latest_probe(
         Err(CredentialStoreError::NotWritable) => HashMap::new(),
         Err(err) => return Err(credential_resource_store_error(err)),
     };
+    let credential_ids: Vec<_> = snapshots
+        .iter()
+        .map(|snapshot| CredentialId(snapshot.id.clone()))
+        .collect();
+    let credential_positions = match credential_store
+        .load_credential_positions_for_credentials(credential_set_id.clone(), credential_ids)
+        .await
+    {
+        Ok(positions) => positions,
+        Err(CredentialStoreError::NotWritable) => HashMap::new(),
+        Err(err) => return Err(credential_resource_store_error(err)),
+    };
     Ok(snapshots
         .into_iter()
         .map(|snapshot| {
+            let credential_id = CredentialId(snapshot.id.clone());
             let latest_probe = latest_probes
-                .get(&CredentialId(snapshot.id.clone()))
+                .get(&credential_id)
                 .cloned()
                 .map(credential_probe_result_status);
-            credential_status_with_latest_probe(snapshot, latest_probe)
+            let credential_ref = credential_positions
+                .get(&credential_id)
+                .copied()
+                .map(credential_ref_for_position);
+            credential_status_with_latest_probe_and_ref(snapshot, latest_probe, credential_ref)
         })
         .collect())
 }
@@ -1793,6 +1916,7 @@ pub fn credential_resource_status(record: CredentialResourceRecord) -> Credentia
     CredentialResourceStatus {
         credential_set_id: record.credential_set_id.0,
         credential_id: record.credential_id.0,
+        credential_ref: credential_ref_for_position(record.position),
         fingerprint: record.fingerprint,
         label: record.label,
         note: record.note,

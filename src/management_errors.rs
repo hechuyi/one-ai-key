@@ -5,8 +5,10 @@ use crate::{
 
 #[derive(Debug)]
 pub enum ManagementServiceError {
+    BadRequest(String),
     NotFound(String),
     Conflict(String),
+    PreconditionFailed(String),
     Persistence(String),
     EventAppendFailed {
         message: String,
@@ -24,6 +26,10 @@ impl ManagementServiceError {
             }
             other => other,
         }
+    }
+
+    pub fn records_runtime_reload_failure(&self) -> bool {
+        !matches!(self, ManagementServiceError::PreconditionFailed(_))
     }
 }
 

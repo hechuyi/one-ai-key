@@ -29,12 +29,14 @@ use crate::{
         quota_exhaust_credential_response_for_channel, quota_exhaust_credential_response_for_set,
         restore_credential_response_for_channel, restore_credential_response_for_set,
     },
+    management_credential_refs::resolve_credential_path_segment,
     management_credentials::{
         apply_latest_credential_probe_response_for_set,
         apply_latest_credential_probes_response_for_set, credential_import_for_existing_set,
         credential_import_response_for_set, credential_imports_for_existing_set,
         credential_lifecycle_history_response_for_set,
-        credential_operator_metadata_response_for_set, credential_probe_results_response_for_set,
+        credential_operator_metadata_response_for_set,
+        credential_probe_apply_plan_response_for_set, credential_probe_results_response_for_set,
         credential_resource_response_for_set, credential_set_credentials_response_for_set_page,
         credentials_response_for_channel_page, probe_credential_response_for_command,
     },
@@ -58,7 +60,7 @@ use crate::{
         CredentialsQuery, EventsQuery, ExpireCredentialRequest,
         ImportCredentialSetCredentialsRequest, ModelDiscoverySyncPlanRequest,
         ProbeCredentialKindRequest, ProbeCredentialRequest, RoutingPreviewQuery,
-        SetCredentialMetadataRequest, UpdateClientTokenScopeRequest,
+        RuntimeReloadQuery, SetCredentialMetadataRequest, UpdateClientTokenScopeRequest,
     },
     management_resources::{
         accounts_response, credential_sets_response_for_state, disable_channel_resource,
@@ -71,11 +73,22 @@ use crate::{
         response_filter_events_snapshot_response, routing_telemetry_snapshot_response,
         runtime_explain_response_for_state, runtime_response_for_state, serving_health_response,
     },
+    management_runtime_diff::runtime_reload_diff_response_for_state,
     model_discovery,
     state::AppState,
 };
 
 const MAX_CHAT_PROBE_EXPECTED_OUTPUT_CHARS: usize = 256;
+
+async fn credential_id_from_path_segment_response(
+    state: &AppState,
+    credential_set_id: &str,
+    path_segment: String,
+) -> Result<CredentialId, Response> {
+    resolve_credential_path_segment(&state.credential_store, credential_set_id, path_segment)
+        .await
+        .map_err(service_error)
+}
 
 pub async fn list_pools(State(state): State<AppState>, headers: HeaderMap) -> Response {
     list_channel_statuses(state, headers).await
@@ -639,7 +652,12 @@ pub async fn credential_set_credential(
         Err(resp) => return *resp,
     };
     let _principal_context = (&principal.id, &principal.name, &principal.role);
-    match credential_resource_response_for_set(&state, &id, CredentialId(credential_id)).await {
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &id, credential_id).await {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
+    match credential_resource_response_for_set(&state, &id, credential_id).await {
         Ok(resource) => Json(resource).into_response(),
         Err(err) => service_error(err),
     }
@@ -656,11 +674,16 @@ pub async fn set_credential_set_credential_metadata(
         Err(resp) => return *resp,
     };
     let actor = management_actor(&principal);
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &id, credential_id).await {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
     match credential_operator_metadata_response_for_set(
         &state,
         actor,
         &id,
-        CredentialId(credential_id),
+        credential_id,
         request.label,
         request.note,
     )
@@ -682,10 +705,15 @@ pub async fn credential_set_credential_history(
         Err(resp) => return *resp,
     };
     let _principal_context = (&principal.id, &principal.name, &principal.role);
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &id, credential_id).await {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
     match credential_lifecycle_history_response_for_set(
         &state,
         &id,
-        CredentialId(credential_id),
+        credential_id,
         query.offset_or_zero(),
         query.bounded_limit(usize::MAX, 1000),
     )
@@ -707,6 +735,11 @@ pub async fn probe_credential_set_credential(
         Err(resp) => return *resp,
     };
     let actor = management_actor(&principal);
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &id, credential_id).await {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
     let model = payload.model.trim().to_string();
     if model.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "model must not be empty");
@@ -745,7 +778,7 @@ pub async fn probe_credential_set_credential(
         actor,
         CredentialProbeCommand {
             credential_set_id: id,
-            credential_id: CredentialId(credential_id),
+            credential_id,
             model,
             kind,
             expected_output,
@@ -770,16 +803,42 @@ pub async fn credential_set_credential_probes(
         Err(resp) => return *resp,
     };
     let _principal_context = (&principal.id, &principal.name, &principal.role);
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &id, credential_id).await {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
     match credential_probe_results_response_for_set(
         &state,
         &id,
-        CredentialId(credential_id),
+        credential_id,
         query.offset_or_zero(),
         query.bounded_limit(usize::MAX, 1000),
     )
     .await
     {
         Ok(history) => Json(history).into_response(),
+        Err(err) => service_error(err),
+    }
+}
+
+pub async fn credential_probe_apply_plan(
+    State(state): State<AppState>,
+    Path((id, credential_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let principal = match authorize_management(&state, &headers) {
+        Ok(principal) => principal,
+        Err(resp) => return *resp,
+    };
+    let _principal_context = (&principal.id, &principal.name, &principal.role);
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &id, credential_id).await {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
+    match credential_probe_apply_plan_response_for_set(&state, &id, credential_id).await {
+        Ok(plan) => Json(plan).into_response(),
         Err(err) => service_error(err),
     }
 }
@@ -797,11 +856,18 @@ pub async fn apply_latest_credential_probe(
     let reason = payload
         .reason
         .unwrap_or_else(|| "apply latest credential probe".to_string());
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &id, credential_id).await {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
     match apply_latest_credential_probe_response_for_set(
         &state,
         management_actor(&principal),
         &id,
-        CredentialId(credential_id),
+        credential_id,
+        payload.probe_result_ref,
+        true,
         reason,
     )
     .await
@@ -1184,11 +1250,18 @@ pub async fn expire_credential_set_credential(
     };
     let actor = management_actor(&principal);
     let reason = request.reason_or("manual management action");
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &credential_set_id, credential_id)
+            .await
+        {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
     match expire_credential_response_for_set(
         &state,
         actor,
         &credential_set_id,
-        CredentialId(credential_id),
+        credential_id,
         reason,
     )
     .await
@@ -1210,11 +1283,18 @@ pub async fn restore_credential_set_credential(
     };
     let actor = management_actor(&principal);
     let reason = request.reason_or("manual management action");
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &credential_set_id, credential_id)
+            .await
+        {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
     match restore_credential_response_for_set(
         &state,
         actor,
         &credential_set_id,
-        CredentialId(credential_id),
+        credential_id,
         reason,
     )
     .await
@@ -1236,11 +1316,18 @@ pub async fn quota_exhaust_credential_set_credential(
     };
     let actor = management_actor(&principal);
     let reason = request.reason_or("manual quota exhaust");
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &credential_set_id, credential_id)
+            .await
+        {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
     match quota_exhaust_credential_response_for_set(
         &state,
         actor,
         &credential_set_id,
-        CredentialId(credential_id),
+        credential_id,
         reason,
     )
     .await
@@ -1262,11 +1349,18 @@ pub async fn reset_credential_set_credential_cooldown(
     };
     let actor = management_actor(&principal);
     let reason = request.reason_or("manual cooldown reset");
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &credential_set_id, credential_id)
+            .await
+        {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
     match clear_credential_cooldown_response_for_set(
         &state,
         actor,
         &credential_set_id,
-        CredentialId(credential_id),
+        credential_id,
         reason,
     )
     .await
@@ -1288,11 +1382,18 @@ pub async fn disable_credential_set_credential(
     };
     let actor = management_actor(&principal);
     let reason = request.reason_or("manual disable");
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &credential_set_id, credential_id)
+            .await
+        {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
     match disable_credential_response_for_set(
         &state,
         actor,
         &credential_set_id,
-        CredentialId(credential_id),
+        credential_id,
         reason,
     )
     .await
@@ -1314,11 +1415,18 @@ pub async fn enable_credential_set_credential(
     };
     let actor = management_actor(&principal);
     let reason = request.reason_or("manual enable");
+    let credential_id =
+        match credential_id_from_path_segment_response(&state, &credential_set_id, credential_id)
+            .await
+        {
+            Ok(credential_id) => credential_id,
+            Err(resp) => return resp,
+        };
     match enable_credential_response_for_set(
         &state,
         actor,
         &credential_set_id,
-        CredentialId(credential_id),
+        credential_id,
         reason,
     )
     .await
@@ -1448,14 +1556,30 @@ pub async fn explain_runtime(State(state): State<AppState>, headers: HeaderMap) 
     }
 }
 
-pub async fn reload_runtime(State(state): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn runtime_reload_diff(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match authorize_management(&state, &headers) {
+        Ok(principal) => principal,
+        Err(resp) => return *resp,
+    };
+    let _principal_context = (&principal.id, &principal.name, &principal.role);
+    match runtime_reload_diff_response_for_state(&state).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => service_error(err),
+    }
+}
+
+pub async fn reload_runtime(
+    State(state): State<AppState>,
+    Query(query): Query<RuntimeReloadQuery>,
+    headers: HeaderMap,
+) -> Response {
     let principal = match authorize_management(&state, &headers) {
         Ok(principal) => principal,
         Err(resp) => return *resp,
     };
     let actor = management_actor(&principal);
 
-    match reload_runtime_state(&state, actor).await {
+    match reload_runtime_state(&state, actor, query.expected_staged_registry_version).await {
         Ok(runtime) => Json(runtime).into_response(),
         Err(err) => service_error(err),
     }
@@ -1463,8 +1587,12 @@ pub async fn reload_runtime(State(state): State<AppState>, headers: HeaderMap) -
 
 fn service_error(err: ManagementServiceError) -> Response {
     match err {
+        ManagementServiceError::BadRequest(message) => json_error(StatusCode::BAD_REQUEST, message),
         ManagementServiceError::NotFound(message) => json_error(StatusCode::NOT_FOUND, message),
         ManagementServiceError::Conflict(message) => json_error(StatusCode::CONFLICT, message),
+        ManagementServiceError::PreconditionFailed(message) => {
+            json_error(StatusCode::CONFLICT, message)
+        }
         ManagementServiceError::Persistence(message) => {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, message)
         }

@@ -15,6 +15,7 @@ use crate::{
         ModelRouteTargetConfig, PolicyProfileConfig, PoolConfig, ProviderConfig,
         RoutingProfileConfig,
     },
+    endpoint_capabilities::EndpointCapabilitiesConfig,
     provider::ProviderKind,
 };
 
@@ -619,6 +620,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             policy_profile_id TEXT,
             routing_profile_id TEXT,
             error_rules_json TEXT NOT NULL,
+            endpoint_capabilities_json TEXT NOT NULL DEFAULT '{}',
             enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
             version_id INTEGER NOT NULL
         );
@@ -655,7 +657,33 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             version_id INTEGER NOT NULL
         );
         ",
+    )?;
+    ensure_column(
+        connection,
+        "channels",
+        "endpoint_capabilities_json",
+        "TEXT NOT NULL DEFAULT '{}'",
     )
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(());
+        }
+    }
+    connection.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
+    Ok(())
 }
 
 fn insert_registry_version(connection: &Connection, version: u64) -> anyhow::Result<()> {
@@ -758,8 +786,8 @@ fn replace_document_rows(
         connection.execute(
             "INSERT INTO channels (
                 id, account_id, credential_set_id, policy_profile_id, routing_profile_id,
-                error_rules_json, enabled, version_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                error_rules_json, endpoint_capabilities_json, enabled, version_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 channel.account.as_deref().unwrap_or(""),
@@ -767,6 +795,7 @@ fn replace_document_rows(
                 channel.policy_profile.as_deref(),
                 channel.routing_profile.as_deref(),
                 serde_json::to_string(&channel.error_rules)?,
+                serde_json::to_string(&channel.endpoint_capabilities)?,
                 channel.enabled as i64,
                 version
             ],
@@ -862,14 +891,15 @@ fn upsert_channel(
     connection.execute(
         "INSERT INTO channels (
             id, account_id, credential_set_id, policy_profile_id, routing_profile_id,
-            error_rules_json, enabled, version_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            error_rules_json, endpoint_capabilities_json, enabled, version_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(id) DO UPDATE SET
             account_id = excluded.account_id,
             credential_set_id = excluded.credential_set_id,
             policy_profile_id = excluded.policy_profile_id,
             routing_profile_id = excluded.routing_profile_id,
             error_rules_json = excluded.error_rules_json,
+            endpoint_capabilities_json = excluded.endpoint_capabilities_json,
             enabled = excluded.enabled,
             version_id = excluded.version_id",
         params![
@@ -879,6 +909,7 @@ fn upsert_channel(
             channel.policy_profile.as_deref(),
             channel.routing_profile.as_deref(),
             serde_json::to_string(&channel.error_rules)?,
+            serde_json::to_string(&channel.endpoint_capabilities)?,
             channel.enabled as i64,
             version as i64
         ],
@@ -1069,7 +1100,7 @@ fn load_registry_resources(connection: &Connection) -> anyhow::Result<RegistryRe
     let mut pools = HashMap::new();
     let mut channel_rows = connection.prepare(
         "SELECT id, account_id, credential_set_id, policy_profile_id, routing_profile_id,
-                error_rules_json, enabled
+                error_rules_json, endpoint_capabilities_json, enabled
          FROM channels ORDER BY id",
     )?;
     let channel_iter = channel_rows.query_map([], |row| {
@@ -1089,10 +1120,20 @@ fn load_registry_resources(connection: &Connection) -> anyhow::Result<RegistryRe
                     Box::new(err),
                 )
             })?;
+        let endpoint_capabilities_json: String = row.get(6)?;
+        let endpoint_capabilities: EndpointCapabilitiesConfig =
+            serde_json::from_str(&endpoint_capabilities_json).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
         Ok((
             row.get::<_, String>(0)?,
             PoolConfig {
-                enabled: row.get::<_, i64>(6)? != 0,
+                endpoint_capabilities,
+                enabled: row.get::<_, i64>(7)? != 0,
                 account: Some(account_id),
                 policy_profile: row.get(3)?,
                 routing_profile: row.get(4)?,
@@ -1314,6 +1355,9 @@ mod tests {
             PolicyProfileConfig, PoolConfig, ProviderConfig, RouteTargetRetryConfig,
             RoutingProfileConfig, SameRequestCredentialRetryConfig, TimeoutConfig,
         },
+        endpoint_capabilities::{
+            EndpointCapabilitiesConfig, EndpointSupport, ModelsEndpointCapability,
+        },
         provider::ProviderKind,
         test_fixtures::{credential_lines, fixtures},
     };
@@ -1425,6 +1469,13 @@ mod tests {
         document.pools.insert(
             "primary-channel".to_string(),
             PoolConfig {
+                endpoint_capabilities: EndpointCapabilitiesConfig {
+                    chat_completions: Some(EndpointSupport::Supported),
+                    responses: Some(EndpointSupport::Unsupported),
+                    embeddings: Some(EndpointSupport::Unknown),
+                    models: Some(ModelsEndpointCapability::LocalProjection),
+                    diagnostic_labels: vec!["registry-fixture".to_string()],
+                },
                 enabled: true,
                 account: Some("primary".to_string()),
                 policy_profile: Some("relay-cooldown".to_string()),
@@ -1498,6 +1549,10 @@ mod tests {
         assert_eq!(
             loaded.pools["primary-channel"].routing_profile,
             expected.pools["primary-channel"].routing_profile
+        );
+        assert_eq!(
+            loaded.pools["primary-channel"].endpoint_capabilities,
+            expected.pools["primary-channel"].endpoint_capabilities
         );
         assert_eq!(
             serde_json::to_value(&loaded.pools["primary-channel"].error_rules).unwrap(),
@@ -2070,6 +2125,13 @@ mod tests {
         .unwrap();
         let store = SqliteRegistryStore::open(&path).unwrap();
         let channel = PoolConfig {
+            endpoint_capabilities: EndpointCapabilitiesConfig {
+                chat_completions: Some(EndpointSupport::Supported),
+                responses: Some(EndpointSupport::Unsupported),
+                embeddings: Some(EndpointSupport::Supported),
+                models: Some(ModelsEndpointCapability::LocalProjection),
+                diagnostic_labels: vec!["channel-upsert".to_string()],
+            },
             enabled: true,
             account: Some("primary".to_string()),
             policy_profile: Some("relay-cooldown".to_string()),
@@ -2106,6 +2168,10 @@ mod tests {
             stored.pools["secondary-channel"].routing_profile,
             channel.routing_profile
         );
+        assert_eq!(
+            stored.pools["secondary-channel"].endpoint_capabilities,
+            channel.endpoint_capabilities
+        );
         assert!(stored.pools["secondary-channel"].enabled);
     }
 
@@ -2124,6 +2190,7 @@ mod tests {
                 RegistryCommand::Channel(ChannelRegistryCommand::Upsert {
                     channel_id: "secondary-channel".to_string(),
                     channel: Box::new(PoolConfig {
+                        endpoint_capabilities: Default::default(),
                         enabled: true,
                         account: Some("primary".to_string()),
                         policy_profile: None,
