@@ -9,7 +9,7 @@ The previous broad P0-P4 plan has been deliberately shrunk. The useful core is:
 
 - explain whether a client can use a public model on a specific endpoint family;
 - maintain keys through explicit management workflows;
-- keep bounded failure evidence for troubleshooting;
+- keep bounded failure evidence for troubleshooting and retry audit;
 - absorb only small, pre-output upstream jitter through a conservative retry
   preset.
 
@@ -56,9 +56,12 @@ The proxy request path must not:
   text in telemetry, logs, tests, docs, or reports.
 
 Data-plane additions may only emit bounded facts: fixed-cost counters, bounded
-attempt summaries, and non-blocking redacted event records. Overflow drops the
-event and increments a dropped-event counter; it must not block request sending,
-credential mutation, or response streaming.
+attempt summaries, and non-blocking redacted event records. Failure evidence
+does not absorb upstream jitter by itself; it only explains whether M3 retry was
+eligible, attempted, denied, or risky. Overflow drops the oldest or current
+event according to the concrete buffer/queue contract and increments a
+dropped-event counter; it must not block request sending, credential mutation,
+or response streaming.
 
 Client-facing `/v1/models` remains a family-blind local public model projection.
 It reports visible public model ids for the authenticated client token. It does
@@ -123,7 +126,7 @@ Keep:
 - a simple disable/retire action for bad keys when the existing management API
   supports it;
 - manual `keys probe` only as an explicit upstream-touching operator action;
-- bounded recent failure/attempt evidence;
+- bounded recent failure/attempt evidence for troubleshooting and retry audit;
 - a small status summary for recent failures and dropped telemetry.
 
 Park:
@@ -133,6 +136,12 @@ Park:
 - broad restore/promote lifecycle command sets;
 - usage ledger, billing-style top views, audit ledger, and cost tracking;
 - persistent failure ledger as a required prerequisite.
+
+Failure evidence is not a routing input and must not be used to absorb
+upstream jitter. The existing routing telemetry window is an in-memory ring
+buffer controlled by `routing.telemetry_buffer_capacity`; the default is 1024
+events. When full, the ring drops the oldest event. This roadmap does not make
+persistent failure storage a prerequisite.
 
 Failure evidence should be minimal: request id, time bucket, endpoint family,
 public model, channel/credential reference when safe, failure kind, retry
@@ -145,7 +154,8 @@ Acceptance gates:
   mutation boundaries;
 - no command prints raw keys, raw tokens, token hashes, absolute key paths, raw
   request/response bodies, or full upstream URLs with token-like components;
-- failure evidence is bounded and redacted;
+- failure evidence is bounded and redacted, with the default routing telemetry
+  window remaining 1024 in-memory events unless explicitly configured;
 - status output is one-screen operational context, not an analytics product.
 
 ### M3: Conservative Pre-Output Stability
