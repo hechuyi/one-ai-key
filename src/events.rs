@@ -383,6 +383,7 @@ impl RetryPressureCounters {
 #[derive(Debug, Clone)]
 pub struct RoutingTelemetryBuffer {
     capacity: usize,
+    dropped_events: u64,
     events: VecDeque<RoutingTelemetry>,
 }
 
@@ -390,22 +391,29 @@ impl RoutingTelemetryBuffer {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
+            dropped_events: 0,
             events: VecDeque::with_capacity(capacity),
         }
     }
 
     pub fn push(&mut self, event: RoutingTelemetry) {
         if self.capacity == 0 {
+            self.dropped_events = self.dropped_events.saturating_add(1);
             return;
         }
         if self.events.len() == self.capacity {
             self.events.pop_front();
+            self.dropped_events = self.dropped_events.saturating_add(1);
         }
         self.events.push_back(event);
     }
 
     pub fn len(&self) -> usize {
         self.events.len()
+    }
+
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events
     }
 
     pub fn snapshot(&self) -> Vec<RoutingTelemetry> {
@@ -1529,6 +1537,8 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer.dropped_events(), 1);
     }
 
     #[test]
@@ -1541,6 +1551,8 @@ mod tests {
         });
 
         assert!(buffer.snapshot().is_empty());
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.dropped_events(), 1);
     }
 
     #[test]
@@ -1622,6 +1634,7 @@ mod tests {
 
         let counters = buffer.retry_pressure_snapshot();
         assert_eq!(buffer.snapshot().len(), 1);
+        assert_eq!(buffer.dropped_events(), 1);
         assert_eq!(counters.by_directive.retry_credential, 0);
         assert_eq!(counters.by_directive.return_error, 1);
         assert_eq!(

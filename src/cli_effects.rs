@@ -521,6 +521,7 @@ mod tests {
                 connection: connection.clone(),
                 model: "gpt-4o".to_string(),
                 client_token_ref: Some("local-client".to_string()),
+                endpoint_family: None,
                 output: crate::cli_report::OutputFormat::Table,
             }),
             CliAction::ClientTokensList(

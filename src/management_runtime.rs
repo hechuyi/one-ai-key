@@ -13,14 +13,14 @@ use crate::{
         RoutingTelemetry,
     },
     management_alerts::{
-        model_route_all_target_suppression_alerts, response_filter_contamination_alerts_for_state,
-        ManagementAlertStatus,
+        ManagementAlertStatus, model_route_all_target_suppression_alerts,
+        response_filter_contamination_alerts_for_state,
     },
-    management_errors::{registry_store_error, ManagementServiceError},
+    management_errors::{ManagementServiceError, registry_store_error},
     management_registry::resolve_staged_registry_document,
     management_status::{
-        credential_pool_alerts, runtime_readiness_projection, CredentialPoolAlertStatus,
-        CredentialSetSnapshotCache, RuntimeCredentialCounts, RuntimeReadinessProjection,
+        CredentialPoolAlertStatus, CredentialSetSnapshotCache, RuntimeCredentialCounts,
+        RuntimeReadinessProjection, credential_pool_alerts, runtime_readiness_projection,
     },
     registry_store::RegistryStoreHandle,
     state::{AppState, ChannelHealth, RuntimeTopologySummary},
@@ -65,6 +65,8 @@ pub fn response_filter_events_snapshot_response(
 #[derive(Debug, Serialize)]
 pub struct RoutingTelemetryResponse {
     pub buffered_events: usize,
+    pub capacity: usize,
+    pub dropped_events: u64,
     pub offset: usize,
     pub limit: usize,
     pub events: Vec<RoutingTelemetry>,
@@ -72,6 +74,8 @@ pub struct RoutingTelemetryResponse {
 
 pub fn routing_telemetry_response(
     snapshot: Vec<RoutingTelemetry>,
+    capacity: usize,
+    dropped_events: u64,
     offset: usize,
     limit: usize,
 ) -> RoutingTelemetryResponse {
@@ -79,6 +83,8 @@ pub fn routing_telemetry_response(
     let events = snapshot.into_iter().skip(offset).take(limit).collect();
     RoutingTelemetryResponse {
         buffered_events,
+        capacity,
+        dropped_events,
         offset,
         limit,
         events,
@@ -90,12 +96,18 @@ pub fn routing_telemetry_snapshot_response(
     offset: usize,
     limit: usize,
 ) -> RoutingTelemetryResponse {
-    let snapshot = state
-        .routing_telemetry
-        .lock()
-        .expect("routing telemetry mutex poisoned")
-        .snapshot();
-    routing_telemetry_response(snapshot, offset, limit)
+    let (snapshot, capacity, dropped_events) = {
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned");
+        (
+            telemetry.snapshot(),
+            state.routing.telemetry_buffer_capacity,
+            telemetry.dropped_events(),
+        )
+    };
+    routing_telemetry_response(snapshot, capacity, dropped_events, offset, limit)
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +129,7 @@ pub struct RuntimeResponse {
     pub management_event_window_capacity: usize,
     pub routing_telemetry_events: usize,
     pub routing_telemetry_capacity: usize,
+    pub routing_telemetry_dropped_events: u64,
     pub response_filter_events: usize,
     pub response_filter_event_capacity: usize,
     pub request_limits: RequestLimits,
@@ -176,6 +189,7 @@ pub struct RuntimeResponseParts {
     pub management_event_window_capacity: usize,
     pub routing_telemetry_events: usize,
     pub routing_telemetry_capacity: usize,
+    pub routing_telemetry_dropped_events: u64,
     pub response_filter_events: usize,
     pub response_filter_event_capacity: usize,
     pub max_request_body_bytes: usize,
@@ -208,6 +222,7 @@ pub fn runtime_response_from_parts(parts: RuntimeResponseParts) -> RuntimeRespon
         management_event_window_capacity: parts.management_event_window_capacity,
         routing_telemetry_events: parts.routing_telemetry_events,
         routing_telemetry_capacity: parts.routing_telemetry_capacity,
+        routing_telemetry_dropped_events: parts.routing_telemetry_dropped_events,
         response_filter_events: parts.response_filter_events,
         response_filter_event_capacity: parts.response_filter_event_capacity,
         request_limits: RequestLimits {
@@ -258,6 +273,7 @@ pub async fn runtime_response(
         management_event_window_capacity: sample.management_event_window_capacity,
         routing_telemetry_events: sample.routing_telemetry_events,
         routing_telemetry_capacity: state.routing.telemetry_buffer_capacity,
+        routing_telemetry_dropped_events: sample.routing_telemetry_dropped_events,
         response_filter_events: sample.response_filter_events,
         response_filter_event_capacity: sample.response_filter_event_capacity,
         max_request_body_bytes: state.max_request_body_bytes,
@@ -387,6 +403,7 @@ struct RuntimeSnapshotSample {
     management_events: usize,
     management_event_window_capacity: usize,
     routing_telemetry_events: usize,
+    routing_telemetry_dropped_events: u64,
     response_filter_events: usize,
     response_filter_event_capacity: usize,
     serving_channels: usize,
@@ -483,12 +500,16 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
         .read()
         .expect("client token registry lock poisoned")
         .len();
-    let (routing_telemetry_events, recent_retry_counters) = {
+    let (routing_telemetry_events, routing_telemetry_dropped_events, recent_retry_counters) = {
         let telemetry = state
             .routing_telemetry
             .lock()
             .expect("routing telemetry mutex poisoned");
-        (telemetry.len(), telemetry.retry_pressure_snapshot())
+        (
+            telemetry.len(),
+            telemetry.dropped_events(),
+            telemetry.retry_pressure_snapshot(),
+        )
     };
     let (response_filter_events, response_filter_event_capacity) = {
         let events = state
@@ -514,6 +535,7 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
         management_events: state.events.len(),
         management_event_window_capacity: state.events.window_capacity(),
         routing_telemetry_events,
+        routing_telemetry_dropped_events,
         response_filter_events,
         response_filter_event_capacity,
         serving_channels,

@@ -539,7 +539,7 @@ pub fn render_keys_probe_apply_report(
             "upstream_request_sent": true,
             "probe_evidence_persisted": true,
             "automatic_rollback": false,
-            "recovery_path": "manual probe evidence correction via future probe-apply workflow or credential lifecycle correction",
+            "recovery_path": "review bounded failure evidence, then use keys stats or route explain before any credential lifecycle correction",
             "probe": sanitize_probe_result(response.get("result")),
         }),
         serde_json::json!({
@@ -588,7 +588,7 @@ fn render_keys_probe_apply_apply_report(
             "mutating_apply_sent": true,
             "lifecycle_mutation_applied": lifecycle_mutation_applied,
             "automatic_rollback": false,
-            "recovery_path": "rerun probe and probe-apply plan if lifecycle state does not match expectation",
+            "recovery_path": "review keys stats and bounded failure evidence if lifecycle state does not match expectation",
         }),
         serde_json::json!({
             "summary": "Review credential-set state after applying probe evidence.",
@@ -654,13 +654,13 @@ fn render_keys_probe_apply_plan_report_with_expected(
             "mutating_apply_sent": false,
             "lifecycle_mutation_applied": false,
             "automatic_rollback": false,
-            "recovery_path": "re-run mutating probe apply only with the matching probe_result_ref after reviewing this plan",
+            "recovery_path": "review keys stats and bounded failure evidence before any lifecycle correction",
         }),
         if probe_result_ref_matches {
             keys_probe_apply_next_action(options, probe_result_ref.as_deref())
         } else {
             keys_probe_apply_blocked_next_action(
-                "Rerun probe-apply plan and use the current probe_result_ref.",
+                "The supplied probe_result_ref is stale; review the current keys stats before retrying.",
             )
         },
     );
@@ -741,15 +741,15 @@ fn keys_probe_apply_report_envelope(
 
 fn keys_probe_apply_next_action(
     options: &KeysProbeApplyPlanOptions,
-    probe_result_ref: Option<&str>,
+    _probe_result_ref: Option<&str>,
 ) -> Value {
     serde_json::json!({
-        "summary": "Re-run with explicit confirmation and the planned probe_result_ref to apply lifecycle changes.",
-        "safe_argv": keys_probe_apply_apply_argv(options, probe_result_ref),
-        "side_effect_class": "management_write",
-        "requires_confirmation": true,
+        "summary": "Review bounded credential state before choosing any lifecycle correction.",
+        "safe_argv": keys_stats_argv(Some(&options.credential_set_id), true),
+        "side_effect_class": "runtime_readonly",
+        "requires_confirmation": false,
         "automatic_rollback": false,
-        "recovery_path": "rerun plan if the latest probe result changes before apply",
+        "recovery_path": "use keys stats with bounded credential refs to inspect current state",
     })
 }
 
@@ -779,34 +779,6 @@ fn keys_probe_apply_blocked_next_action(summary: &str) -> Value {
         "requires_confirmation": false,
         "automatic_rollback": false,
     })
-}
-
-fn keys_probe_apply_apply_argv(
-    options: &KeysProbeApplyPlanOptions,
-    probe_result_ref: Option<&str>,
-) -> Value {
-    let Some(credential_set_id) = safe_local_id(&options.credential_set_id) else {
-        return Value::Null;
-    };
-    let Some(credential_ref) = normalize_credential_ref(&options.credential_ref) else {
-        return Value::Null;
-    };
-    let Some(probe_result_ref) = probe_result_ref.and_then(normalize_probe_result_ref) else {
-        return Value::Null;
-    };
-    serde_json::json!([
-        "one-ai-key",
-        "keys",
-        "probe-apply",
-        "apply",
-        "--credential-set",
-        credential_set_id,
-        "--credential-ref",
-        credential_ref,
-        "--probe-result-ref",
-        probe_result_ref,
-        "--yes"
-    ])
 }
 
 fn keys_probe_report_envelope(
@@ -858,7 +830,7 @@ fn keys_probe_next_action(options: &KeysProbeOptions) -> Value {
         "side_effect_class": "upstream_touching",
         "requires_confirmation": true,
         "automatic_rollback": false,
-        "recovery_path": "manual probe evidence correction via future probe-apply workflow or credential lifecycle correction",
+        "recovery_path": "review persisted probe evidence with keys stats before any credential lifecycle correction",
     })
 }
 
@@ -1775,13 +1747,55 @@ fn sanitize_operations_alerts(alerts: Option<&Value>) -> Vec<Value> {
         .into_iter()
         .flatten()
         .map(|alert| {
+            let kind = alert
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(safe_local_id);
+            let severity = alert
+                .get("severity")
+                .and_then(Value::as_str)
+                .and_then(safe_alert_severity);
+            let reason_code = alert
+                .get("reason_code")
+                .and_then(Value::as_str)
+                .and_then(safe_local_id);
             serde_json::json!({
-                "kind": alert.get("kind").and_then(Value::as_str),
-                "severity": alert.get("severity").and_then(Value::as_str),
-                "message": alert.get("message").and_then(Value::as_str),
+                "kind": kind,
+                "severity": severity,
+                "reason_code": reason_code,
+                "summary": operations_alert_summary(kind, severity, reason_code),
             })
         })
         .collect()
+}
+
+fn safe_alert_severity(value: &str) -> Option<&str> {
+    match value {
+        "info" | "warning" | "error" | "critical" => Some(value),
+        _ => None,
+    }
+}
+
+fn operations_alert_summary(
+    kind: Option<&str>,
+    severity: Option<&str>,
+    reason_code: Option<&str>,
+) -> &'static str {
+    match kind.or(reason_code) {
+        Some("credential_pool_exhausted") => {
+            "Credential pool is exhausted; inspect bounded credential refs before lifecycle correction."
+        }
+        Some("credential_pool_degraded") => {
+            "Credential pool is degraded; inspect bounded credential refs before lifecycle correction."
+        }
+        Some("credential_rotation_required") => {
+            "Credential rotation is required; inspect bounded credential refs before lifecycle correction."
+        }
+        _ if matches!(severity, Some("critical" | "error")) => {
+            "Credential-set operations alert requires operator review; details were redacted."
+        }
+        _ => "Credential-set operations alert was reported; details were redacted.",
+    }
 }
 
 fn string_array(value: Option<&Value>) -> Vec<String> {
@@ -1964,7 +1978,10 @@ fn render_credential_set_line(set: &Value) -> String {
         "- {} channels={} total={} available={} cooling_down={} expired={} quota_exhausted={} disabled={} probe_summary_status={} credential_refs={}\n",
         display_value(id),
         set.get("channels").and_then(Value::as_u64).unwrap_or(0),
-        credentials.get("total").and_then(Value::as_u64).unwrap_or(0),
+        credentials
+            .get("total")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         credentials
             .get("available")
             .and_then(Value::as_u64)
@@ -1973,7 +1990,10 @@ fn render_credential_set_line(set: &Value) -> String {
             .get("cooling_down")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        credentials.get("expired").and_then(Value::as_u64).unwrap_or(0),
+        credentials
+            .get("expired")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         credentials
             .get("quota_exhausted")
             .and_then(Value::as_u64)
@@ -1994,16 +2014,16 @@ fn display_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use axum::{
-        routing::{get, post},
         Json, Router,
+        routing::{get, post},
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::{
         fs,
         path::Path,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
         },
     };
 
@@ -2296,6 +2316,7 @@ mod tests {
             report["next_action"]["side_effect_class"],
             "upstream_touching"
         );
+        assert_no_probe_apply_recommendation(&report);
     }
 
     #[tokio::test]
@@ -2389,7 +2410,11 @@ mod tests {
                             "id": "internal-derived-id",
                             "fingerprint": "fingerprint-fixture",
                             "state": "available"
-                        }
+                        },
+                        "raw_key": "sk-probe-secret",
+                        "token_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "source_path": "/tmp/raw-probe-source.keys",
+                        "upstream_url": "https://upstream.example/v1/chat?api_key=sk-url-secret"
                     }))
                 }
             }),
@@ -2431,8 +2456,15 @@ mod tests {
         assert_eq!(body["timeout_seconds"], 2);
         assert_eq!(report["status"], "ok");
         assert_eq!(report["data"]["probe"]["outcome"], "success");
+        assert_no_probe_apply_recommendation(&report);
         assert!(!rendered.contains("internal-derived-id"));
         assert!(!rendered.contains("fingerprint-fixture"));
+        assert!(!rendered.contains("sk-probe-secret"));
+        assert!(
+            !rendered.contains("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert!(!rendered.contains("/tmp/raw-probe-source.keys"));
+        assert!(!rendered.contains("https://upstream.example"));
     }
 
     #[test]
@@ -2478,7 +2510,11 @@ mod tests {
                     "state": "available"
                 },
                 "raw_request_body": "request-body-fixture",
-                "raw_response_body": "response-body-fixture"
+                "raw_response_body": "response-body-fixture",
+                "raw_key": "sk-probe-secret",
+                "token_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "source_path": "/tmp/raw-probe-source.keys",
+                "upstream_url": "https://upstream.example/v1/models?token=sk-url-secret"
             }),
             crate::cli_report::OutputFormat::Json,
         );
@@ -2495,10 +2531,17 @@ mod tests {
         assert!(report["data"]["probe"].get("account_id").is_none());
         assert!(report["data"]["probe"].get("classifier_id").is_none());
         assert_eq!(report["data"]["upstream_request_sent"], true);
+        assert_no_probe_apply_recommendation(&report);
         assert!(!rendered.contains("internal-derived-id"));
         assert!(!rendered.contains("fingerprint-fixture"));
         assert!(!rendered.contains("request-body-fixture"));
         assert!(!rendered.contains("response-body-fixture"));
+        assert!(!rendered.contains("sk-probe-secret"));
+        assert!(
+            !rendered.contains("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert!(!rendered.contains("/tmp/raw-probe-source.keys"));
+        assert!(!rendered.contains("https://upstream.example"));
     }
 
     #[test]
@@ -2557,27 +2600,23 @@ mod tests {
         assert_eq!(report["data"]["probe"]["channel_id"], "relay-channel");
         assert_eq!(report["data"]["mutating_apply_sent"], false);
         assert_eq!(report["data"]["lifecycle_mutation_applied"], false);
-        assert_eq!(report["next_action"]["requires_confirmation"], true);
+        assert_eq!(report["next_action"]["requires_confirmation"], false);
         assert_eq!(
             report["next_action"]["side_effect_class"],
-            "management_write"
+            "runtime_readonly"
         );
         assert_eq!(
             report["next_action"]["safe_argv"],
             json!([
                 "one-ai-key",
                 "keys",
-                "probe-apply",
-                "apply",
+                "stats",
                 "--credential-set",
                 "relay-credentials",
-                "--credential-ref",
-                "cr:v1:pos:0",
-                "--probe-result-ref",
-                "pr:v1:id:7",
-                "--yes"
+                "--include-credential-refs"
             ])
         );
+        assert_no_probe_apply_recommendation(&report);
         assert!(!rendered.contains("internal-derived-id"));
         assert!(!rendered.contains("fingerprint-fixture"));
         assert!(!rendered.contains("request-body-fixture"));
@@ -2965,8 +3004,10 @@ mod tests {
         assert!(rendered.contains("\"command\": \"keys list\""));
         assert!(rendered.contains("\"side_effect_class\": \"runtime_readonly\""));
         assert!(rendered.contains("\"effect_vector\""));
-        assert!(rendered
-            .contains("\"probe_summary_status\": \"unavailable_without_summary_projection\""));
+        assert!(
+            rendered
+                .contains("\"probe_summary_status\": \"unavailable_without_summary_projection\"")
+        );
         assert!(
             rendered.contains("\"credential_ref_status\": \"available_from_summary_projection\"")
         );
@@ -3070,7 +3111,7 @@ mod tests {
             "alerts": [{
                 "kind": "credential_pool_exhausted",
                 "severity": "critical",
-                "message": "No credentials are available",
+                "message": "No credentials are available: sk-alert-secret https://host.example/path?token=sk-url-secret /Users/rtoc/.one-ai-key/keys.txt request body {\"Authorization\":\"Bearer raw-token\"} response body {\"token\":\"secret\"} 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "credential_id": "cred-alert-secret"
             }],
             "raw_key": "RAW_OPS_SECRET"
@@ -3085,12 +3126,23 @@ mod tests {
         assert!(rendered.contains("\"status\": \"blocked\""));
         assert!(rendered.contains("\"required_action\": \"probe_or_import_credentials\""));
         assert!(rendered.contains("\"kind\": \"credential_pool_exhausted\""));
+        assert!(rendered.contains("\"summary\""));
         assert!(rendered.contains("\"next_action\""));
         assert!(rendered.contains("\"safe_argv\""));
         assert!(rendered.contains("keys_probe_unavailable_until_m3"));
         assert!(rendered.contains("\"shared-credentials\""));
         assert!(!rendered.contains("<credential-set-id>"));
         assert!(!rendered.contains("keys probe"));
+        assert!(!rendered.contains("probe-apply"));
+        assert!(!rendered.contains("No credentials are available"));
+        assert!(!rendered.contains("sk-alert-secret"));
+        assert!(!rendered.contains("sk-url-secret"));
+        assert!(!rendered.contains("https://host.example/path"));
+        assert!(!rendered.contains("/Users/rtoc/.one-ai-key/keys.txt"));
+        assert!(!rendered.contains("Authorization"));
+        assert!(!rendered.contains("raw-token"));
+        assert!(!rendered.contains("response body"));
+        assert!(!rendered.contains("0123456789abcdef0123456789abcdef"));
         assert!(!rendered.contains("ops-fp-secret"));
         assert!(!rendered.contains("cred-alert-secret"));
         assert!(!rendered.contains("RAW_OPS_SECRET"));
@@ -3284,5 +3336,18 @@ mod tests {
         assert!(!rendered.contains("shared\ncredentials"));
         assert!(rendered.contains("ready\\rnow"));
         assert!(!rendered.contains('\u{1b}'));
+    }
+
+    fn assert_no_probe_apply_recommendation(report: &Value) {
+        for field in [
+            &report["next_action"],
+            &report["data"]["recovery_path"],
+            &report["next_action"]["recovery_path"],
+        ] {
+            assert!(
+                !field.to_string().contains("probe-apply"),
+                "probe-apply recommendation leaked: {field}"
+            );
+        }
     }
 }

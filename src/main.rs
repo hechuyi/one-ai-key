@@ -274,6 +274,11 @@ const MANAGEMENT_ROUTE_SPECS: &[ManagementRouteSpec] = &[
         minimum_role: ManagementRole::Readonly,
     },
     ManagementRouteSpec {
+        method: "GET",
+        path: "/management/model-availability",
+        minimum_role: ManagementRole::Readonly,
+    },
+    ManagementRouteSpec {
         method: "PUT",
         path: "/management/registry/model-routes/*model",
         minimum_role: ManagementRole::Admin,
@@ -856,6 +861,10 @@ fn app_without_test_peer_default(state: AppState) -> Router {
             post(management::reset_credential_set_credential_cooldown),
         )
         .route("/management/model-routes", get(management::model_routes))
+        .route(
+            "/management/model-availability",
+            get(management::model_availability),
+        )
         .route(
             "/management/registry/model-routes/*model",
             put(management::upsert_registry_model_route),
@@ -10831,6 +10840,11 @@ pools:
             ),
             ("GET", "/management/model-routes", ManagementRole::Readonly),
             (
+                "GET",
+                "/management/model-availability",
+                ManagementRole::Readonly,
+            ),
+            (
                 "PUT",
                 "/management/registry/model-routes/*model",
                 ManagementRole::Admin,
@@ -11135,6 +11149,16 @@ pools:
             management_role_matrix_response(
                 "GET",
                 "/management/explain/runtime",
+                Some(fixture_readonly_management_token()),
+                Body::empty()
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            management_role_matrix_response(
+                "GET",
+                "/management/model-availability?model=gpt-test&endpoint_family=chat_completions&client_token_ref=test-client",
                 Some(fixture_readonly_management_token()),
                 Body::empty()
             )
@@ -19724,6 +19748,132 @@ pools:
     }
 
     #[tokio::test]
+    async fn management_model_availability_explains_endpoint_family_from_runtime_state() {
+        let state = endpoint_capability_projection_state();
+        state
+            .client_tokens
+            .write()
+            .unwrap()
+            .push(crate::config::ResolvedClientToken {
+                id: "disabled-client".to_string(),
+                name: "Disabled Client".to_string(),
+                token_hash: hash_token("disabled-client-token"),
+                enabled: false,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            });
+        let app = app(state);
+
+        let available = management_response_json(
+            &app,
+            "/management/model-availability?model=gpt-capability&endpoint_family=chat_completions&client_token_ref=test-client",
+        )
+        .await;
+        assert_eq!(available["status"], "available");
+        assert_eq!(available["reason_code"], "available");
+        assert_eq!(available["next_action"], "none");
+        assert_eq!(available["endpoint_family"], "chat_completions");
+        assert_eq!(available["public_model"], "gpt-capability");
+        assert_eq!(available["client_token"]["name"], "test-client");
+
+        let unsupported = management_response_json(
+            &app,
+            "/management/model-availability?model=gpt-capability&endpoint_family=edits&client_token_ref=test-client",
+        )
+        .await;
+        assert_eq!(unsupported["status"], "unavailable");
+        assert_eq!(unsupported["reason_code"], "unsupported_endpoint_family");
+        assert_eq!(unsupported["next_action"], "use_supported_endpoint_family");
+
+        let disabled = management_response_json(
+            &app,
+            "/management/model-availability?model=gpt-capability&endpoint_family=chat_completions&client_token_ref=disabled-client",
+        )
+        .await;
+        assert_eq!(disabled["status"], "unavailable");
+        assert_eq!(disabled["reason_code"], "token_disabled");
+        assert_eq!(disabled["client_token"]["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn management_model_availability_response_does_not_leak_secret_material() {
+        let app = app(endpoint_capability_projection_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/management/model-availability?model=gpt-capability&endpoint_family=chat_completions&client_token_ref=test-client")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let client_token_hash = hash_token(fixture_client_token().as_str());
+        for forbidden in [
+            "upstream-secret-primary",
+            "upstream-secret-fallback",
+            "hidden-primary",
+            "hidden-fallback",
+            fixture_client_token().as_str(),
+            fixture_admin_token().as_str(),
+            client_token_hash.as_str(),
+            "http://127.0.0.1:1/v1?token=hidden-primary",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "model availability leaked forbidden material {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn management_model_availability_default_channel_passthrough_is_available() {
+        let app = app(test_state());
+
+        let value = management_response_json(
+            &app,
+            "/management/model-availability?model=unclaimed-default-model&endpoint_family=chat_completions&client_token_ref=test-client",
+        )
+        .await;
+
+        assert_eq!(value["status"], "available");
+        assert_eq!(value["reason_code"], "available");
+        assert_eq!(value["route_kind"], "default_channel");
+        assert_ne!(value["reason_code"], "model_missing");
+    }
+
+    #[tokio::test]
+    async fn management_model_availability_redacts_unsafe_public_model() {
+        let app = app(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/management/model-availability?model=https%3A%2F%2Frelay.example%2Fv1%3Ftoken%3Dsk-SHOULD_NOT_RENDER&endpoint_family=chat_completions&client_token_ref=test-client")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["status"], "available");
+        assert_eq!(value["route_kind"], "default_channel");
+        assert_eq!(value["public_model"], "<redacted-public-model>");
+        assert!(!body.contains("SHOULD_NOT_RENDER"));
+        assert!(!body.contains("sk-"));
+        assert!(!body.contains("token="));
+        assert!(!body.contains("https://relay.example/v1"));
+    }
+
+    #[tokio::test]
     async fn endpoint_capability_projection_management_model_routes_include_static_capabilities() {
         let value = management_response_json(
             &app(endpoint_capability_projection_state()),
@@ -19831,6 +19981,11 @@ pools:
         let _preview =
             management_response_json(&app, "/management/routing/preview?model=gpt-capability")
                 .await;
+        let _availability = management_response_json(
+            &app,
+            "/management/model-availability?model=gpt-capability&endpoint_family=chat_completions&client_token_ref=test-client",
+        )
+        .await;
 
         assert_eq!(
             state.runtime_catalogs.registry_generation(),
@@ -21808,6 +21963,7 @@ pools:
         let runtime = serde_json::from_str::<Value>(&body).unwrap();
         assert_eq!(runtime["routing_telemetry_capacity"], 1);
         assert_eq!(runtime["routing_telemetry_events"], 1);
+        assert_eq!(runtime["routing_telemetry_dropped_events"], 1);
         assert_eq!(runtime["response_filter_event_capacity"], 1024);
         assert_eq!(runtime["response_filter_events"], 0);
         assert_eq!(runtime["recent_retry_counters"]["window_capacity"], 1);
@@ -23981,6 +24137,8 @@ pools:
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let body = serde_json::from_slice::<Value>(&body).unwrap();
         assert_eq!(body["buffered_events"], 1);
+        assert_eq!(body["capacity"], 1);
+        assert_eq!(body["dropped_events"], 1);
         assert_eq!(body["events"][0]["request_id"], "req_2");
     }
 

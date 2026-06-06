@@ -1,14 +1,15 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
+use serde::Deserialize;
 
 use std::time::Duration;
 
 use crate::{
-    auth::{authorize_management, json_error, AuthorizedManagementPrincipal},
+    auth::{AuthorizedManagementPrincipal, authorize_management, json_error},
     config::{
         AccountConfig, ManagementRole, ModelRouteConfig, PolicyProfileConfig, PoolConfig,
         ProviderConfig, RoutingProfileConfig,
@@ -67,7 +68,9 @@ use crate::{
         enable_channel_resource, pool_status_for_channel, pools_response, providers_response,
         reset_channel_health_status,
     },
-    management_routing::{model_routes_response, routing_preview_for_model},
+    management_routing::{
+        endpoint_family_availability_explain, model_routes_response, routing_preview_for_model,
+    },
     management_runtime::{
         readiness_response, reload_runtime as reload_runtime_state, resilience_health_response,
         response_filter_events_snapshot_response, routing_telemetry_snapshot_response,
@@ -79,6 +82,14 @@ use crate::{
 };
 
 const MAX_CHAT_PROBE_EXPECTED_OUTPUT_CHARS: usize = 256;
+
+#[derive(Debug, Deserialize)]
+pub struct ModelAvailabilityQuery {
+    model: String,
+    endpoint_family: String,
+    client_token_ref: Option<String>,
+    client_token: Option<String>,
+}
 
 async fn credential_id_from_path_segment_response(
     state: &AppState,
@@ -945,6 +956,39 @@ pub async fn model_routes(State(state): State<AppState>, headers: HeaderMap) -> 
     };
     let _principal_context = (&principal.id, &principal.name, &principal.role);
     Json(model_routes_response(&state).await).into_response()
+}
+
+pub async fn model_availability(
+    State(state): State<AppState>,
+    Query(query): Query<ModelAvailabilityQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let principal = match authorize_management(&state, &headers) {
+        Ok(principal) => principal,
+        Err(resp) => return *resp,
+    };
+    let _principal_context = (&principal.id, &principal.name, &principal.role);
+
+    let model = query.model.trim();
+    if model.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "model must not be empty");
+    }
+    let endpoint_family = query.endpoint_family.trim();
+    if endpoint_family.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "endpoint_family must not be empty");
+    }
+    let client_token_ref = query
+        .client_token_ref
+        .as_deref()
+        .or(query.client_token.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    Json(
+        endpoint_family_availability_explain(&state, client_token_ref, endpoint_family, model)
+            .await,
+    )
+    .into_response()
 }
 
 pub async fn upsert_registry_model_route(

@@ -299,6 +299,11 @@ pub enum ReadOnlyEndpoint {
         model: String,
         client_token_ref: Option<String>,
     },
+    ModelAvailability {
+        model: String,
+        endpoint_family: String,
+        client_token_ref: Option<String>,
+    },
     ClientTokens,
     ModelRoutes,
     Channel {
@@ -396,6 +401,20 @@ impl ReadOnlyEndpoint {
                     query.push(("client_token".to_string(), client_token_ref.clone()));
                 }
                 EndpointRequest::new("/management/routing/preview", query)
+            }
+            Self::ModelAvailability {
+                model,
+                endpoint_family,
+                client_token_ref,
+            } => {
+                let mut query = vec![
+                    ("model".to_string(), model.clone()),
+                    ("endpoint_family".to_string(), endpoint_family.clone()),
+                ];
+                if let Some(client_token_ref) = client_token_ref {
+                    query.push(("client_token_ref".to_string(), client_token_ref.clone()));
+                }
+                EndpointRequest::new("/management/model-availability", query)
             }
             Self::ClientTokens => EndpointRequest::new("/management/client-tokens", Vec::new()),
             Self::ModelRoutes => EndpointRequest::new("/management/model-routes", Vec::new()),
@@ -694,19 +713,19 @@ pub fn classify_http_error(
             return OperatorClientError::new(
                 "management_unauthorized",
                 "management API rejected the token",
-            )
+            );
         }
         StatusCode::FORBIDDEN => {
             return OperatorClientError::new(
                 "management_forbidden",
                 "management API principal lacks permission",
-            )
+            );
         }
         StatusCode::NOT_FOUND => {
             return OperatorClientError::new(
                 "management_not_found",
                 "management API endpoint or resource was not found",
-            )
+            );
         }
         _ => {}
     }
@@ -732,6 +751,7 @@ pub fn is_readonly_management_path(method: Method, path: &str) -> bool {
     matches!(
         path,
         "/management/routing/preview"
+            | "/management/model-availability"
             | "/management/client-tokens"
             | "/management/model-routes"
             | "/management/channels"
@@ -952,6 +972,7 @@ mod tests {
     fn read_only_allowlist_accepts_only_m2_get_management_paths() {
         for path in [
             "/management/routing/preview",
+            "/management/model-availability",
             "/management/client-tokens",
             "/management/model-routes",
             "/management/channels",
@@ -1046,6 +1067,30 @@ mod tests {
         assert!(serving.accepts_status(StatusCode::OK));
         assert!(serving.accepts_status(StatusCode::SERVICE_UNAVAILABLE));
         assert!(!serving.accepts_status(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[test]
+    fn typed_endpoint_builds_model_availability_query() {
+        let endpoint = ReadOnlyEndpoint::ModelAvailability {
+            model: "vendor/gpt-public".to_string(),
+            endpoint_family: "chat_completions".to_string(),
+            client_token_ref: Some("local-client".to_string()),
+        };
+        let (path, query) = endpoint.test_request_parts().unwrap();
+
+        assert_eq!(path, "/management/model-availability");
+        assert_eq!(
+            query,
+            vec![
+                ("model".to_string(), "vendor/gpt-public".to_string()),
+                (
+                    "endpoint_family".to_string(),
+                    "chat_completions".to_string()
+                ),
+                ("client_token_ref".to_string(), "local-client".to_string())
+            ]
+        );
+        assert!(is_readonly_management_path(Method::Get, &path));
     }
 
     #[test]

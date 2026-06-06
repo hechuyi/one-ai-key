@@ -4,16 +4,16 @@ use std::sync::atomic::Ordering;
 
 use crate::{
     config::ResolvedClientToken,
-    endpoint_capabilities::EndpointCapabilitiesStatus,
+    endpoint_capabilities::{EndpointCapabilitiesStatus, EndpointSupport},
     management_errors::ManagementServiceError,
     management_status::{
-        add_key_pool_snapshot_counts, channel_health_status, channel_health_status_from_health,
-        ChannelHealthStatus, RuntimeCredentialCounts,
+        ChannelHealthStatus, RuntimeCredentialCounts, add_key_pool_snapshot_counts,
+        channel_health_status, channel_health_status_from_health,
     },
     provider::ProviderKind,
     route_plan::{
-        preview_route, ModelRoute, RoutePreviewCandidate, RoutePreviewInput, RoutePreviewReason,
-        RouteStrategy, RouteTarget,
+        ChannelRouteState, ModelRoute, RoutePreviewCandidate, RoutePreviewInput,
+        RoutePreviewReason, RouteStrategy, RouteTarget, preview_route,
     },
     state::{AppState, ChannelHealth, ChannelId, ChannelRoutePlanContext},
 };
@@ -566,4 +566,638 @@ pub fn routing_preview_candidate_statuses(
         statuses.push(routing_preview_candidate_status(candidate, status));
     }
     statuses
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct EndpointFamilyAvailabilityExplain {
+    pub status: &'static str,
+    pub reason_code: &'static str,
+    pub next_action: &'static str,
+    pub endpoint_family: String,
+    pub public_model: String,
+    pub route_kind: &'static str,
+    pub registry_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_token: Option<EndpointFamilyAvailabilityClient>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct EndpointFamilyAvailabilityClient {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+}
+
+pub struct EndpointFamilyAvailabilityExplainInput<'a> {
+    pub client_tokens: &'a [ResolvedClientToken],
+    pub client_token_ref: Option<&'a str>,
+    pub endpoint_family: &'a str,
+    pub public_model: &'a str,
+    pub registry_generation: u64,
+    pub model_allowed: bool,
+    pub model_visible: bool,
+    pub route_kind: &'static str,
+    pub route: Option<&'a ModelRoute>,
+    pub channel_states: &'a HashMap<ChannelId, ChannelRouteState>,
+    pub endpoint_capabilities: &'a HashMap<String, EndpointCapabilitiesStatus>,
+    pub candidate_limit: usize,
+}
+
+pub async fn endpoint_family_availability_explain(
+    state: &AppState,
+    client_token_ref: Option<&str>,
+    endpoint_family: &str,
+    public_model: &str,
+) -> EndpointFamilyAvailabilityExplain {
+    let client_tokens = state
+        .client_tokens
+        .read()
+        .expect("client token registry lock poisoned")
+        .clone();
+    let client = client_token_ref.and_then(|reference| {
+        client_tokens
+            .iter()
+            .find(|token| token.id == reference || token.name == reference)
+    });
+    let enabled_client = client.filter(|token| token.enabled);
+    let route_context = state.channels.route_plan_context(Some(public_model));
+    let routing_preview_route = routing_preview_route(&route_context, public_model).ok();
+    let route_kind = routing_preview_route
+        .as_ref()
+        .map(|route| route.route_kind)
+        .unwrap_or("no_route");
+    let route = routing_preview_route
+        .as_ref()
+        .and_then(|route| route.route.as_ref());
+    let model_allowed = enabled_client.is_some_and(|client| {
+        state
+            .runtime_catalogs
+            .client_model_allowed(&client.allowed_model_groups, public_model)
+    });
+    let model_visible = enabled_client.is_some_and(|client| {
+        model_allowed
+            && (route_context.model_route.is_some()
+                || route_kind == "default_channel"
+                || route_context.has_claimed_upstream_model(&client.allowed_channels))
+    });
+    let channel_states = route_context_channel_states(&route_context);
+    let endpoint_capabilities =
+        endpoint_capabilities_by_channel(state, route_context.registry_generation);
+
+    endpoint_family_availability_explain_from_parts(EndpointFamilyAvailabilityExplainInput {
+        client_tokens: &client_tokens,
+        client_token_ref,
+        endpoint_family,
+        public_model,
+        registry_generation: route_context.registry_generation,
+        model_allowed,
+        model_visible,
+        route_kind,
+        route,
+        channel_states: &channel_states,
+        endpoint_capabilities: &endpoint_capabilities,
+        candidate_limit: state.routing.max_route_candidates,
+    })
+}
+
+pub fn endpoint_family_availability_explain_from_parts(
+    input: EndpointFamilyAvailabilityExplainInput<'_>,
+) -> EndpointFamilyAvailabilityExplain {
+    let Some(client_token_ref) = input.client_token_ref else {
+        return endpoint_family_availability_explain_result(
+            input,
+            None,
+            "unavailable",
+            "token_missing",
+            "provide_client_token_ref",
+        );
+    };
+    let Some(client) = input
+        .client_tokens
+        .iter()
+        .find(|token| token.id == client_token_ref || token.name == client_token_ref)
+    else {
+        return endpoint_family_availability_explain_result(
+            input,
+            None,
+            "unavailable",
+            "token_unknown",
+            "check_client_token_ref",
+        );
+    };
+    let client_status = EndpointFamilyAvailabilityClient {
+        id: client.id.clone(),
+        name: client.name.clone(),
+        enabled: client.enabled,
+    };
+    if !client.enabled {
+        return endpoint_family_availability_explain_result(
+            input,
+            Some(client_status),
+            "unavailable",
+            "token_disabled",
+            "enable_client_token",
+        );
+    }
+
+    let Some(endpoint_family) = EndpointFamily::parse(input.endpoint_family) else {
+        return endpoint_family_availability_explain_result(
+            input,
+            Some(client_status),
+            "unavailable",
+            "unsupported_endpoint_family",
+            "use_supported_endpoint_family",
+        );
+    };
+    if !input.model_allowed || !input.model_visible {
+        return endpoint_family_availability_explain_result(
+            input,
+            Some(client_status),
+            "unavailable",
+            "model_missing",
+            "publish_or_route_model",
+        );
+    }
+    let Some(route) = input.route else {
+        return endpoint_family_availability_explain_result(
+            input,
+            Some(client_status),
+            "unavailable",
+            "no_route",
+            "configure_route_or_default_channel",
+        );
+    };
+
+    let family_targets =
+        route_with_endpoint_family_targets(route, endpoint_family, input.endpoint_capabilities);
+    let Some(family_route) = family_targets.route.as_ref() else {
+        let reason_code = if family_targets.has_unsupported_target {
+            "endpoint_family_unsupported"
+        } else {
+            "endpoint_family_mismatch"
+        };
+        return endpoint_family_availability_explain_result(
+            input,
+            Some(client_status),
+            "unavailable",
+            reason_code,
+            "configure_endpoint_capabilities_or_route",
+        );
+    };
+    let preview = preview_route(RoutePreviewInput {
+        request_id: format!(
+            "endpoint-family-explain:{}:{}",
+            input.public_model,
+            endpoint_family.as_str()
+        ),
+        registry_generation: input.registry_generation,
+        public_model: Some(input.public_model.to_string()),
+        route: Some(family_route),
+        channel_states: input.channel_states,
+        allowed_channels: &client.allowed_channels,
+        candidate_limit: input.candidate_limit,
+    });
+    if preview.selected_target_index.is_none() {
+        return endpoint_family_availability_explain_result(
+            input,
+            Some(client_status),
+            "unavailable",
+            "no_usable_key_or_target",
+            "enable_target_or_key",
+        );
+    }
+
+    endpoint_family_availability_explain_result(
+        input,
+        Some(client_status),
+        "available",
+        "available",
+        "none",
+    )
+}
+
+fn route_context_channel_states(
+    route_context: &ChannelRoutePlanContext,
+) -> HashMap<ChannelId, ChannelRouteState> {
+    if route_context.model_route.is_some() {
+        route_context.model_route_channel_states.clone()
+    } else {
+        route_context
+            .default_channel
+            .as_ref()
+            .zip(route_context.default_channel_route_state)
+            .map(|(channel_id, state)| HashMap::from([(ChannelId(channel_id.clone()), state)]))
+            .unwrap_or_default()
+    }
+}
+
+fn endpoint_family_availability_explain_result(
+    input: EndpointFamilyAvailabilityExplainInput<'_>,
+    client_token: Option<EndpointFamilyAvailabilityClient>,
+    status: &'static str,
+    reason_code: &'static str,
+    next_action: &'static str,
+) -> EndpointFamilyAvailabilityExplain {
+    EndpointFamilyAvailabilityExplain {
+        status,
+        reason_code,
+        next_action,
+        endpoint_family: input.endpoint_family.to_string(),
+        public_model: safe_public_model_label(input.public_model),
+        route_kind: input.route_kind,
+        registry_generation: input.registry_generation,
+        client_token,
+    }
+}
+
+fn safe_public_model_label(public_model: &str) -> String {
+    let trimmed = public_model.trim();
+    if is_safe_public_model_label(trimmed) {
+        trimmed.to_string()
+    } else {
+        "<redacted-public-model>".to_string()
+    }
+}
+
+fn is_safe_public_model_label(public_model: &str) -> bool {
+    if public_model.is_empty() || public_model.len() > 128 {
+        return false;
+    }
+    if public_model.starts_with('/')
+        || public_model.starts_with("~/")
+        || public_model.starts_with("./")
+        || public_model.starts_with("../")
+        || public_model.contains("/../")
+        || public_model.contains('\\')
+        || public_model.contains("://")
+        || public_model.contains('?')
+        || public_model.contains('&')
+        || public_model.contains('=')
+        || public_model.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let lower = public_model.to_ascii_lowercase();
+    if looks_like_windows_absolute_path(public_model)
+        || looks_like_url_scheme(&lower)
+        || lower.contains("token")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("secret")
+        || lower.contains("authorization")
+        || lower.contains("bearer")
+        || lower.contains("sk-")
+        || lower.contains("sk_")
+    {
+        return false;
+    }
+    public_model
+        .bytes()
+        .all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
+        })
+}
+
+fn looks_like_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn looks_like_url_scheme(lower: &str) -> bool {
+    ["http:", "https:", "file:", "ftp:", "s3:", "gs:"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
+}
+
+struct EndpointFamilyRouteTargets {
+    route: Option<ModelRoute>,
+    has_unsupported_target: bool,
+}
+
+fn route_with_endpoint_family_targets(
+    route: &ModelRoute,
+    endpoint_family: EndpointFamily,
+    endpoint_capabilities: &HashMap<String, EndpointCapabilitiesStatus>,
+) -> EndpointFamilyRouteTargets {
+    let mut has_unsupported_target = false;
+    let targets: Vec<RouteTarget> = route
+        .targets
+        .iter()
+        .filter(|target| {
+            let Some(capabilities) = endpoint_capabilities.get(&target.channel_id.0) else {
+                return false;
+            };
+            match endpoint_family.support(capabilities) {
+                EndpointSupport::Supported => true,
+                EndpointSupport::Unsupported => {
+                    has_unsupported_target = true;
+                    false
+                }
+                EndpointSupport::Unknown => false,
+            }
+        })
+        .cloned()
+        .collect();
+    if targets.is_empty() {
+        return EndpointFamilyRouteTargets {
+            route: None,
+            has_unsupported_target,
+        };
+    }
+    EndpointFamilyRouteTargets {
+        route: Some(ModelRoute {
+            public_model: route.public_model.clone(),
+            strategy: route.strategy,
+            targets,
+        }),
+        has_unsupported_target,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EndpointFamily {
+    ChatCompletions,
+    Responses,
+    Embeddings,
+}
+
+impl EndpointFamily {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "chat_completions" => Some(Self::ChatCompletions),
+            "responses" => Some(Self::Responses),
+            "embeddings" => Some(Self::Embeddings),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+            Self::Embeddings => "embeddings",
+        }
+    }
+
+    fn support(self, capabilities: &EndpointCapabilitiesStatus) -> EndpointSupport {
+        match self {
+            Self::ChatCompletions => capabilities.chat_completions,
+            Self::Responses => capabilities.responses,
+            Self::Embeddings => capabilities.embeddings,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::endpoint_capabilities::EndpointSupport;
+
+    fn client(id: &str, enabled: bool) -> ResolvedClientToken {
+        ResolvedClientToken {
+            id: id.to_string(),
+            name: format!("{id}-name"),
+            token_hash: format!("{id}-hash"),
+            enabled,
+            allowed_model_groups: Vec::new(),
+            allowed_channels: Vec::new(),
+        }
+    }
+
+    fn route() -> ModelRoute {
+        ModelRoute {
+            public_model: "gpt-public".to_string(),
+            strategy: RouteStrategy::Priority,
+            targets: vec![RouteTarget {
+                channel_id: ChannelId("ch1".to_string()),
+                provider_kind: ProviderKind::OpenAiCompatible,
+                upstream_model: Some("upstream-private".to_string()),
+                priority: 0,
+                weight: 1,
+                enabled: true,
+            }],
+        }
+    }
+
+    fn capabilities(
+        chat_completions: EndpointSupport,
+    ) -> HashMap<String, EndpointCapabilitiesStatus> {
+        HashMap::from([(
+            "ch1".to_string(),
+            EndpointCapabilitiesStatus {
+                chat_completions,
+                responses: EndpointSupport::Unsupported,
+                embeddings: EndpointSupport::Unknown,
+                models: Default::default(),
+                diagnostic_labels: Vec::new(),
+            },
+        )])
+    }
+
+    #[test]
+    fn endpoint_family_explain_reports_available_for_supported_usable_route() {
+        let route = route();
+        let clients = vec![client("client-a", true)];
+
+        let explain = endpoint_family_availability_explain_from_parts(
+            EndpointFamilyAvailabilityExplainInput {
+                client_tokens: &clients,
+                client_token_ref: Some("client-a"),
+                endpoint_family: "chat_completions",
+                public_model: "gpt-public",
+                registry_generation: 7,
+                model_allowed: true,
+                model_visible: true,
+                route_kind: "explicit_model_route",
+                route: Some(&route),
+                channel_states: &HashMap::from([(
+                    ChannelId("ch1".to_string()),
+                    ChannelRouteState::Available,
+                )]),
+                endpoint_capabilities: &capabilities(EndpointSupport::Supported),
+                candidate_limit: 16,
+            },
+        );
+
+        assert_eq!(explain.status, "available");
+        assert_eq!(explain.reason_code, "available");
+        assert_eq!(explain.next_action, "none");
+        assert_eq!(explain.client_token.as_ref().unwrap().id, "client-a");
+    }
+
+    #[test]
+    fn endpoint_family_explain_distinguishes_missing_unknown_and_disabled_token() {
+        let clients = vec![client("disabled", false)];
+
+        let missing = endpoint_family_availability_explain_from_parts(
+            EndpointFamilyAvailabilityExplainInput {
+                client_tokens: &clients,
+                client_token_ref: None,
+                endpoint_family: "chat_completions",
+                public_model: "gpt-public",
+                registry_generation: 7,
+                model_allowed: true,
+                model_visible: true,
+                route_kind: "explicit_model_route",
+                route: Some(&route()),
+                channel_states: &HashMap::new(),
+                endpoint_capabilities: &HashMap::new(),
+                candidate_limit: 16,
+            },
+        );
+        assert_eq!(missing.reason_code, "token_missing");
+
+        let unknown = endpoint_family_availability_explain_from_parts(
+            EndpointFamilyAvailabilityExplainInput {
+                client_tokens: &clients,
+                client_token_ref: Some("unknown"),
+                endpoint_family: "chat_completions",
+                public_model: "gpt-public",
+                registry_generation: 7,
+                model_allowed: true,
+                model_visible: true,
+                route_kind: "explicit_model_route",
+                route: Some(&route()),
+                channel_states: &HashMap::new(),
+                endpoint_capabilities: &HashMap::new(),
+                candidate_limit: 16,
+            },
+        );
+        assert_eq!(unknown.reason_code, "token_unknown");
+
+        let disabled = endpoint_family_availability_explain_from_parts(
+            EndpointFamilyAvailabilityExplainInput {
+                client_tokens: &clients,
+                client_token_ref: Some("disabled"),
+                endpoint_family: "chat_completions",
+                public_model: "gpt-public",
+                registry_generation: 7,
+                model_allowed: true,
+                model_visible: true,
+                route_kind: "explicit_model_route",
+                route: Some(&route()),
+                channel_states: &HashMap::new(),
+                endpoint_capabilities: &HashMap::new(),
+                candidate_limit: 16,
+            },
+        );
+        assert_eq!(disabled.reason_code, "token_disabled");
+    }
+
+    #[test]
+    fn endpoint_family_explain_reports_model_and_family_failures() {
+        let clients = vec![client("client-a", true)];
+        let route = route();
+
+        let model_missing = endpoint_family_availability_explain_from_parts(
+            EndpointFamilyAvailabilityExplainInput {
+                client_tokens: &clients,
+                client_token_ref: Some("client-a"),
+                endpoint_family: "chat_completions",
+                public_model: "missing-model",
+                registry_generation: 7,
+                model_allowed: true,
+                model_visible: false,
+                route_kind: "no_route",
+                route: None,
+                channel_states: &HashMap::new(),
+                endpoint_capabilities: &HashMap::new(),
+                candidate_limit: 16,
+            },
+        );
+        assert_eq!(model_missing.reason_code, "model_missing");
+
+        let unsupported_family = endpoint_family_availability_explain_from_parts(
+            EndpointFamilyAvailabilityExplainInput {
+                client_tokens: &clients,
+                client_token_ref: Some("client-a"),
+                endpoint_family: "responses",
+                public_model: "gpt-public",
+                registry_generation: 7,
+                model_allowed: true,
+                model_visible: true,
+                route_kind: "explicit_model_route",
+                route: Some(&route),
+                channel_states: &HashMap::from([(
+                    ChannelId("ch1".to_string()),
+                    ChannelRouteState::Available,
+                )]),
+                endpoint_capabilities: &capabilities(EndpointSupport::Supported),
+                candidate_limit: 16,
+            },
+        );
+        assert_eq!(
+            unsupported_family.reason_code,
+            "endpoint_family_unsupported"
+        );
+
+        let family_mismatch = endpoint_family_availability_explain_from_parts(
+            EndpointFamilyAvailabilityExplainInput {
+                client_tokens: &clients,
+                client_token_ref: Some("client-a"),
+                endpoint_family: "embeddings",
+                public_model: "gpt-public",
+                registry_generation: 7,
+                model_allowed: true,
+                model_visible: true,
+                route_kind: "explicit_model_route",
+                route: Some(&route),
+                channel_states: &HashMap::from([(
+                    ChannelId("ch1".to_string()),
+                    ChannelRouteState::Available,
+                )]),
+                endpoint_capabilities: &capabilities(EndpointSupport::Supported),
+                candidate_limit: 16,
+            },
+        );
+        assert_eq!(family_mismatch.reason_code, "endpoint_family_mismatch");
+    }
+
+    #[test]
+    fn endpoint_family_explain_reports_no_route_and_no_usable_key_or_target() {
+        let clients = vec![client("client-a", true)];
+        let route = route();
+
+        let no_route = endpoint_family_availability_explain_from_parts(
+            EndpointFamilyAvailabilityExplainInput {
+                client_tokens: &clients,
+                client_token_ref: Some("client-a"),
+                endpoint_family: "chat_completions",
+                public_model: "gpt-public",
+                registry_generation: 7,
+                model_allowed: true,
+                model_visible: true,
+                route_kind: "no_route",
+                route: None,
+                channel_states: &HashMap::new(),
+                endpoint_capabilities: &HashMap::new(),
+                candidate_limit: 16,
+            },
+        );
+        assert_eq!(no_route.reason_code, "no_route");
+
+        let no_usable = endpoint_family_availability_explain_from_parts(
+            EndpointFamilyAvailabilityExplainInput {
+                client_tokens: &clients,
+                client_token_ref: Some("client-a"),
+                endpoint_family: "chat_completions",
+                public_model: "gpt-public",
+                registry_generation: 7,
+                model_allowed: true,
+                model_visible: true,
+                route_kind: "explicit_model_route",
+                route: Some(&route),
+                channel_states: &HashMap::from([(
+                    ChannelId("ch1".to_string()),
+                    ChannelRouteState::NoAvailableCredentials,
+                )]),
+                endpoint_capabilities: &capabilities(EndpointSupport::Supported),
+                candidate_limit: 16,
+            },
+        );
+        assert_eq!(no_usable.reason_code, "no_usable_key_or_target");
+    }
 }

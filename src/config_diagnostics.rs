@@ -22,8 +22,11 @@ pub struct CheckConfigOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckConfigReport {
+    pub diagnostics_schema_version: u32,
     pub status: DiagnosticStatus,
     pub reason_code: String,
+    pub deprecated_fields: Vec<String>,
+    pub deprecated_templates: Vec<String>,
     pub resource_counts: BTreeMap<String, usize>,
     pub warnings: Vec<String>,
     pub config_path: String,
@@ -106,6 +109,9 @@ impl CheckConfigReport {
             next_action: self.next_action(),
             data: json!({
                 "config_path": self.config_path,
+                "diagnostics_schema_version": self.diagnostics_schema_version,
+                "deprecated_fields": self.deprecated_fields,
+                "deprecated_templates": self.deprecated_templates,
                 "resource_counts": self.resource_counts,
                 "warnings": self.warnings,
                 "model_visibility_preview": self.model_visibility_preview,
@@ -166,8 +172,11 @@ pub fn check_config(options: CheckConfigOptions) -> CheckConfigReport {
                 "config_validation_failed"
             };
             return CheckConfigReport {
+                diagnostics_schema_version: 1,
                 status: DiagnosticStatus::Error,
                 reason_code: reason_code.to_string(),
+                deprecated_fields: Vec::new(),
+                deprecated_templates: Vec::new(),
                 resource_counts: BTreeMap::new(),
                 warnings: vec![redacted_error_summary(&message)],
                 config_path,
@@ -185,8 +194,11 @@ pub fn check_config(options: CheckConfigOptions) -> CheckConfigReport {
         Ok(resolved) => {
             let warnings = endpoint_capability_warnings(&resolved);
             CheckConfigReport {
+                diagnostics_schema_version: 1,
                 status: DiagnosticStatus::Ok,
                 reason_code: "ok".to_string(),
+                deprecated_fields: Vec::new(),
+                deprecated_templates: Vec::new(),
                 resource_counts: resource_counts(&document),
                 warnings,
                 config_path,
@@ -201,8 +213,11 @@ pub fn check_config(options: CheckConfigOptions) -> CheckConfigReport {
                 "config_validation_failed"
             };
             CheckConfigReport {
+                diagnostics_schema_version: 1,
                 status: DiagnosticStatus::Error,
                 reason_code: reason_code.to_string(),
+                deprecated_fields: Vec::new(),
+                deprecated_templates: Vec::new(),
                 resource_counts: resource_counts(&document),
                 warnings: vec![redacted_error_summary(&message)],
                 config_path,
@@ -759,6 +774,15 @@ model_routes:
             assert_eq!(
                 json_report["warnings"][0],
                 serde_json::Value::String(report.warnings[0].clone())
+            );
+            assert_eq!(json_report["diagnostics_schema_version"], 1);
+            assert_eq!(
+                json_report["deprecated_fields"],
+                serde_json::Value::Array(Vec::new())
+            );
+            assert_eq!(
+                json_report["deprecated_templates"],
+                serde_json::Value::Array(Vec::new())
             );
             let table = report.render_table();
             assert!(table.contains("Warnings: 1"));

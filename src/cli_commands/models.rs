@@ -12,6 +12,7 @@ pub struct ModelsExplainOptions {
     pub connection: crate::cli::OperatorConnectionOptions,
     pub model: String,
     pub client_token_ref: Option<String>,
+    pub endpoint_family: Option<String>,
     pub output: crate::cli_report::OutputFormat,
 }
 
@@ -42,9 +43,25 @@ pub async fn run_explain(
     let runtime_projection =
         crate::cli_commands::runtime_reload_projection::fetch_runtime_reload_projection(&client)
             .await?;
+    let availability = if let Some(endpoint_family) = options.endpoint_family.as_ref() {
+        Some(
+            client
+                .get_json(
+                    crate::operator_client::ReadOnlyEndpoint::ModelAvailability {
+                        model: options.model.clone(),
+                        endpoint_family: endpoint_family.clone(),
+                        client_token_ref: options.client_token_ref.clone(),
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
     Ok(render_models_explain_report_with_management_projection(
         &preview,
         runtime_projection.as_ref(),
+        availability.as_ref(),
         options.output,
     ))
 }
@@ -69,20 +86,21 @@ pub fn render_models_explain_report(
     preview: &Value,
     output: crate::cli_report::OutputFormat,
 ) -> String {
-    render_models_explain_report_with_management_projection(preview, None, output)
+    render_models_explain_report_with_management_projection(preview, None, None, output)
 }
 
 fn render_models_explain_report_with_management_projection(
     preview: &Value,
     management_projection: Option<&Value>,
+    availability: Option<&Value>,
     output: crate::cli_report::OutputFormat,
 ) -> String {
     match output {
         crate::cli_report::OutputFormat::Json => {
-            render_models_explain_json(preview, management_projection)
+            render_models_explain_json(preview, management_projection, availability)
         }
         crate::cli_report::OutputFormat::Table => {
-            render_models_explain_table(preview, management_projection)
+            render_models_explain_table(preview, management_projection, availability)
         }
     }
 }
@@ -268,14 +286,19 @@ fn sanitize_model_target(target: &Value) -> Value {
     })
 }
 
-fn render_models_explain_json(preview: &Value, management_projection: Option<&Value>) -> String {
-    let report = sanitized_models_explain_report(preview, management_projection);
+fn render_models_explain_json(
+    preview: &Value,
+    management_projection: Option<&Value>,
+    availability: Option<&Value>,
+) -> String {
+    let report = sanitized_models_explain_report(preview, management_projection, availability);
     serde_json::to_string_pretty(&report).expect("models explain json report should serialize")
 }
 
 fn sanitized_models_explain_report(
     preview: &Value,
     management_projection: Option<&Value>,
+    availability: Option<&Value>,
 ) -> Value {
     let client_token = sanitize_preview_client_token(preview.get("client_token"));
     let candidates = preview
@@ -301,6 +324,7 @@ fn sanitized_models_explain_report(
                 .or_else(|| preview.get("runtime_reload_projection"))
                 .or_else(|| preview.get("runtime_reload")),
         );
+    let availability = availability.map(sanitize_model_availability);
     let data = serde_json::json!({
         "command": "models explain",
         "active_registry_generation": runtime_reload.active_registry_generation,
@@ -317,6 +341,7 @@ fn sanitized_models_explain_report(
         "candidate_limit": preview.get("candidate_limit").and_then(Value::as_u64),
         "client_token": client_token,
         "client_scope_status": client_scope_status,
+        "availability": availability.clone(),
         "selected_target": selected_target,
         "candidates": candidates,
     });
@@ -328,11 +353,103 @@ fn sanitized_models_explain_report(
         scope: serde_json::json!({
             "model": preview.get("model").and_then(Value::as_str),
             "client_token_ref": client_token.get("name").and_then(Value::as_str),
+            "endpoint_family": availability
+                .as_ref()
+                .and_then(|value| value.get("endpoint_family"))
+                .and_then(Value::as_str),
         }),
         window: Value::Null,
         next_action: models_explain_next_action(status, preview, client_scope_status),
         data,
     })
+}
+
+fn sanitize_model_availability(value: &Value) -> Value {
+    let client_token = value
+        .get("client_token")
+        .and_then(Value::as_object)
+        .map(|token| {
+            serde_json::json!({
+                "id": token.get("id").and_then(Value::as_str),
+                "name": token.get("name").and_then(Value::as_str),
+                "enabled": token.get("enabled").and_then(Value::as_bool),
+            })
+        });
+    serde_json::json!({
+        "status": value.get("status").and_then(Value::as_str),
+        "reason_code": value.get("reason_code").and_then(Value::as_str),
+        "next_action": value.get("next_action").and_then(Value::as_str),
+        "endpoint_family": value.get("endpoint_family").and_then(Value::as_str),
+        "public_model": value
+            .get("public_model")
+            .and_then(Value::as_str)
+            .map(safe_public_model_label),
+        "route_kind": value.get("route_kind").and_then(Value::as_str),
+        "registry_generation": value.get("registry_generation").and_then(Value::as_u64),
+        "client_token": client_token,
+    })
+}
+
+fn safe_public_model_label(public_model: &str) -> String {
+    let trimmed = public_model.trim();
+    if is_safe_public_model_label(trimmed) {
+        trimmed.to_string()
+    } else {
+        "<redacted-public-model>".to_string()
+    }
+}
+
+fn is_safe_public_model_label(public_model: &str) -> bool {
+    if public_model.is_empty() || public_model.len() > 128 {
+        return false;
+    }
+    if public_model.starts_with('/')
+        || public_model.starts_with("~/")
+        || public_model.starts_with("./")
+        || public_model.starts_with("../")
+        || public_model.contains("/../")
+        || public_model.contains('\\')
+        || public_model.contains("://")
+        || public_model.contains('?')
+        || public_model.contains('&')
+        || public_model.contains('=')
+        || public_model.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let lower = public_model.to_ascii_lowercase();
+    if looks_like_windows_absolute_path(public_model)
+        || looks_like_url_scheme(&lower)
+        || lower.contains("token")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("secret")
+        || lower.contains("authorization")
+        || lower.contains("bearer")
+        || lower.contains("sk-")
+        || lower.contains("sk_")
+    {
+        return false;
+    }
+    public_model
+        .bytes()
+        .all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
+        })
+}
+
+fn looks_like_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn looks_like_url_scheme(lower: &str) -> bool {
+    ["http:", "https:", "file:", "ftp:", "s3:", "gs:"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
 }
 
 fn client_scope_status(client_token: &Value, preview: &Value) -> &'static str {
@@ -562,8 +679,12 @@ fn render_models_list_table(model_routes: &Value, client_token_ref: Option<&str>
     output
 }
 
-fn render_models_explain_table(preview: &Value, management_projection: Option<&Value>) -> String {
-    let report = sanitized_models_explain_report(preview, management_projection);
+fn render_models_explain_table(
+    preview: &Value,
+    management_projection: Option<&Value>,
+    availability: Option<&Value>,
+) -> String {
+    let report = sanitized_models_explain_report(preview, management_projection, availability);
     let mut output = String::new();
     output.push_str(&format!(
         "Model explanation for {}\n",
@@ -584,6 +705,28 @@ fn render_models_explain_table(preview: &Value, management_projection: Option<&V
                 .unwrap_or("unknown")
         )
     ));
+    if let Some(availability) = report.get("availability").filter(|value| !value.is_null()) {
+        crate::cli_report::push_table_field(
+            &mut output,
+            "availability.status",
+            availability.get("status"),
+        );
+        crate::cli_report::push_table_field(
+            &mut output,
+            "availability.reason_code",
+            availability.get("reason_code"),
+        );
+        crate::cli_report::push_table_field(
+            &mut output,
+            "availability.next_action",
+            availability.get("next_action"),
+        );
+        crate::cli_report::push_table_field(
+            &mut output,
+            "availability.endpoint_family",
+            availability.get("endpoint_family"),
+        );
+    }
     let selected = report
         .get("selected_target")
         .and_then(|target| target.get("channel_id"))
@@ -894,9 +1037,11 @@ mod tests {
                 "diagnostic_labels": ["openai_compatible", "line\nlabel"]
             })
         );
-        assert!(report["candidates"][0]["endpoint_capabilities"]
-            .get("raw_secret")
-            .is_none());
+        assert!(
+            report["candidates"][0]["endpoint_capabilities"]
+                .get("raw_secret")
+                .is_none()
+        );
         assert!(!rendered_json.contains("SHOULD_NOT_RENDER"));
 
         let rendered_table =
@@ -986,6 +1131,7 @@ mod tests {
         let rendered = super::render_models_explain_report_with_management_projection(
             &input,
             Some(&projection),
+            None,
             crate::cli_report::OutputFormat::Json,
         );
         let report: Value = serde_json::from_str(&rendered).unwrap();
@@ -1095,6 +1241,7 @@ mod tests {
             },
             model: "gpt-public".to_string(),
             client_token_ref: None,
+            endpoint_family: None,
             output: crate::cli_report::OutputFormat::Json,
         })
         .await
@@ -1114,6 +1261,124 @@ mod tests {
         assert_eq!(report["active_registry_generation"], 33);
         assert_eq!(report["runtime_reload_required"], false);
         assert_eq!(report["capability_status"], "available");
+    }
+
+    #[tokio::test]
+    async fn models_explain_run_fetches_management_model_availability_when_endpoint_family_requested(
+    ) {
+        let seen_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let preview_seen = Arc::clone(&seen_paths);
+        let diff_seen = Arc::clone(&seen_paths);
+        let availability_seen = Arc::clone(&seen_paths);
+        let router = Router::new()
+            .route(
+                "/management/routing/preview",
+                get(move || {
+                    let preview_seen = Arc::clone(&preview_seen);
+                    async move {
+                        preview_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/routing/preview".to_string());
+                        Json(serde_json::json!({
+                            "model": "gpt-public",
+                            "selected_target": {"channel_id": "primary", "plan_position": 0},
+                            "client_token": {"name": "local-client"},
+                            "candidates": []
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/management/runtime/reload-diff",
+                get(move || {
+                    let diff_seen = Arc::clone(&diff_seen);
+                    async move {
+                        diff_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/runtime/reload-diff".to_string());
+                        Json(serde_json::json!({
+                            "status": "ok",
+                            "reason_code": "reload_diff_empty",
+                            "runtime_reload_required": false
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/management/model-availability",
+                get(move || {
+                    let availability_seen = Arc::clone(&availability_seen);
+                    async move {
+                        availability_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/model-availability".to_string());
+                        Json(serde_json::json!({
+                            "status": "available",
+                            "reason_code": "available",
+                            "next_action": "none",
+                            "endpoint_family": "chat_completions",
+                            "public_model": "https://relay.example/v1?token=sk-SHOULD_NOT_RENDER",
+                            "route_kind": "explicit_model_route",
+                            "registry_generation": 7,
+                            "client_token": {
+                                "id": "client-a",
+                                "name": "local-client",
+                                "enabled": true,
+                                "token_hash": "SHOULD_NOT_RENDER"
+                            },
+                            "raw_token": "SHOULD_NOT_RENDER",
+                            "upstream_url": "https://relay.example/v1?token=SHOULD_NOT_RENDER"
+                        }))
+                    }
+                }),
+            );
+        let management_url = spawn_management_fixture(router).await;
+        let env_name = format!(
+            "ONE_AI_KEY_TEST_MODELS_EXPLAIN_AVAILABILITY_TOKEN_{}",
+            std::process::id()
+        );
+        std::env::set_var(&env_name, "opaque-management-fixture");
+
+        let rendered = super::run_explain(super::ModelsExplainOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some(management_url),
+                deprecated_base_url: None,
+                management_token_env: Some(env_name.clone()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            model: "gpt-public".to_string(),
+            client_token_ref: Some("local-client".to_string()),
+            endpoint_family: Some("chat_completions".to_string()),
+            output: crate::cli_report::OutputFormat::Json,
+        })
+        .await
+        .unwrap();
+        std::env::remove_var(env_name);
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            *seen_paths.lock().unwrap(),
+            vec![
+                "/management/routing/preview".to_string(),
+                "/management/runtime/reload-diff".to_string(),
+                "/management/model-availability".to_string(),
+            ]
+        );
+        assert_eq!(report["availability"]["status"], "available");
+        assert_eq!(report["availability"]["reason_code"], "available");
+        assert_eq!(
+            report["availability"]["endpoint_family"],
+            "chat_completions"
+        );
+        assert_eq!(report["scope"]["endpoint_family"], "chat_completions");
+        assert!(!rendered.contains("SHOULD_NOT_RENDER"));
+        assert!(!rendered.contains("sk-"));
+        assert!(!rendered.contains("token="));
+        assert!(!rendered.contains("https://relay.example/v1"));
     }
 
     #[tokio::test]
@@ -1183,6 +1448,7 @@ mod tests {
             },
             model: "gpt-public".to_string(),
             client_token_ref: None,
+            endpoint_family: None,
             output: crate::cli_report::OutputFormat::Json,
         })
         .await
