@@ -122,8 +122,8 @@ labels. It is not a provider/model catalog and must not contain model ids,
 pricing, context windows, tool support, or other model-specific facts.
 Static endpoint capabilities must not authorize Responses-to-Chat conversion,
 missing-model defaulting, or endpoint-family fallback. Responses defaulting and
-Responses-to-Chat adapters are parked follow-up work, not part of this M1-M4
-implementation plan.
+Responses-to-Chat adapters are parked follow-up work outside the current product
+roadmap.
 
 The request path must not:
 
