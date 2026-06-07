@@ -10,10 +10,31 @@ The previous broad P0-P4 plan has been deliberately shrunk. The useful core is:
 - explain whether a client can use a public model on a specific endpoint family;
 - maintain keys through explicit management workflows;
 - keep bounded failure evidence for troubleshooting and retry audit;
-- absorb only small, pre-output upstream jitter through a conservative retry
-  preset.
+- define the smallest conservative pre-output stability contract that can absorb
+  isolated upstream jitter without turning routing into an adaptive platform.
 
 Everything else is parked unless a new plan explicitly reopens it.
+
+## Product Narrative
+
+The roadmap follows one operator decision loop:
+
+```text
+explain current usability -> maintain with bounded evidence -> cautiously
+stabilize eligible pre-output failures
+```
+
+M1 answers whether a specific client-token reference can use a specific public
+model on a specific endpoint family, and why. M2 makes the next maintenance
+action explicit and bounded: read-only, dry-run, upstream-touching, or mutating.
+M3 is the only data-plane stability step in this roadmap; it may hide one small
+pre-output upstream failure when all retry gates pass, and it must record why it
+did or did not retry.
+
+Do not use incident narratives, private deployment traces, temporary key
+replacement stories, or one-off support workarounds as product requirements.
+Convert recurring lessons into stable routing, reporting, or release rules, then
+delete the support context.
 
 ## Product Boundary
 
@@ -69,6 +90,31 @@ not assert Responses support, tools, vision, context window, pricing, adapter
 status, endpoint-family support, upstream ids, or provider capability.
 
 Endpoint-family availability belongs to management explain/status only.
+
+## Configuration Surface Rules
+
+Configuration exists to build explicit resources and compiled runtime
+projections. It is not a dumping ground for report display preferences,
+one-off diagnostics, deployment evidence, or operator-session state.
+
+YAML and registry fields are appropriate only when they change resource
+topology, credential lifecycle policy, response-filter policy, or a compiled
+routing/profile projection. Management query parameters and CLI flags own
+one-time explanation dimensions such as `endpoint_family`, pagination, display
+limits, failure source filters, credential-state filters, `--dry-run`, `--yes`,
+and local import/probe inputs.
+
+M3 must not add a YAML `preset` field by default. A future
+`Conservative Pre-Output Stability v1` plan may name an init-template profile
+that renders explicit `routing_profiles` fields. A runtime config `preset`
+field is rejected unless a later admission record proves that explicit knobs are
+insufficient and defines conflict resolution, compiled projection, redaction,
+tests, and hot-path proof.
+
+Existing probe-derived policy configuration is compatibility surface, not a
+license to build automated key maintenance. Probe actions remain explicit
+management operations; they must not be triggered from request forwarding,
+failure evidence, background jobs, or automatic scope mutation.
 
 ## Roadmap
 
@@ -137,6 +183,12 @@ Park:
 - usage ledger, billing-style top views, audit ledger, and cost tracking;
 - persistent failure ledger as a required prerequisite.
 
+If an implementation already exposes a probe-apply management path, this
+roadmap treats it as existing compatibility surface only. M2 does not expand it,
+promote it as a daily-maintenance dependency, add new action enums, add batch
+auto-apply, or let probe evidence mutate credentials without an explicit
+management action.
+
 Failure evidence is not a routing input and must not be used to absorb
 upstream jitter. The minimum failure evidence comes only from two in-memory
 rings: routing telemetry controlled by `routing.telemetry_buffer_capacity` and
@@ -177,32 +229,28 @@ Acceptance gates:
   capped at 4096 events when explicitly configured;
 - status output is one-screen operational context, not an analytics product.
 
-Absorbed availability follow-up: production traffic through `one-ai-key` showed
-`503 no route candidate` on `/v1/responses` materially more often than direct
-upstream-key use. The local fix treats provider/account transient cooldown as a
-soft route state: normal and degraded candidates still win, but if every
-otherwise valid route target is provider-cooling, the router may use it as a
-last resort instead of failing at admission. Within a frozen fallback chain,
-provider-cooling targets are skipped while later targets remain, so a
-Retry-After on one shared account does not immediately retry a sibling channel
-before external fallback. Hard channel cooldown from relay balance,
-response-filter rejection, disabled channels, runtime lock contention, and empty
-credential pools remain admission blockers. Production telemetry should still
-compare client token/model scope, endpoint-family route visibility,
-credential/channel lifecycle state, frozen fallback candidates, and Responses
-endpoint handling after release.
+Provider/account transient cooldown is a soft route state, not an automatic
+local admission failure. Normal and degraded candidates win first. If every
+otherwise valid route target is provider-cooling, the router may use a
+provider-cooling target as the last resort instead of returning local
+`no_route_candidate` immediately. Within a frozen fallback chain,
+provider-cooling targets are skipped while later non-cooling targets remain.
+Hard channel cooldown from relay balance, response-filter rejection, disabled
+channels, runtime lock contention, and empty credential pools remain admission
+blockers.
 
 ### M3: Conservative Pre-Output Stability
 
 **Goal:** reduce client-visible failures from small upstream jitter without
 making retry behavior opaque.
 
-This is the only stability behavior in this roadmap. It is a preset over
-existing routing/policy mechanics, not a new stability engine.
+This is the only stability behavior in this roadmap. It is a small capability
+package over explicit routing/profile mechanics, not a new stability engine and
+not a runtime YAML preset.
 
 Allowed conservative retry:
 
-- at most one extra attempt;
+- at most one extra upstream attempt for the original client request;
 - total wall-clock retry budget <= 1500 ms;
 - budget includes backoff, candidate selection, and the extra attempt until
   upstream headers or terminal failure;
@@ -214,6 +262,28 @@ Allowed conservative retry:
   failure, TLS/connect timeout, header timeout, connection reset before
   headers, or 502/503/504 before body;
 - duplicate-charge risk must be recorded when it cannot be proven absent.
+
+The one extra attempt is mutually exclusive. A request may choose only one of:
+
+- retry with another credential on the same selected channel when same-request
+  credential retry is explicitly enabled and the replacement credential is
+  proven different;
+- retry the next eligible frozen route target from the original compiled route
+  plan when route-target retry is explicitly enabled;
+- retry the same target once as a last resort for selected transient
+  channel/provider failure when no frozen target remains and no cooldown
+  evidence is present.
+
+These choices do not chain. A failed credential retry must not then fall through
+to a route-target retry inside the same original client request.
+
+Endpoint-family eligibility is an allowlist. Initial M3 eligibility covers
+non-streaming `chat_completions` and non-streaming `responses` only when the
+request body is replayable, the public model has been resolved, and the route
+plan is frozen. `/v1/models` is local projection and is never retry-eligible.
+Streaming Chat/Responses, Embeddings, named-pool requests, and unknown endpoint
+families are not eligible unless a separate plan proves replayability,
+idempotency/charge risk, parser behavior, and tests.
 
 Default prohibitions:
 
@@ -245,6 +315,8 @@ this document:
 - adapter-backed Responses examples;
 - endpoint capability triggered protocol conversion;
 - automatic endpoint fallback;
+- YAML retry presets or global retry switches that bypass explicit
+  `routing_profiles`;
 - model alias/profile onboarding planner;
 - automatic model exposure from upstream catalog;
 - persistent model trust states;
@@ -271,3 +343,53 @@ Before closing the roadmap:
   `data/`, SQLite, logs, keys, raw fixtures, and `AGENTS.md`;
 - docs must describe stable product behavior, not support transcripts or future
   feature promises.
+
+## Plan Closure
+
+A milestone is closed by evidence, not by continued searching. Its stop card
+must record:
+
+- `plan_id`;
+- `release_or_scope_name`;
+- `closed_capability`;
+- `implemented_scope`;
+- `deferred_scope`;
+- `parked_or_rejected_items`;
+- `operator_contract_evidence`;
+- `test_evidence`;
+- `non_empty_filtered_test_evidence`;
+- `local_ci_result`;
+- `release_artifact_result`;
+- `redaction_and_denylist_result`;
+- `anti_platform_gate_result`;
+- `support_residue_scan_result`;
+- `deployment_boundary_result`;
+- `known_blockers`;
+- `next_version_candidates`.
+
+Once the fixed evidence fields are present and valid, stop. New concerns must
+be classified as a blocking defect, a next-version blocker, or post-release
+debt. Do not keep expanding smoke tests, docs, or review loops without replacing
+an existing matrix item or opening a separate accepted plan.
+
+## Next Version Entry
+
+A next version starts only after the current stop card is closed or the current
+plan is explicitly abandoned. It must define one named capability package, not a
+catch-all upgrade. Its entry record must include:
+
+- `version_name`;
+- `single_capability_package`;
+- `entry_precondition`;
+- `problem_statement_without_incident_narrative`;
+- `user_visible_contract`;
+- `non_goals`;
+- `mature_gateway_principles_absorbed`;
+- `explicit_rejections`;
+- `new_command_api_config_admission_records`;
+- `hot_path_proof`;
+- `state_and_cardinality_bounds`;
+- `redaction_contract`;
+- `test_plan`;
+- `release_gate`;
+- `stop_or_block_conditions`.

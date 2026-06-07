@@ -59,6 +59,7 @@ Before publishing a GitHub release, run:
 ```bash
 scripts/local-ci.sh
 scripts/build-release-x86_64-linux-docker.sh
+scripts/release-smoke.sh
 git status -sb --untracked-files=all
 ```
 
@@ -73,17 +74,25 @@ git status -sb --untracked-files=all
 5. Verify that `dist/one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz` and
    its `.sha256` sidecar exist, and that the sidecar contains only the archive
    basename.
-6. Create the release commit and tag after checking that runtime state and
+6. Run `scripts/release-smoke.sh`; it must exercise the extracted artifact with
+   local placeholder tokens and a local mock upstream.
+7. Create the release commit and tag after checking that runtime state and
    generated artifacts are not staged.
-7. Upload the tarball and `.sha256` sidecar as GitHub Release assets.
-8. On the deployment host, update the gateway or NixOS pin to the GitHub Release
-   tarball URL and exact `sha256`; do not build on the host.
-9. Run a release smoke against the deployed gateway: process liveness,
-   authenticated management health, `/v1/models`, and one harmless client
-   completion through the public base URL.
-10. Record the release version, asset URL, checksum, deployment host pin, smoke
-    status, and any redacted reason codes. Do not record raw tokens, upstream
-    keys, request bodies, or response bodies.
+8. Upload the tarball and `.sha256` sidecar as GitHub Release assets.
+9. Download the uploaded tarball and `.sha256` sidecar into a tempdir and verify
+   the checksum from the uploaded sidecar. Confirm tag, Cargo version, asset
+   filename, checksum filename, and release notes version match.
+10. Record the local release-ready stop node and the published asset
+    verification result. If a deployment host has not been intentionally updated
+    by the operator, record `deployment_pin_smoke: not_run_by_design`.
+11. When an operator separately updates a gateway or NixOS deployment, pin the
+    GitHub Release tarball URL and exact `sha256`; do not build on the host.
+12. Optional deployment smoke belongs to that operator-run deployment action:
+    process liveness, authenticated management health, `/v1/models`, and one
+    harmless client completion through the public base URL.
+13. Deployment records must contain only redacted status, reason codes, route
+    names, model ids, release version, asset URL, and checksum. Do not record
+    raw tokens, upstream keys, request bodies, or response bodies.
 
 The release commit or tag must not include `dist/`, runtime config, SQLite
 databases, key files, token files, JSONL logs, private agent files,

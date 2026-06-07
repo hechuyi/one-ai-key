@@ -101,6 +101,11 @@ answer:
 `v0.2` closes the operator-confidence surface. It must not be used as a bucket
 for adjacent feature requests.
 
+`v0.2` may verify and characterize stability behavior that already exists in the
+current codebase, but it must not broaden that behavior. Any gap found while
+characterizing upstream jitter becomes a `v0.3_blocker` or post-release debt,
+not a `v0.2` production-path patch.
+
 Allowed in `v0.2`:
 
 - release artifact smoke with local mock upstreams;
@@ -136,11 +141,12 @@ Not allowed in `v0.2`:
   modules. `v0.2` may characterize existing config behavior but must not move or
   reinterpret resolver semantics.
 
-`v0.3` starts only after `v0.2` is released and tagged. Its entry scope is
-`Conservative Pre-Output Stability v1`: reduce client-visible upstream jitter
-with at most one extra pre-output attempt under explicit budget, replayability,
-streaming, deadline, and duplicate-charge gates. `v0.3` must have its own plan,
-tests, telemetry proof, and hot-path budget proof.
+`v0.3` starts only after `v0.2` is released and tagged, or after `v0.2` is
+explicitly abandoned. Its entry scope is `Conservative Pre-Output Stability v1`:
+reduce client-visible upstream jitter with at most one extra pre-output attempt
+under explicit budget, replayability, streaming, deadline, endpoint-family, and
+duplicate-charge gates. `v0.3` must have its own plan, tests, telemetry proof,
+and hot-path budget proof.
 
 ## Design Discipline
 
@@ -204,6 +210,21 @@ parameters before they belong in YAML. Fields that affect request forwarding
 belong in compiled route/policy/profile resources before they reach the proxy
 path. Fields that require live probing, persistent learning, or broad protocol
 conversion are separate plans.
+
+For future plans, these decisions are already locked unless a new admission
+record explicitly overrides them:
+
+- `endpoint_family`, pagination, failure filters, display limits, and
+  credential-state filters are management query parameters or CLI flags, not
+  YAML fields.
+- A `Conservative Pre-Output Stability v1` runtime YAML `preset` is rejected by
+  default. Future templates may render explicit `routing_profiles` fields
+  instead.
+- Existing probe-derived policy fields are compatibility surface only. Do not
+  add automatic probe-apply, batch apply, selector promotion, or request-path
+  lifecycle mutation from probe evidence.
+- Release artifact checks, deployment pin evidence, and stop-card fields are
+  process evidence, not runtime configuration.
 
 ### Anti-Sprawl Rule
 
@@ -305,17 +326,28 @@ Management/report smoke:
 ### Fixed Decision Scenario Matrix
 
 The smoke fixture must include only local placeholder data and local mock
-upstreams. It must cover these states:
+upstreams. The artifact smoke covers a representative end-to-end path. Contract
+tests cover the wider reason-code and redaction matrix.
+
+Artifact-smoke states:
 
 | Scenario | Required evidence |
 | --- | --- |
 | runnable artifact | extracted binary runs `--help`, `init local`, and `check-config` without source checkout |
 | usable model | `check-config` preview, `/v1/models`, `models explain`, `route explain`, and one chat completion agree on `gpt-example` |
-| model not visible | stable reason code distinguishes missing route or client-token scope; next action is read-only or config + `check-config` |
-| no usable key | stable reason code distinguishes credential unavailability; next action is `keys stats` or `keys import --dry-run` |
 | reload not applied / no staged diff | `reload status/diff/apply --dry-run` reports staged/active state and does not mutate runtime |
 | management URL misuse | `/v1` management URL is rejected with `client_base_url_used_for_management` |
-| streaming transient boundary | characterized as no transparent streaming retry; any gap becomes `v0.3` blocker |
+| invalid client token | client auth fails as `invalid router api key` and does not reveal token material |
+
+Contract-test states:
+
+| Scenario | Required evidence |
+| --- | --- |
+| model not visible | stable reason code distinguishes missing route or client-token scope; next action is read-only or config + `check-config` |
+| no usable key | stable reason code distinguishes credential unavailability; next action is `keys stats` or `keys import --dry-run` |
+| streaming transient boundary | characterized as no transparent streaming retry; any gap becomes `v0.3_blocker` |
+| bounded failure windows | failure output does not exceed documented per-source and combined caps |
+| report redaction | reports do not expose raw keys, raw tokens, token hashes, full upstream URLs, absolute key paths, request bodies, or response bodies |
 
 Negative smoke:
 
@@ -323,17 +355,22 @@ Negative smoke:
   `client_base_url_used_for_management` reason;
 - invalid client token failure stays a client auth problem and does not reveal
   token material;
-- streaming transient failure is characterized as not transparently retried;
-- any request-path stability gap becomes a `v0.3` blocker, not a `v0.2` fix.
+- any request-path stability gap found by tests becomes a `v0.3_blocker`, not a
+  `v0.2` fix.
 
 ## GitHub Asset And Deployment Pin Boundary
 
-`v0.2` release closure has two separate gates:
+`v0.2` release closure has three separate gates:
 
-1. **Release artifact gate:** local CI, local Docker/Nix build, checksum
-   verification, release smoke against the extracted artifact, and post-upload
-   GitHub asset checksum verification.
-2. **Deployment pin evidence gate:** documentation and optional operator-run
+1. **Local release-ready gate:** local CI, local Docker/Nix build, local
+   checksum verification, artifact-shape verification, release smoke against
+   the extracted artifact, staging denylist, anti-platform gate, and
+   `no_prod_touch`.
+2. **Published asset gate:** after upload, download the GitHub Release tarball
+   and checksum sidecar into a tempdir and verify tag, version, filename,
+   checksum, and release notes identity. This gate must not modify an already
+   uploaded artifact; failure requires a new artifact/release attempt.
+3. **Deployment pin evidence gate:** documentation and optional operator-run
    evidence that a deployment host or deployment repository pins the GitHub
    Release tarball URL and exact checksum.
 
@@ -346,6 +383,35 @@ If deployment evidence is not available during release closure, the stop card
 must say `deployment_pin_smoke: not_run_by_design` and link to the operations
 checklist. It must not block the local artifact release unless the release claim
 says the production deployment has already been updated.
+
+## Stop Nodes
+
+`v0.2_local_release_ready` is complete only when the fixed local evidence set is
+present:
+
+- `local_ci`;
+- `docker_nix_build`;
+- `artifact_sha`;
+- `artifact_shape`;
+- `release_smoke`;
+- `contract_tests`;
+- `denylist`;
+- `anti_platform_gate`;
+- `support_residue_scan`;
+- `no_prod_touch`;
+- `route_boundary_extraction`, with `deferred` accepted.
+
+`v0.2_published_release_complete` is complete only when
+`v0.2_local_release_ready` is complete and the published GitHub assets have
+been downloaded and checksum-verified. Deployment evidence is recorded as
+`not_run_by_design`, `operator_provided`, or `operator_run`; it does not block
+published artifact completion unless the release claim explicitly says the
+deployment host was updated.
+
+When a stop node is complete, stop. New findings must be classified as
+`blocking_defect`, `v0.3_blocker`, or `post_release_debt`. Do not keep adding
+release-smoke cases, docs sections, or review rounds without replacing an
+existing matrix item or writing a separate accepted plan.
 
 ## Optional Hygiene Package B: Main Boundary Diet
 
@@ -517,8 +583,10 @@ management-url check.
 
 - [ ] **Step 2: Add only missing fixed matrix entries**
 
-Update `scripts/release-smoke.sh` so it covers the fixed matrix above. Keep
-local placeholder tokens and local mock upstreams only.
+Update `scripts/release-smoke.sh` so it covers the artifact-smoke matrix above.
+Keep local placeholder tokens and local mock upstreams only. Do not grow smoke
+with every negative branch; put combinatorial reason-code, redaction, failure
+window, endpoint-family, and credential-state cases in contract tests.
 
 - [ ] **Step 3: Shell-check by execution parser**
 
@@ -578,7 +646,10 @@ Cover:
 - `safe_argv` is structured and redacted;
 - dry-run, read-only, local-write, upstream-touching, and management-mutating
   reports keep their current side-effect classes;
-- bounded failure output does not exceed documented caps.
+- bounded failure output does not exceed documented caps: routing telemetry and
+  response-filter events default to 1024 in-memory events, each rejects public
+  configuration outside 1 to 4096, `failures` defaults to 50 records per source,
+  caps each source at 200, and returns at most 400 combined records.
 
 - [ ] **Step 3: Run narrow tests and prove filters are non-empty**
 
@@ -887,9 +958,10 @@ Expected: pass.
 
 - [ ] **Step 6: Verify GitHub release asset identity after upload**
 
-Download the uploaded tarball and `.sha256` into a tempdir and verify the
-checksum from the uploaded sidecar. Confirm tag, Cargo version, artifact
-filename, checksum filename, and release notes version match.
+After the local release-ready gate passes and the release is uploaded, download
+the uploaded tarball and `.sha256` into a tempdir and verify the checksum from
+the uploaded sidecar. Confirm tag, Cargo version, artifact filename, checksum
+filename, and release notes version match.
 
 Expected: uploaded assets are exactly the release tarball and checksum sidecar
 unless a separate packaging task explicitly added more artifacts.
@@ -927,21 +999,31 @@ probing, adaptive routing, or automatic discover/apply/reload/scope behavior.
 
 - [ ] **Step 9: Record `v0.2` stop card**
 
-The release stop card must state:
+The release stop card must state only fixed fields:
 
-- release artifact version, tag, tarball name, and checksum;
-- local CI result;
-- release smoke result from extracted binary, not `cargo run`;
-- `check-config` vs `/v1/models` model-set equality result;
-- representative command envelope/decision-triad result;
-- negative management URL misuse result;
-- redaction/denylist result;
-- GitHub uploaded asset checksum verification result;
-- deployment pin boundary result, with no production touch unless separately
-  authorized;
-- route-boundary extraction result, or `route_boundary_extraction: deferred`;
-- anti-platform gate result;
-- any `v0.3` blockers found during characterization.
+- `plan_id`;
+- `release_or_scope_name`;
+- `closed_capability`;
+- `implemented_scope`;
+- `deferred_scope`;
+- `parked_or_rejected_items`;
+- `operator_contract_evidence`;
+- `test_evidence`;
+- `non_empty_filtered_test_evidence`;
+- `local_ci_result`;
+- `release_artifact_result`;
+- `release_smoke_result`;
+- `artifact_sha`;
+- `published_asset_verification`;
+- `redaction_and_denylist_result`;
+- `anti_platform_gate_result`;
+- `support_residue_scan_result`;
+- `deployment_boundary_result`;
+- `no_prod_touch`;
+- `route_boundary_extraction`;
+- `known_blockers`;
+- `v0.3_blockers`;
+- `next_version_candidates`.
 
 - [ ] **Step 10: Commit stop-card docs if needed**
 
@@ -963,10 +1045,13 @@ be one stability package, not a catch-all platform upgrade.
 
 Initial `v0.3` scope:
 
-- named preset: `Conservative Pre-Output Stability v1`;
-- at most one extra attempt;
+- named capability package: `Conservative Pre-Output Stability v1`;
+- no runtime YAML preset by default; init templates may render explicit
+  `routing_profiles` fields;
+- at most one extra upstream attempt per original client request;
 - total retry wall-clock budget <= 1500 ms;
-- non-streaming only;
+- non-streaming `chat_completions` and non-streaming `responses` only in the
+  initial endpoint-family allowlist;
 - replayable bodies only;
 - retry before upstream response bytes reach the client only;
 - no retry after partial output;
@@ -975,6 +1060,11 @@ Initial `v0.3` scope:
 - stable denial reason codes;
 - duplicate-charge risk telemetry;
 - management-only bounded retry evidence.
+
+The one extra attempt is mutually exclusive: retry a different credential on
+the same channel, retry one eligible frozen route target, or retry the same
+target once as a last resort. These choices must not chain inside the same
+original client request.
 
 `v0.3` must not add:
 

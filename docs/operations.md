@@ -17,7 +17,7 @@ The supported build path remains local development host to release artifact:
 local Docker/Nix x86_64 build -> GitHub Release tarball + sha256 -> deployment host pin
 ```
 
-A public client base URL such as `https://ai.rtoc.cc/v1` may point at the
+A public client base URL such as `https://gateway.example/v1` may point at the
 gateway, but the public URL is not a secret. Client tokens, management tokens,
 and upstream credentials remain secret material and should never appear in Nix
 expressions, Git history, issue text, chat logs, or troubleshooting snippets.
@@ -123,9 +123,19 @@ and which redacted token name or stable client id was expected.
 
 ## Release Smoke
 
-After pinning a deployment host to a GitHub Release asset and checksum, run a
-minimal release smoke against the public base URL. The smoke should verify
-process liveness, authenticated management health, `/v1/models`, and one
-non-sensitive completion request using a test client token and a harmless prompt.
-Store only redacted status, reason codes, route names, model ids, release
-version, and checksum in the smoke record.
+Before publishing a release, run the local artifact smoke from the repository
+root after the Docker/Nix release build:
+
+```bash
+scripts/release-smoke.sh
+```
+
+That smoke uses the extracted release binary, generated placeholder tokens, and
+a local mock upstream. It does not contact a deployment host.
+
+After an operator intentionally pins a deployment host to a GitHub Release asset
+and checksum, the operator may run a minimal deployment smoke against the public
+base URL. The smoke should verify process liveness, authenticated management
+health, `/v1/models`, and one non-sensitive completion request using a test
+client token and a harmless prompt. Store only redacted status, reason codes,
+route names, model ids, release version, and checksum in the smoke record.
