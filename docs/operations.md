@@ -1,4 +1,4 @@
-# Operations And Troubleshooting
+# Operations
 
 This document covers the runtime and deployment boundaries that operators should
 keep stable for a small one-ai-key gateway. It intentionally avoids raw secrets,
@@ -8,8 +8,8 @@ request bodies, response bodies, and upstream-specific private data.
 
 The gateway deployment host consumes a published GitHub Release tarball. On
 NixOS, pin the release asset URL and its `sha256` in the host configuration, then
-unpack and run the pinned binary. Do not build this repository on the VPS, do
-not run Cargo there, and do not use the deployment host as an ad hoc Nix builder.
+unpack and run the pinned binary. Do not build this repository on the deployment
+host, do not run Cargo there, and do not use that host as an ad hoc Nix builder.
 
 The supported build path remains local development host to release artifact:
 
@@ -17,10 +17,10 @@ The supported build path remains local development host to release artifact:
 local Docker/Nix x86_64 build -> GitHub Release tarball + sha256 -> deployment host pin
 ```
 
-A public client base URL such as `https://gateway.example/v1` may point at the
-gateway, but the public URL is not a secret. Client tokens, management tokens,
-and upstream credentials remain secret material and should never appear in Nix
-expressions, Git history, issue text, chat logs, or troubleshooting snippets.
+A public client base URL has the shape `<public-gateway-base-url>/v1`, but the
+URL is not a credential. Client tokens, management tokens, and upstream
+credentials remain secret material and should never appear in Nix expressions,
+Git history, tickets, copied terminal output, or documentation.
 
 ## Persistent State
 
@@ -46,7 +46,7 @@ only by the service user and the operator account that rotates them.
 
 JSONL events and logs are operational evidence, not source material. They may
 contain timing, route, status, and reason-code data, but operators should treat
-them as sensitive because they can reveal deployment topology or incident
+them as sensitive because they can reveal deployment topology or operational
 context. Some deployments keep JSONL events under `data`, for example
 `/opt/one-ai-key/data/events.jsonl`, so treat configured event paths as mutable
 runtime state even when they are not under a dedicated `logs` directory.
@@ -54,15 +54,120 @@ runtime state even when they are not under a dedicated `logs` directory.
 Do not commit SQLite databases, JSONL event streams, token files, upstream key
 files, local YAML containing secrets, generated tarballs, or checksum sidecars.
 
-## Safe Diagnostics
+## Runtime Workflow
 
-Troubleshooting should use redacted, structural evidence: HTTP status, stable
-reason codes, public model ids, route names, credential lifecycle state, reload
-state, release version, and checksum identity. Never paste raw client tokens,
+Install from a release artifact, generate local config, check it offline, then
+start the service:
+
+```bash
+shasum -a 256 -c one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz
+one-ai-key init local --out config/local.yaml --keys data/relay.keys --dry-run
+one-ai-key init local --out config/local.yaml --keys data/relay.keys --yes
+one-ai-key check-config --config config/local.yaml
+one-ai-key serve --config config/local.yaml
+```
+
+`check-config` is offline. It parses local YAML, expands `upstreams`, validates
+local references, counts local credential lines, and reports redacted model
+visibility. It does not open SQLite stores, probe upstreams, or call upstream
+catalogs.
+
+Configure clients with the OpenAI-compatible base URL and a client token:
+
+```text
+Base URL: <public-gateway-base-url>/v1
+API Key: <client-token>
+Model: <public-model-id>
+```
+
+Inspect the local client-visible catalog with the same client token:
+
+```bash
+curl <public-gateway-base-url>/v1/models \
+  -H 'Authorization: Bearer <client-token>'
+```
+
+For local loopback checks, replace `<public-gateway-base-url>` with the service
+origin, for example `http://127.0.0.1:4101`.
+
+Operator commands use the management token and the management origin, not the
+client `/v1` base URL:
+
+```bash
+export ONE_AI_KEY_MANAGEMENT_TOKEN=<management-token>
+
+one-ai-key doctor --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN
+
+one-ai-key models list --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --client-token-ref <client-token-ref>
+
+one-ai-key models explain --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --model <public-model-id> \
+  --client-token-ref <client-token-ref>
+
+one-ai-key route explain <public-model-id> --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --client-token-ref <client-token-ref>
+```
+
+The offline `check-config` visibility preview, authenticated `/v1/models`, and
+the `models explain` / `route explain` views should agree for the same generated
+config, public model id, and client-token reference.
+
+## Operator Command Boundaries
+
+All operator reports use a redacted envelope with status, stable reason code,
+side-effect class, effect vector, scope/window data when applicable, and a safe
+next action. Table output can be shorter than JSON, but it must preserve the
+same decision-bearing fields.
+
+Read-only commands do not write local files, call upstreams, or mutate
+management state: `doctor`, `models list`, `models explain`, `route explain`,
+`client-tokens list`, `keys list`, `keys stats`, `failures tail`, `failures
+explain`, `reload status`, and `reload diff`.
+
+Dry-run commands preview the intended effect and must leave write/upstream bits
+off: `init local --dry-run`, `keys import --credential-set <id> --source <path>
+--dry-run`, `keys probe --credential-set <id> --credential-ref <ref> --model
+<public-model> --dry-run`, `keys probe-apply apply --credential-set <id>
+--credential-ref <ref> --dry-run`, `models onboard-plan --dry-run`, and `reload
+apply --dry-run`.
+
+Upstream-touching commands are explicit. `keys probe --yes` probes one
+credential reference and may persist redacted probe evidence; it is not a
+background health scan and it is not an automatic routing mutation.
+
+Mutating commands require `--yes` or interactive confirmation:
+`keys import --credential-set <id> --source <path> --yes`, `keys disable
+--credential-set <id> --credential-ref <ref> --reason <reason> --yes`, `keys
+probe-apply apply --credential-set <id> --credential-ref <ref>
+--probe-result-ref <probe-ref> --yes`, and `reload apply
+--expected-staged-registry-version <version> --yes`. Each report must disclose
+whether it writes the management store, mutates active runtime state, or has no
+automatic rollback.
+
+## Diagnostic Red Lines
+
+Diagnostics should use redacted structural evidence: HTTP status, stable reason
+codes, public model ids, route names, credential lifecycle state, reload state,
+release version, and checksum identity. Never paste raw client tokens,
 management tokens, upstream keys, complete request bodies, complete response
-bodies, or provider payloads. Also do not copy advertising, promotion, invite,
-mirror-site, or unrelated marketing text from logs, web pages, OCR, screenshots,
-or error output into project files or incident notes.
+bodies, provider payloads, absolute secret paths, or token-like URL components.
+
+Do not preserve private deployment names, private host names, real gateway or
+upstream domains, temporary key values, one-off replacement procedures,
+conversation excerpts, workaround transcripts, or operator identities in project
+docs, examples, release notes, test fixtures, or generated artifacts. Convert
+recurring lessons into stable commands, reason codes, smoke checks, or checklist
+items; otherwise remove them.
+
+Do not copy advertising, promotion, invite, mirror-site, or unrelated marketing
+text from logs, web pages, OCR, screenshots, or error output into project files
+or operational records.
 
 Before diagnosing application behavior, confirm the deployed binary is the
 pinned release asset by checking the systemd `ExecStart` path or equivalent
@@ -114,8 +219,8 @@ client traffic.
 `invalid router api key` is a client-facing authentication failure. Confirm that
 the caller is using a valid client token for this gateway, not a management token
 and not an upstream provider key. Check token rotation history and service
-configuration on the host, but never paste the token value into chat, docs,
-tickets, shell history, or Git.
+configuration on the host, but never paste the token value into docs, tickets,
+shared notes, shell history, or Git.
 
 If the gateway sits behind a reverse proxy, verify that the `Authorization`
 header reaches one-ai-key unchanged. Record only whether the header was present

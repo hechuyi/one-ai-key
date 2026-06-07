@@ -1,13 +1,19 @@
 # one-ai-key
 
-`one-ai-key` is a lightweight AI API key router for personal and small-team
-deployments. Clients use one OpenAI-compatible base URL and one client token;
-the router selects an upstream channel, credential set, and real upstream
-credential behind that stable client-facing endpoint.
+`one-ai-key` is a lightweight OpenAI-compatible key router for personal and
+small-team deployments. Clients use one `/v1` base URL and one client token;
+the router maps each public model id through explicit local model routes to an
+upstream channel, credential set, and real upstream credential.
 
-The project is intentionally backend-first. It is not a hosted multi-tenant API
-platform, billing system, UI product, active health-check cluster, or live model
-catalog aggregator.
+The operator surface is intentionally redacted. Management APIs and CLI reports
+explain configuration, model visibility, route choice, key state, reload state,
+and bounded recent failure evidence without printing raw client tokens,
+management tokens, upstream keys, raw request bodies, raw response bodies,
+absolute key-file paths, or token-like URL components.
+
+The project is not a hosted multi-tenant platform, billing system, UI product,
+live provider catalog, active health-check cluster, broad protocol converter, or
+support bundle.
 
 ## What It Does
 
@@ -26,6 +32,8 @@ catalog aggregator.
   obvious upstream error envelopes and configured response-filter rejections.
 - Serves `/v1/models` from compiled local runtime state. It does not call
   upstream `/v1/models` on the request path.
+- Provides redacted operator commands for `doctor`, `models`, `route`, `keys`,
+  `failures`, and `reload`.
 
 ## Fit
 
@@ -49,18 +57,19 @@ Do not use it as:
 
 ## Install
 
-Download a Linux x86_64 release artifact from:
+Download a pinned Linux x86_64 release artifact and its checksum from:
 
 ```text
 https://github.com/hechuyi/one-ai-key/releases
 ```
 
-Then unpack the tarball and run the `one-ai-key` binary with a local
-configuration file:
+Then verify the checksum, unpack the tarball, and run the extracted
+`one-ai-key` binary with a local configuration file:
 
 ```bash
+shasum -a 256 -c one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256
 tar -xzf one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz
-./one-ai-key --config config/local.yaml
+./one-ai-key serve --config config/local.yaml
 ```
 
 For development, run from source:
@@ -91,7 +100,7 @@ one-ai-key check-config --config config/local.yaml --output json
 
 `check-config` parses YAML, expands `upstreams`, validates local references,
 counts local credential lines, and reports a redacted model visibility preview.
-It does not open SQLite stores, start the HTTP server, probe upstreams, or call
+It does not open SQLite stores, start the HTTP listener, probe upstreams, or call
 upstream `/v1/models`.
 
 Example `config/local.yaml`:
@@ -122,7 +131,7 @@ routing_profiles:
 upstreams:
   relay:
     template: openai_compatible_bearer
-    api_base: https://relay.example/v1
+    api_base: <upstream-openai-compatible-base-url>/v1
     credential_set: relay_credentials
     keys_file: /data/relay-keys.txt
     models:
@@ -130,10 +139,18 @@ upstreams:
         upstream_model: provider/gpt-example
 ```
 
-Send a request:
+Start the service and inspect the client-visible model catalog:
 
 ```bash
-curl http://localhost:4101/v1/chat/completions \
+one-ai-key serve --config config/local.yaml
+curl http://127.0.0.1:4101/v1/models \
+  -H 'Authorization: Bearer <client-token>'
+```
+
+Send a model-bearing request through the OpenAI-compatible client base URL:
+
+```bash
+curl http://127.0.0.1:4101/v1/chat/completions \
   -H 'Authorization: Bearer <client-token>' \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-example","messages":[{"role":"user","content":"ok"}]}'
@@ -142,10 +159,41 @@ curl http://localhost:4101/v1/chat/completions \
 Client configuration:
 
 ```text
-Base URL: http://localhost:4101/v1
+Base URL: http://127.0.0.1:4101/v1
 API Key: <client-token>
 Model: gpt-example
 ```
+
+The client token is not the management token. Normal clients use the
+OpenAI-compatible `/v1` base URL and the client token. Operator commands use a
+management origin or `/management` base URL plus a management token reference:
+
+```bash
+export ONE_AI_KEY_MANAGEMENT_TOKEN=<management-token>
+
+one-ai-key doctor \
+  --management-url http://127.0.0.1:4101 \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN
+
+one-ai-key models list \
+  --management-url http://127.0.0.1:4101 \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --client-token-ref local-client
+
+one-ai-key models explain \
+  --management-url http://127.0.0.1:4101 \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --model gpt-example \
+  --client-token-ref local-client
+
+one-ai-key route explain gpt-example \
+  --management-url http://127.0.0.1:4101 \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --client-token-ref local-client
+```
+
+The management CLI rejects a client `/v1` base URL used as
+`--management-url`; pass the service origin or the management base instead.
 
 ## Configuration Model
 
@@ -212,6 +260,16 @@ Model discovery is management-only and does not change client traffic by itself.
 Use sync planning/apply and runtime reload only when discovered models should be
 staged as explicit public routes.
 
+Use `one-ai-key doctor` as the first read-only runtime summary. By default it
+reads runtime management projections without writing local files, calling
+upstreams, or mutating management state. Add `--include-alerts`,
+`--include-events`, or `--include-routes` only when the bounded extra projection
+is needed.
+
+`one-ai-key models list --client-token-ref <ref>` shows public models visible to
+one configured client-token reference from compiled runtime state. It should
+agree with authenticated `GET /v1/models` for the same client token.
+
 `one-ai-key models explain --model <public-model>` and
 `one-ai-key route explain <public-model>` are read-only management CLI views over
 the compiled routing preview. They show selected route candidates, client-token
@@ -219,6 +277,28 @@ scope, reload status, and static endpoint capability metadata when the active
 runtime exposes it. Capability output is diagnostic metadata only; it does not
 probe upstreams, change routing, or imply protocol conversion between endpoint
 families.
+
+`one-ai-key keys list` and `one-ai-key keys stats` are read-only credential-set
+views. `keys stats --credential-set <id> --include-credential-refs` may show
+non-secret `credential_ref` values for individual workflows when the runtime has
+a durable non-secret reference. `keys import --credential-set <id> --source
+<path> --dry-run` previews a replacement import from a local file. `keys import
+--credential-set <id> --source <path> --yes` writes only after explicit
+confirmation and reports whether management store or active runtime state
+changed.
+
+`one-ai-key keys probe --credential-set <id> --credential-ref <ref> --model
+<public-model> --dry-run` previews a single-credential probe. A confirmed
+`--yes` probe is upstream-touching and may persist redacted probe evidence. Use
+`keys probe-apply plan --credential-set <id> --credential-ref <ref>` and `keys
+probe-apply apply --credential-set <id> --credential-ref <ref> --dry-run` before
+a confirmed `keys probe-apply apply --credential-set <id> --credential-ref <ref>
+--probe-result-ref <probe-ref> --yes`.
+
+`one-ai-key failures tail --last <n>` and `one-ai-key failures explain
+<request-id>` read only bounded recent failure evidence from management
+projections. They are not historical storage, routing input, or a place to
+quote upstream payloads.
 
 `one-ai-key reload status` is a read-only operator CLI view over
 `/management/runtime` and `/management/explain/runtime`. It reports the active

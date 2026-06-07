@@ -39,7 +39,17 @@ tarball URL and its `sha256`. The gateway host must not pin a branch, local
 checkout, moving archive URL, Docker image, or source build. The release asset is
 the deployment contract.
 
-The release artifact is written under `dist/`:
+## Artifact Contract
+
+The published artifact set for a release is exactly the Linux x86_64 tarball and
+its `.sha256` sidecar:
+
+```text
+one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz
+one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256
+```
+
+The local build writes the same files under `dist/`:
 
 ```text
 dist/one-ai-key-<version>-<target>.tar.gz
@@ -54,6 +64,19 @@ The SHA256 sidecar must contain only the archive basename:
 
 It must not contain an absolute path or a `dist/`-prefixed path.
 
+The tarball contains the release binary as the runnable contract. It does not
+contain deployment config, client tokens, management tokens, upstream keys,
+SQLite state, JSONL event streams, local logs, Nix caches, Cargo target
+directories, private scripts, or operator notes.
+
+A consumer verifies the uploaded sidecar, unpacks the tarball, pins the exact
+asset URL and hash in deployment configuration, and runs the binary with local
+config and secret files supplied by that deployment. A consumer must not infer
+release identity from a branch name, a moving archive URL, a local checkout, a
+Docker image tag, or a locally compiled binary.
+
+## Publish Contract
+
 Before publishing a GitHub release, run:
 
 ```bash
@@ -62,6 +85,14 @@ scripts/build-release-x86_64-linux-docker.sh
 scripts/release-smoke.sh
 git status -sb --untracked-files=all
 ```
+
+`scripts/release-smoke.sh` must run the extracted artifact in a tempdir with
+generated placeholder tokens and a local mock upstream. It must cover offline
+config generation/checking, authenticated `/v1/models`, one model-bearing
+request, redacted operator reports for `doctor`, `models`, `route`, `keys`,
+`failures`, and `reload`, and rejection of a client `/v1` URL used as a
+management URL. It must not use `cargo run`, a source checkout binary, real
+upstream credentials, or a deployment host.
 
 ## Release Checklist
 
@@ -97,6 +128,11 @@ git status -sb --untracked-files=all
 The release commit or tag must not include `dist/`, runtime config, SQLite
 databases, key files, token files, JSONL logs, private agent files,
 `AGENTS.md`, `target/`, or local deployment state.
+
+Local `config/`, `data/`, `db/`, `logs/`, `dist/`, `target/`, and deployment
+state directories are operational or build outputs. Keep them ignored and out of
+Git staging; release publication is the uploaded artifact pair, not repository
+storage of generated files.
 
 The first run can be slow while Docker populates the persistent Nix store volume.
 That is cache warm-up, not a reason to switch build paths. If a build path is in
