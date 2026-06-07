@@ -125,6 +125,21 @@ pub fn classify_action(action: &CliAction) -> CommandEffect {
                     },
                 },
             },
+            crate::cli_commands::keys::KeysCommand::Disable(options) => match options.mode {
+                crate::cli_commands::keys::KeysDisableMode::DryRun => CommandEffect {
+                    side_effect_class: SideEffectClass::OfflineReadonly,
+                    effect_vector: EffectVector::default(),
+                },
+                crate::cli_commands::keys::KeysDisableMode::Apply
+                | crate::cli_commands::keys::KeysDisableMode::NeedsConfirmation => CommandEffect {
+                    side_effect_class: SideEffectClass::ManagementWrite,
+                    effect_vector: EffectVector {
+                        writes_management_store: true,
+                        mutates_runtime: true,
+                        ..EffectVector::default()
+                    },
+                },
+            },
             crate::cli_commands::keys::KeysCommand::ProbeApply(command) => match command {
                 crate::cli_commands::keys::KeysProbeApplyCommand::Plan(_) => {
                     runtime_readonly_store_reads_effect()
@@ -250,6 +265,23 @@ pub fn confirmation_outcome(action: &CliAction, stdin_is_tty: bool) -> Confirmat
             if matches!(
                 options.mode,
                 crate::cli_commands::keys::KeysProbeMode::NeedsConfirmation
+            ) =>
+        {
+            if stdin_is_tty {
+                ConfirmationOutcome::PromptRequired {
+                    reason_code: "confirmation_required",
+                }
+            } else {
+                ConfirmationOutcome::Denied {
+                    exit_code: 3,
+                    reason_code: "confirmation_required",
+                }
+            }
+        }
+        CliAction::Keys(crate::cli_commands::keys::KeysCommand::Disable(options))
+            if matches!(
+                options.mode,
+                crate::cli_commands::keys::KeysDisableMode::NeedsConfirmation
             ) =>
         {
             if stdin_is_tty {
@@ -856,6 +888,108 @@ mod tests {
                 reads_local_files: false,
                 reads_management_runtime: true,
                 reads_management_store: true,
+                writes_local_files: false,
+                writes_management_store: true,
+                calls_upstream: false,
+                mutates_runtime: true,
+            }
+        );
+    }
+
+    #[test]
+    fn keys_disable_requires_confirmation_before_management_write() {
+        let action = CliAction::Keys(crate::cli_commands::keys::KeysCommand::Disable(
+            crate::cli_commands::keys::KeysDisableOptions {
+                connection: crate::cli::OperatorConnectionOptions {
+                    management_url: Some("https://router.example".to_string()),
+                    deprecated_base_url: None,
+                    management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                    management_token_stdin: false,
+                    timeout_seconds: 10,
+                },
+                credential_set_id: "relay-a".to_string(),
+                credential_ref: "cr:v1:pos:0".to_string(),
+                reason: "operator verified bad key".to_string(),
+                mode: crate::cli_commands::keys::KeysDisableMode::NeedsConfirmation,
+                output: crate::cli_report::OutputFormat::Table,
+            },
+        ));
+
+        assert_eq!(
+            super::confirmation_outcome(&action, false),
+            super::ConfirmationOutcome::Denied {
+                exit_code: 3,
+                reason_code: "confirmation_required"
+            }
+        );
+        assert_eq!(
+            super::confirmation_outcome(&action, true),
+            super::ConfirmationOutcome::PromptRequired {
+                reason_code: "confirmation_required"
+            }
+        );
+    }
+
+    #[test]
+    fn keys_disable_dry_run_is_offline_readonly_but_confirmed_disable_is_management_write() {
+        let connection = crate::cli::OperatorConnectionOptions {
+            management_url: Some("https://router.example".to_string()),
+            deprecated_base_url: None,
+            management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+            management_token_stdin: false,
+            timeout_seconds: 10,
+        };
+
+        let dry_run = CliAction::Keys(crate::cli_commands::keys::KeysCommand::Disable(
+            crate::cli_commands::keys::KeysDisableOptions {
+                connection: connection.clone(),
+                credential_set_id: "relay-a".to_string(),
+                credential_ref: "cr:v1:pos:0".to_string(),
+                reason: "operator verified bad key".to_string(),
+                mode: crate::cli_commands::keys::KeysDisableMode::DryRun,
+                output: crate::cli_report::OutputFormat::Table,
+            },
+        ));
+        let confirmed = CliAction::Keys(crate::cli_commands::keys::KeysCommand::Disable(
+            crate::cli_commands::keys::KeysDisableOptions {
+                connection,
+                credential_set_id: "relay-a".to_string(),
+                credential_ref: "cr:v1:pos:0".to_string(),
+                reason: "operator verified bad key".to_string(),
+                mode: crate::cli_commands::keys::KeysDisableMode::Apply,
+                output: crate::cli_report::OutputFormat::Table,
+            },
+        ));
+
+        let dry_run_effect = super::classify_action(&dry_run);
+        assert_eq!(
+            dry_run_effect.side_effect_class,
+            super::SideEffectClass::OfflineReadonly
+        );
+        assert_eq!(
+            dry_run_effect.effect_vector,
+            super::EffectVector {
+                reads_local_files: false,
+                reads_management_runtime: false,
+                reads_management_store: false,
+                writes_local_files: false,
+                writes_management_store: false,
+                calls_upstream: false,
+                mutates_runtime: false,
+            }
+        );
+
+        let confirmed_effect = super::classify_action(&confirmed);
+        assert_eq!(
+            confirmed_effect.side_effect_class,
+            super::SideEffectClass::ManagementWrite
+        );
+        assert_eq!(
+            confirmed_effect.effect_vector,
+            super::EffectVector {
+                reads_local_files: false,
+                reads_management_runtime: false,
+                reads_management_store: false,
                 writes_local_files: false,
                 writes_management_store: true,
                 calls_upstream: false,

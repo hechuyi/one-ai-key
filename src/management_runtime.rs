@@ -5,13 +5,15 @@ use std::{
 };
 
 use serde::Serialize;
+use serde_json::{json, Value};
 
 use crate::{
     client_token_store::ClientTokenStoreHandle,
     credential_repository::CredentialStoreHandle,
+    credentials::short_hash,
     events::{
         ManagementAuditEvent, ManagementEventActor, ResponseFilterEvent, RetryPressureCounters,
-        RoutingTelemetry,
+        RoutingTelemetry, UpstreamFailureTelemetry,
     },
     management_alerts::{
         model_route_all_target_suppression_alerts, response_filter_contamination_alerts_for_state,
@@ -34,7 +36,7 @@ pub struct ResponseFilterEventsResponse {
     pub dropped_events: u64,
     pub offset: usize,
     pub limit: usize,
-    pub events: Vec<ResponseFilterEvent>,
+    pub events: Vec<Value>,
 }
 
 pub fn response_filter_events_response(
@@ -45,7 +47,12 @@ pub fn response_filter_events_response(
     limit: usize,
 ) -> ResponseFilterEventsResponse {
     let buffered_events = snapshot.len();
-    let events = snapshot.into_iter().skip(offset).take(limit).collect();
+    let events = snapshot
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(sanitize_response_filter_event)
+        .collect();
     ResponseFilterEventsResponse {
         buffered_events,
         capacity,
@@ -85,7 +92,7 @@ pub struct RoutingTelemetryResponse {
     pub dropped_events: u64,
     pub offset: usize,
     pub limit: usize,
-    pub events: Vec<RoutingTelemetry>,
+    pub events: Vec<Value>,
 }
 
 pub fn routing_telemetry_response(
@@ -96,7 +103,12 @@ pub fn routing_telemetry_response(
     limit: usize,
 ) -> RoutingTelemetryResponse {
     let buffered_events = snapshot.len();
-    let events = snapshot.into_iter().skip(offset).take(limit).collect();
+    let events = snapshot
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(sanitize_routing_telemetry)
+        .collect();
     RoutingTelemetryResponse {
         buffered_events,
         capacity,
@@ -131,6 +143,147 @@ pub fn routing_telemetry_snapshot_response(
 
 fn total_dropped_events(buffer_dropped_events: u64, lock_contention_drops: &AtomicU64) -> u64 {
     buffer_dropped_events.saturating_add(lock_contention_drops.load(Ordering::Relaxed))
+}
+
+fn sanitize_routing_telemetry(event: RoutingTelemetry) -> Value {
+    match event {
+        RoutingTelemetry::RouteSelected {
+            request_id,
+            registry_generation,
+            channel_id,
+        } => json!({
+            "kind": "route_selected",
+            "request_id": safe_management_id(&request_id),
+            "registry_generation": registry_generation,
+            "channel_id": safe_management_id(&channel_id),
+        }),
+        RoutingTelemetry::UpstreamFailureObserved {
+            request_id,
+            channel_id,
+            failure,
+        } => json!({
+            "kind": "upstream_failure_observed",
+            "request_id": safe_management_id(&request_id),
+            "channel_id": safe_management_id(&channel_id),
+            "failure": sanitize_upstream_failure(*failure),
+        }),
+        RoutingTelemetry::TransitionApplied {
+            request_id,
+            channel_id,
+        } => json!({
+            "kind": "transition_applied",
+            "request_id": safe_management_id(&request_id),
+            "channel_id": safe_management_id(&channel_id),
+        }),
+        RoutingTelemetry::ChannelHealthTransitionApplied {
+            request_id,
+            channel_id,
+            state,
+            reason,
+        } => json!({
+            "kind": "channel_health_transition_applied",
+            "request_id": safe_management_id(&request_id),
+            "channel_id": safe_management_id(&channel_id),
+            "state": safe_management_id(&state),
+            "reason": safe_management_id(&reason),
+        }),
+        RoutingTelemetry::CredentialTransitionApplied {
+            request_id,
+            channel_id,
+            credential_id,
+            state,
+            reason,
+        } => json!({
+            "kind": "credential_transition_applied",
+            "request_id": safe_management_id(&request_id),
+            "channel_id": safe_management_id(&channel_id),
+            "credential_id_hash": short_hash(&credential_id),
+            "state": safe_management_id(&state),
+            "reason": safe_management_id(&reason),
+        }),
+        RoutingTelemetry::CredentialLifecyclePersistenceDropped {
+            request_id,
+            channel_id,
+            credential_id,
+            state,
+            reason,
+            drop_reason,
+        } => json!({
+            "kind": "credential_lifecycle_persistence_dropped",
+            "request_id": safe_management_id(&request_id),
+            "channel_id": safe_management_id(&channel_id),
+            "credential_id_hash": short_hash(&credential_id),
+            "state": safe_management_id(&state),
+            "reason": safe_management_id(&reason),
+            "drop_reason": safe_management_id(&drop_reason),
+        }),
+    }
+}
+
+fn sanitize_upstream_failure(failure: UpstreamFailureTelemetry) -> Value {
+    json!({
+        "public_model": failure.public_model.as_deref().and_then(safe_management_id),
+        "credential_id_hash": safe_management_id(&failure.credential_id_hash),
+        "attempt": failure.attempt,
+        "failure_source": safe_management_id(&failure.failure_source),
+        "failure_kind": safe_management_id(&failure.failure_kind),
+        "failure_scope": safe_management_id(&failure.failure_scope),
+        "retryable": failure.retryable,
+        "confidence": safe_management_id(&failure.confidence),
+        "status": failure.status,
+        "classifier_id": safe_management_id(&failure.classifier_id),
+        "classifier_version": safe_management_id(&failure.classifier_version),
+        "adaptation_rule_id": failure.adaptation_rule_id.as_deref().and_then(safe_management_id),
+        "retry_after_source": failure.retry_after_source.as_deref().and_then(safe_management_id),
+        "cooldown_seconds": failure.cooldown_seconds,
+        "directive": safe_management_id(&failure.directive),
+        "denial_reason": failure.denial_reason.as_deref().and_then(safe_management_id),
+        "duplicate_charge_risk": safe_management_id(&failure.duplicate_charge_risk),
+        "effective_deadline_remaining_ms": failure.effective_deadline_remaining_ms,
+        "retry_pressure_accounted": failure.retry_pressure_accounted,
+        "retry_decision": safe_management_id(&failure.retry_decision),
+        "retry_decision_reason": failure.retry_decision_reason.as_deref().and_then(safe_management_id),
+    })
+}
+
+fn sanitize_response_filter_event(event: ResponseFilterEvent) -> Value {
+    json!({
+        "event_id": event.event_id,
+        "created_at_unix_seconds": event.created_at_unix_seconds,
+        "request_id": safe_management_id(&event.request_id),
+        "channel_id": safe_management_id(&event.channel_id),
+        "public_model": safe_management_id(&event.public_model),
+        "rule_id": safe_management_id(&event.rule_id),
+        "action": safe_management_id(&event.action),
+        "content_kind": safe_management_id(&event.content_kind),
+        "reason_code": safe_management_id(&event.reason_code),
+        "outcome": safe_management_id(&event.outcome),
+        "body_committed": event.body_committed,
+    })
+}
+
+fn safe_management_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return None;
+    }
+    if !trimmed
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("sk-")
+        || lower.contains("://")
+        || lower.contains("http")
+        || lower.contains("telegram")
+        || lower.contains("promo")
+        || lower.contains("invite")
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 #[derive(Debug, Serialize)]

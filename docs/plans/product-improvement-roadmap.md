@@ -142,14 +142,29 @@ upstream jitter. The minimum failure evidence comes only from two in-memory
 rings: routing telemetry controlled by `routing.telemetry_buffer_capacity` and
 response-filter events controlled by `response_filter.event_window_capacity`.
 Both default to 1024 events and reject public configuration outside 1 to 4096.
-Overflow, dropped appends, and runtime-reload shrink only increment the relevant
-dropped counter; they must not block proxy requests or management reads. This
-roadmap does not introduce a persistent failure ledger.
+Management API reads are paged separately: event endpoints default to a 100-item
+page and clamp a single page to 1000 items. CLI failure summaries are narrower
+for one-screen operation: `one-ai-key failures` defaults to 50 records per
+source and caps each source at 200, so a combined routing + response-filter
+report can return at most 400 records. Overflow, dropped appends, and
+runtime-reload shrink only increment the relevant dropped counter; they must
+not block proxy requests or management reads. This roadmap does not introduce a
+persistent failure ledger.
 
 Failure evidence should be minimal: request id, time bucket, endpoint family,
 public model, channel/credential reference when safe, failure kind, retry
 decision, commit state, streaming state, duplicate-charge risk, and dropped
 event count.
+
+Management failure-evidence output is a field whitelist, not raw telemetry
+serialization. Displayable string fields are local identifiers only: trimmed,
+128 bytes or shorter, ASCII `[A-Za-z0-9._:-]`, and rejected if they contain
+token-like, URL-like, or promotional/injection-like fragments. Unsafe values are
+rendered as `null`; raw credential ids are exposed only as short irreversible
+hashes. Upstream bodies, matched filter text, complete URLs, key paths, token
+hashes, request payloads, and upstream free-form `error.message` are never
+failure evidence. `max_error_body_bytes` is a classification input cap, not a
+recording allowance.
 
 Acceptance gates:
 
@@ -161,6 +176,14 @@ Acceptance gates:
   response-filter event windows remaining 1024 in-memory events by default and
   capped at 4096 events when explicitly configured;
 - status output is one-screen operational context, not an analytics product.
+
+Known follow-up to investigate after this milestone: production traffic through
+`one-ai-key` has shown `503 no route candidate` on `/v1/responses` materially
+more often than direct upstream-key use. Treat this as a router availability
+bug until disproven. The next investigation should compare client token/model
+scope, endpoint-family route visibility, credential/channel lifecycle state,
+frozen fallback candidates, and Responses endpoint handling before blaming the
+upstream.
 
 ### M3: Conservative Pre-Output Stability
 

@@ -1104,7 +1104,15 @@ async fn forward_with_pools(req: ForwardRequest) -> Response {
     let total_pools = req.route_plan.targets.len();
     for (route_attempt, target) in req.route_plan.targets.iter().enumerate() {
         let route_target_available = route_attempt + 1 < total_pools;
-        match forward_with_pool(&req, target.clone(), route_target_available).await {
+        let initial_attempt = usize::from(route_attempt > 0);
+        match forward_with_pool(
+            &req,
+            target.clone(),
+            route_target_available,
+            initial_attempt,
+        )
+        .await
+        {
             PoolForwardResult::Response(response) => return response,
             PoolForwardResult::RouteFallback(response) if route_target_available => {
                 last_response = Some(response);
@@ -1125,6 +1133,7 @@ async fn forward_with_pool(
     req: &ForwardRequest,
     target: ForwardTarget,
     route_target_available: bool,
+    initial_attempt: usize,
 ) -> PoolForwardResult {
     let ForwardRequest {
         state,
@@ -1153,7 +1162,7 @@ async fn forward_with_pool(
     };
 
     let query = query.as_deref().unwrap_or_default();
-    let mut attempt = 0usize;
+    let mut attempt = initial_attempt;
     let mut retry_credential_id: Option<CredentialId> = None;
     let mut frozen_retry_candidates: Option<FrozenRetryCandidates> = None;
 

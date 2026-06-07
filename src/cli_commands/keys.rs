@@ -11,6 +11,7 @@ pub enum KeysCommand {
     Stats(KeysStatsOptions),
     Import(KeysImportOptions),
     Probe(KeysProbeOptions),
+    Disable(KeysDisableOptions),
     ProbeApply(KeysProbeApplyCommand),
 }
 
@@ -81,6 +82,23 @@ pub enum KeysProbeMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeysDisableOptions {
+    pub connection: crate::cli::OperatorConnectionOptions,
+    pub credential_set_id: String,
+    pub credential_ref: String,
+    pub reason: String,
+    pub mode: KeysDisableMode,
+    pub output: crate::cli_report::OutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysDisableMode {
+    DryRun,
+    NeedsConfirmation,
+    Apply,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeysProbeApplyCommand {
     Plan(KeysProbeApplyPlanOptions),
     Apply(KeysProbeApplyApplyOptions),
@@ -129,6 +147,11 @@ struct ProbeCredentialRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct DisableCredentialRequest {
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
 struct ApplyLatestProbeRequest {
     probe_result_ref: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,6 +166,7 @@ pub async fn run(
         KeysCommand::Stats(options) => run_stats(options).await,
         KeysCommand::Import(options) => run_import(options).await,
         KeysCommand::Probe(options) => run_probe(options).await,
+        KeysCommand::Disable(options) => run_disable(options).await,
         KeysCommand::ProbeApply(command) => run_probe_apply(command).await,
     }
 }
@@ -218,6 +242,21 @@ pub async fn run_probe(
             "keys probe requires --yes or interactive confirmation",
         )),
         KeysProbeMode::Apply => run_confirmed_probe(options).await,
+    }
+}
+
+pub async fn run_disable(
+    options: KeysDisableOptions,
+) -> Result<String, crate::operator_client::OperatorClientError> {
+    match options.mode {
+        KeysDisableMode::DryRun => Ok(render_keys_disable_dry_run_report(&options)),
+        KeysDisableMode::NeedsConfirmation => {
+            Err(crate::operator_client::OperatorClientError::new(
+                "confirmation_required",
+                "keys disable requires --yes or interactive confirmation",
+            ))
+        }
+        KeysDisableMode::Apply => run_confirmed_disable(options).await,
     }
 }
 
@@ -344,6 +383,24 @@ async fn run_confirmed_probe(
     ))
 }
 
+async fn run_confirmed_disable(
+    options: KeysDisableOptions,
+) -> Result<String, crate::operator_client::OperatorClientError> {
+    let client = crate::cli_commands::operator_client_from_connection(&options.connection)?;
+    let response = client
+        .post_json(
+            crate::operator_client::ManagementMutationEndpoint::CredentialSetCredentialDisable {
+                credential_set_id: options.credential_set_id.clone(),
+                credential_ref: options.credential_ref.clone(),
+            },
+            &DisableCredentialRequest {
+                reason: options.reason.clone(),
+            },
+        )
+        .await?;
+    Ok(render_keys_disable_apply_report(&options, &response))
+}
+
 async fn run_confirmed_import(
     options: KeysImportOptions,
 ) -> Result<String, crate::operator_client::OperatorClientError> {
@@ -450,6 +507,7 @@ fn render_sanitized_keys_report(report: &Value, output: crate::cli_report::Outpu
             match report.get("command").and_then(Value::as_str) {
                 Some("keys import") => render_keys_import_table(report),
                 Some("keys probe") => render_keys_probe_table(report),
+                Some("keys disable") => render_keys_disable_table(report),
                 Some("keys probe-apply plan") | Some("keys probe-apply apply") => {
                     render_keys_probe_apply_table(report)
                 }
@@ -513,6 +571,198 @@ pub fn render_keys_probe_dry_run_report(
         },
     );
     render_sanitized_keys_report(&report, options.output)
+}
+
+pub fn render_keys_disable_dry_run_report(options: &KeysDisableOptions) -> String {
+    let credential_ref = normalize_credential_ref(&options.credential_ref);
+    let status = if credential_ref.is_some() {
+        "dry_run"
+    } else {
+        "blocked"
+    };
+    let reason_code = if credential_ref.is_some() {
+        "keys_disable_plan"
+    } else {
+        "credential_ref_invalid"
+    };
+    let report = keys_disable_report_envelope(
+        status,
+        reason_code,
+        "Credential disable plan was built without mutating management state.",
+        keys_disable_effect_for_mode(KeysDisableMode::DryRun),
+        options,
+        serde_json::json!({
+            "command": "keys disable",
+            "credential_ref": credential_ref,
+            "reason_configured": safe_disable_reason(&options.reason).is_some(),
+            "mutating_disable_sent": false,
+            "upstream_request_sent": false,
+            "automatic_rollback": false,
+            "recovery_path": "confirmed disable mutates credential lifecycle state through management",
+        }),
+        if credential_ref.is_some() {
+            keys_disable_next_action(options)
+        } else {
+            keys_disable_blocked_next_action(
+                "Credential disable requires a non-secret credential_ref.",
+            )
+        },
+    );
+    render_sanitized_keys_report(&report, options.output)
+}
+
+fn render_keys_disable_apply_report(options: &KeysDisableOptions, response: &Value) -> String {
+    let report = keys_disable_report_envelope(
+        "ok",
+        "keys_disable_applied",
+        "Credential disable was applied through management and the response was redacted for CLI output.",
+        keys_disable_effect_for_mode(KeysDisableMode::Apply),
+        options,
+        serde_json::json!({
+            "command": "keys disable",
+            "credential_ref": response
+                .get("credential_ref")
+                .and_then(Value::as_str)
+                .and_then(normalize_credential_ref)
+                .or_else(|| normalize_credential_ref(&options.credential_ref)),
+            "channel_id": response
+                .get("channel_id")
+                .and_then(Value::as_str)
+                .and_then(safe_local_id),
+            "selector_generation": response.get("selector_generation").and_then(Value::as_u64),
+            "state_kind": response
+                .get("state")
+                .and_then(|state| state.get("kind"))
+                .and_then(Value::as_str)
+                .and_then(safe_local_id),
+            "reason_configured": safe_disable_reason(&options.reason).is_some(),
+            "mutating_disable_sent": true,
+            "upstream_request_sent": false,
+            "automatic_rollback": false,
+            "recovery_path": "review credential-set state after disabling this credential",
+        }),
+        serde_json::json!({
+            "summary": "Review credential-set serving state after disabling the credential.",
+            "safe_argv": keys_stats_argv(Some(&options.credential_set_id), true),
+            "side_effect_class": "runtime_readonly",
+            "requires_confirmation": false,
+        }),
+    );
+    render_sanitized_keys_report(&report, options.output)
+}
+
+fn keys_disable_report_envelope(
+    status: &'static str,
+    reason_code: &'static str,
+    reason: &'static str,
+    effect: crate::cli_effects::CommandEffect,
+    options: &KeysDisableOptions,
+    data: Value,
+    next_action: Value,
+) -> Value {
+    crate::cli_report::report_envelope_with_legacy_fields(crate::cli_report::ReportEnvelope {
+        status,
+        reason,
+        reason_code,
+        effect,
+        scope: serde_json::json!({
+            "credential_set_id": safe_local_id(&options.credential_set_id),
+            "credential_ref": normalize_credential_ref(&options.credential_ref),
+        }),
+        window: Value::Null,
+        next_action,
+        data,
+    })
+}
+
+fn keys_disable_effect_for_mode(mode: KeysDisableMode) -> crate::cli_effects::CommandEffect {
+    match mode {
+        KeysDisableMode::DryRun => crate::cli_effects::CommandEffect {
+            side_effect_class: crate::cli_effects::SideEffectClass::OfflineReadonly,
+            effect_vector: crate::cli_effects::EffectVector::default(),
+        },
+        KeysDisableMode::NeedsConfirmation | KeysDisableMode::Apply => {
+            crate::cli_effects::CommandEffect {
+                side_effect_class: crate::cli_effects::SideEffectClass::ManagementWrite,
+                effect_vector: crate::cli_effects::EffectVector {
+                    writes_management_store: true,
+                    mutates_runtime: true,
+                    ..crate::cli_effects::EffectVector::default()
+                },
+            }
+        }
+    }
+}
+
+fn keys_disable_next_action(options: &KeysDisableOptions) -> Value {
+    serde_json::json!({
+        "summary": "Re-run with explicit confirmation to disable this single credential.",
+        "safe_argv": keys_disable_apply_argv(options),
+        "side_effect_class": "management_write",
+        "requires_confirmation": true,
+        "automatic_rollback": false,
+        "recovery_path": "review keys stats after confirmed disable",
+    })
+}
+
+fn keys_disable_blocked_next_action(summary: &str) -> Value {
+    serde_json::json!({
+        "summary": summary,
+        "safe_argv": Value::Null,
+        "side_effect_class": Value::Null,
+        "requires_confirmation": false,
+        "automatic_rollback": false,
+    })
+}
+
+fn keys_disable_apply_argv(options: &KeysDisableOptions) -> Value {
+    let Some(credential_set_id) = safe_local_id(&options.credential_set_id) else {
+        return Value::Null;
+    };
+    let Some(credential_ref) = normalize_credential_ref(&options.credential_ref) else {
+        return Value::Null;
+    };
+    let Some(reason) = safe_disable_reason(&options.reason) else {
+        return Value::Null;
+    };
+    serde_json::json!([
+        "one-ai-key",
+        "keys",
+        "disable",
+        "--credential-set",
+        credential_set_id,
+        "--credential-ref",
+        credential_ref,
+        "--reason",
+        reason,
+        "--yes"
+    ])
+}
+
+fn safe_disable_reason(reason: &str) -> Option<&str> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() || trimmed.len() > 160 {
+        return None;
+    }
+    if !trimmed.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b' ' | b'.' | b',' | b':' | b'_' | b'-' | b'/' | b'(' | b')'
+            )
+    }) {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("sk-")
+        || lower.contains("http")
+        || lower.contains("://")
+        || looks_like_jwt(trimmed)
+        || contains_instruction_marker(&lower)
+    {
+        return None;
+    }
+    Some(trimmed)
 }
 
 pub fn render_keys_probe_apply_report(
@@ -1891,6 +2141,26 @@ fn render_keys_probe_table(report: &Value) -> String {
     output
 }
 
+fn render_keys_disable_table(report: &Value) -> String {
+    let mut output = String::new();
+    output.push_str("keys disable\n");
+    crate::cli_report::append_report_envelope_table_fields(&mut output, report);
+    for field in [
+        "credential_ref",
+        "channel_id",
+        "selector_generation",
+        "state_kind",
+        "reason_configured",
+        "mutating_disable_sent",
+        "upstream_request_sent",
+        "automatic_rollback",
+        "recovery_path",
+    ] {
+        crate::cli_report::push_table_field(&mut output, field, report.get(field));
+    }
+    output
+}
+
 fn render_keys_probe_apply_table(report: &Value) -> String {
     let mut output = String::new();
     output.push_str("keys probe-apply\n");
@@ -2465,6 +2735,179 @@ mod tests {
         );
         assert!(!rendered.contains("/tmp/raw-probe-source.keys"));
         assert!(!rendered.contains("https://upstream.example"));
+    }
+
+    #[test]
+    fn keys_disable_dry_run_reports_local_plan_without_secret_output() {
+        let rendered = super::render_keys_disable_dry_run_report(&super::KeysDisableOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some("https://router.example".to_string()),
+                deprecated_base_url: None,
+                management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            credential_set_id: "relay-credentials".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+            reason: "operator verified bad key".to_string(),
+            mode: super::KeysDisableMode::DryRun,
+            output: crate::cli_report::OutputFormat::Json,
+        });
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "dry_run");
+        assert_eq!(report["reason_code"], "keys_disable_plan");
+        assert_eq!(report["side_effect_class"], "offline_readonly");
+        assert_eq!(report["effect_vector"]["writes_management_store"], false);
+        assert_eq!(report["effect_vector"]["calls_upstream"], false);
+        assert_eq!(report["effect_vector"]["mutates_runtime"], false);
+        assert_eq!(report["scope"]["credential_set_id"], "relay-credentials");
+        assert_eq!(report["scope"]["credential_ref"], "cr:v1:pos:0");
+        assert_eq!(report["data"]["credential_ref"], "cr:v1:pos:0");
+        assert_eq!(report["data"]["reason_configured"], true);
+        assert_eq!(report["data"]["mutating_disable_sent"], false);
+        assert_eq!(report["data"]["upstream_request_sent"], false);
+        assert_eq!(report["next_action"]["requires_confirmation"], true);
+        assert_eq!(
+            report["next_action"]["side_effect_class"],
+            "management_write"
+        );
+        assert_eq!(
+            report["next_action"]["safe_argv"],
+            json!([
+                "one-ai-key",
+                "keys",
+                "disable",
+                "--credential-set",
+                "relay-credentials",
+                "--credential-ref",
+                "cr:v1:pos:0",
+                "--reason",
+                "operator verified bad key",
+                "--yes"
+            ])
+        );
+        assert!(!rendered.contains("sk-"));
+        assert!(!rendered.contains("token_hash"));
+    }
+
+    #[tokio::test]
+    async fn keys_disable_dry_run_does_not_call_disable_endpoint_or_require_token() {
+        let disable_called = Arc::new(AtomicBool::new(false));
+        let route_called = Arc::clone(&disable_called);
+        let router = Router::new().route(
+            "/management/credential-sets/relay-credentials/credentials/:credential_ref/disable",
+            post(move |Json(_body): Json<Value>| {
+                let route_called = Arc::clone(&route_called);
+                async move {
+                    route_called.store(true, Ordering::SeqCst);
+                    Json(json!({"unexpected": true}))
+                }
+            }),
+        );
+        let management_url = spawn_management_fixture(router).await;
+
+        let rendered = super::run(super::KeysCommand::Disable(super::KeysDisableOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some(management_url),
+                deprecated_base_url: None,
+                management_token_env: None,
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            credential_set_id: "relay-credentials".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+            reason: "operator verified bad key".to_string(),
+            mode: super::KeysDisableMode::DryRun,
+            output: crate::cli_report::OutputFormat::Json,
+        }))
+        .await
+        .unwrap();
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "dry_run");
+        assert_eq!(report["data"]["mutating_disable_sent"], false);
+        assert!(!disable_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn keys_disable_confirmed_posts_disable_request_and_sanitizes_response() {
+        let captured_body = Arc::new(Mutex::new(None::<Value>));
+        let route_body = Arc::clone(&captured_body);
+        let router = Router::new().route(
+            "/management/credential-sets/relay-credentials/credentials/:credential_ref/disable",
+            post(move |Json(body): Json<Value>| {
+                let route_body = Arc::clone(&route_body);
+                async move {
+                    *route_body.lock().unwrap() = Some(body);
+                    Json(json!({
+                        "credential_set_id": "relay-credentials",
+                        "credential_ref": "cr:v1:pos:0",
+                        "credential_id": "internal-derived-id",
+                        "channel_id": "relay-channel",
+                        "selector_generation": 12,
+                        "state": {"kind": "disabled", "reason": "operator verified bad key"},
+                        "credential": {
+                            "id": "internal-derived-id",
+                            "fingerprint": "fingerprint-fixture",
+                            "state": {"kind": "disabled", "reason": "operator verified bad key"}
+                        },
+                        "raw_request_body": "request-body-fixture",
+                        "raw_response_body": "response-body-fixture",
+                        "raw_key": "RAW_DISABLE_SECRET",
+                        "token_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "source_path": "/tmp/raw-disable-source.keys"
+                    }))
+                }
+            }),
+        );
+        let management_url = spawn_management_fixture(router).await;
+        let env_name = format!("ONE_AI_KEY_TEST_DISABLE_POST_TOKEN_{}", std::process::id());
+        std::env::set_var(&env_name, "opaque-management-fixture");
+
+        let rendered = super::run(super::KeysCommand::Disable(super::KeysDisableOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some(management_url),
+                deprecated_base_url: None,
+                management_token_env: Some(env_name.clone()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            credential_set_id: "relay-credentials".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+            reason: "operator verified bad key".to_string(),
+            mode: super::KeysDisableMode::Apply,
+            output: crate::cli_report::OutputFormat::Json,
+        }))
+        .await
+        .unwrap();
+        std::env::remove_var(env_name);
+        let body = captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("disable endpoint should receive a body");
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(body["reason"], "operator verified bad key");
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["reason_code"], "keys_disable_applied");
+        assert_eq!(report["side_effect_class"], "management_write");
+        assert_eq!(report["data"]["credential_ref"], "cr:v1:pos:0");
+        assert_eq!(report["data"]["state_kind"], "disabled");
+        assert_eq!(report["data"]["selector_generation"], 12);
+        assert_eq!(report["data"]["mutating_disable_sent"], true);
+        assert_eq!(report["data"]["upstream_request_sent"], false);
+        assert_eq!(report["next_action"]["requires_confirmation"], false);
+        assert!(!rendered.contains("internal-derived-id"));
+        assert!(!rendered.contains("fingerprint-fixture"));
+        assert!(!rendered.contains("request-body-fixture"));
+        assert!(!rendered.contains("response-body-fixture"));
+        assert!(!rendered.contains("RAW_DISABLE_SECRET"));
+        assert!(
+            !rendered.contains("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert!(!rendered.contains("/tmp/raw-disable-source.keys"));
     }
 
     #[test]

@@ -209,9 +209,21 @@ fn retry_decision_telemetry(
             "return_current_error",
             Some(retry_decision_reason_code(*reason)),
         ),
-        RetryDirective::RetryCredential { .. } => ("retry_credential", "retry_credential", None),
-        RetryDirective::RetryRouteTarget => ("retry_route_target", "retry_route_target", None),
-        RetryDirective::RetrySameTarget => ("retry_same_target", "retry_same_target", None),
+        RetryDirective::RetryCredential { .. } => (
+            "retry_credential",
+            "retry_credential",
+            Some("credential_retry_allowed"),
+        ),
+        RetryDirective::RetryRouteTarget => (
+            "retry_route_target",
+            "retry_route_target",
+            Some("route_target_retry_allowed"),
+        ),
+        RetryDirective::RetrySameTarget => (
+            "retry_same_target",
+            "retry_same_target",
+            Some("pre_output_transient_retry_allowed"),
+        ),
     }
 }
 
@@ -293,6 +305,29 @@ mod tests {
         assert_eq!(directive, "return_error");
         assert_eq!(retry_decision, "return_current_error");
         assert_eq!(reason, Some("attempt_limit_reached"));
+    }
+
+    #[test]
+    fn retry_decision_telemetry_uses_stable_success_reason_codes() {
+        let (directive, retry_decision, reason) =
+            retry_decision_telemetry(&RetryDirective::RetryCredential {
+                credential_id: CredentialId("credential-b".to_string()),
+            });
+        assert_eq!(directive, "retry_credential");
+        assert_eq!(retry_decision, "retry_credential");
+        assert_eq!(reason, Some("credential_retry_allowed"));
+
+        let (directive, retry_decision, reason) =
+            retry_decision_telemetry(&RetryDirective::RetryRouteTarget);
+        assert_eq!(directive, "retry_route_target");
+        assert_eq!(retry_decision, "retry_route_target");
+        assert_eq!(reason, Some("route_target_retry_allowed"));
+
+        let (directive, retry_decision, reason) =
+            retry_decision_telemetry(&RetryDirective::RetrySameTarget);
+        assert_eq!(directive, "retry_same_target");
+        assert_eq!(retry_decision, "retry_same_target");
+        assert_eq!(reason, Some("pre_output_transient_retry_allowed"));
     }
 
     fn snapshot() -> RequestSelectionSnapshot {

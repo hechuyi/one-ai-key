@@ -261,7 +261,10 @@ pub fn apply_retry_directive_to_attempt_state(
                 RetryAttemptContinuation::FrozenCandidateDrift { credential_id }
             }
         }
-        RetryDirective::RetryRouteTarget => RetryAttemptContinuation::RetryRouteTarget,
+        RetryDirective::RetryRouteTarget => {
+            *attempt += 1;
+            RetryAttemptContinuation::RetryRouteTarget
+        }
         RetryDirective::RetrySameTarget => {
             *attempt += 1;
             RetryAttemptContinuation::RetrySameTarget
@@ -382,6 +385,10 @@ pub fn transition_after_failure(input: TransitionInput<'_>) -> TransitionResult 
         RetryDirective::ReturnCurrentError {
             reason: RetryDecisionReason::PartialOutputStarted,
         }
+    } else if input.snapshot.attempt >= 1 {
+        RetryDirective::ReturnCurrentError {
+            reason: RetryDecisionReason::AttemptLimitReached,
+        }
     } else if effective_deadline_exhausted {
         RetryDirective::ReturnCurrentError {
             reason: RetryDecisionReason::EffectiveDeadlineExhausted,
@@ -401,10 +408,6 @@ pub fn transition_after_failure(input: TransitionInput<'_>) -> TransitionResult 
             }
         } else if input.snapshot.route_target_available {
             RetryDirective::RetryRouteTarget
-        } else if input.snapshot.attempt >= 1 {
-            RetryDirective::ReturnCurrentError {
-                reason: RetryDecisionReason::AttemptLimitReached,
-            }
         } else if same_target_transient_retry_allowed(&input) {
             RetryDirective::RetrySameTarget
         } else {
@@ -838,7 +841,8 @@ mod tests {
     }
 
     #[test]
-    fn retry_attempt_continuation_preserves_route_target_and_terminal_directives() {
+    fn retry_attempt_continuation_advances_route_target_attempt_and_preserves_terminal_directives()
+    {
         let mut frozen = Some(FrozenRetryCandidates::new(vec![CredentialId(
             "cred_1".to_string(),
         )]));
@@ -852,7 +856,7 @@ mod tests {
             ),
             RetryAttemptContinuation::RetryRouteTarget
         );
-        assert_eq!(attempt, 0);
+        assert_eq!(attempt, 1);
         assert_eq!(
             apply_retry_directive_to_attempt_state(
                 RetryDirective::ReturnCurrentError {
@@ -865,7 +869,7 @@ mod tests {
                 reason: RetryDecisionReason::PolicyDisabled,
             }
         );
-        assert_eq!(attempt, 0);
+        assert_eq!(attempt, 1);
     }
 
     #[test]
@@ -1521,6 +1525,60 @@ mod tests {
             result.retry,
             RetryDirective::ReturnCurrentError {
                 reason: RetryDecisionReason::AttemptLimitReached
+            }
+        );
+    }
+
+    #[test]
+    fn retry_gate_clamps_configured_max_retries_to_single_extra_attempt() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let next = pool.retry_candidates_from_current(1)[0]
+            .credential_id
+            .clone();
+        let mut snapshot = retry_snapshot_for(&selected, next);
+        snapshot.attempt = 1;
+        let policy = RoutingPolicy {
+            retry_switched_key_in_same_request: true,
+            max_same_request_retries: 2,
+            route_target_retry_enabled: true,
+            default_credential_cooldown: std::time::Duration::from_secs(20),
+        };
+
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            adapted_retryable_rate_limit_failure(),
+            std::time::Instant::now(),
+            policy,
+        ));
+
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::AttemptLimitReached,
+            }
+        );
+    }
+
+    #[test]
+    fn retry_gate_denies_second_route_target_continuation() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.attempt = 1;
+        snapshot.route_target_available = true;
+
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_5xx_provider_failure(),
+            std::time::Instant::now(),
+            retry_policy(),
+        ));
+
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::AttemptLimitReached,
             }
         );
     }

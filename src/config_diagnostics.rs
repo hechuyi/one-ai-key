@@ -160,6 +160,7 @@ impl CheckConfigReport {
 
 pub fn check_config(options: CheckConfigOptions) -> CheckConfigReport {
     let config_path = safe_display_path(&options.config_path);
+    let deprecated = deprecated_config_diagnostics(&options.config_path);
     let document = match YamlRegistryRepository::new(options.config_path.clone()).load_registry() {
         Ok(document) => document,
         Err(error) => {
@@ -175,10 +176,13 @@ pub fn check_config(options: CheckConfigOptions) -> CheckConfigReport {
                 diagnostics_schema_version: 1,
                 status: DiagnosticStatus::Error,
                 reason_code: reason_code.to_string(),
-                deprecated_fields: Vec::new(),
-                deprecated_templates: Vec::new(),
+                deprecated_fields: deprecated.fields,
+                deprecated_templates: deprecated.templates,
                 resource_counts: BTreeMap::new(),
-                warnings: vec![redacted_error_summary(&message)],
+                warnings: merge_warnings(
+                    deprecated.warnings,
+                    vec![redacted_error_summary(&message)],
+                ),
                 config_path,
                 model_visibility_preview: Vec::new(),
             };
@@ -192,13 +196,14 @@ pub fn check_config(options: CheckConfigOptions) -> CheckConfigReport {
         .resolve_with_credential_repository_and_store_path(&repository, None)
     {
         Ok(resolved) => {
-            let warnings = endpoint_capability_warnings(&resolved);
+            let warnings =
+                merge_warnings(deprecated.warnings, endpoint_capability_warnings(&resolved));
             CheckConfigReport {
                 diagnostics_schema_version: 1,
                 status: DiagnosticStatus::Ok,
                 reason_code: "ok".to_string(),
-                deprecated_fields: Vec::new(),
-                deprecated_templates: Vec::new(),
+                deprecated_fields: deprecated.fields,
+                deprecated_templates: deprecated.templates,
                 resource_counts: resource_counts(&document),
                 warnings,
                 config_path,
@@ -216,10 +221,13 @@ pub fn check_config(options: CheckConfigOptions) -> CheckConfigReport {
                 diagnostics_schema_version: 1,
                 status: DiagnosticStatus::Error,
                 reason_code: reason_code.to_string(),
-                deprecated_fields: Vec::new(),
-                deprecated_templates: Vec::new(),
+                deprecated_fields: deprecated.fields,
+                deprecated_templates: deprecated.templates,
                 resource_counts: resource_counts(&document),
-                warnings: vec![redacted_error_summary(&message)],
+                warnings: merge_warnings(
+                    deprecated.warnings,
+                    vec![redacted_error_summary(&message)],
+                ),
                 config_path,
                 model_visibility_preview,
             }
@@ -430,6 +438,74 @@ fn resource_counts(document: &RegistryDocument) -> BTreeMap<String, usize> {
         ("pools".to_string(), document.pools.len()),
         ("providers".to_string(), document.providers.len()),
     ])
+}
+
+#[derive(Default)]
+struct DeprecatedConfigDiagnostics {
+    fields: Vec<String>,
+    templates: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn deprecated_config_diagnostics(path: &Path) -> DeprecatedConfigDiagnostics {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return DeprecatedConfigDiagnostics::default();
+    };
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&raw) else {
+        return DeprecatedConfigDiagnostics::default();
+    };
+    deprecated_config_diagnostics_from_yaml(&value)
+}
+
+fn deprecated_config_diagnostics_from_yaml(
+    value: &serde_yaml::Value,
+) -> DeprecatedConfigDiagnostics {
+    let mut fields = BTreeSet::new();
+    if yaml_sequence_mappings_at(value, "client_tokens")
+        .iter()
+        .any(|client_token| yaml_mapping_contains_key(client_token, "allowed_model_groups"))
+    {
+        fields.insert("client_tokens.allowed_model_groups".to_string());
+    }
+
+    let mut warnings = Vec::new();
+    if fields.contains("client_tokens.allowed_model_groups") {
+        warnings.push("deprecated_config_field: client_tokens.allowed_model_groups is a legacy model-scope field name; check_config preserves current scope semantics".to_string());
+    }
+
+    DeprecatedConfigDiagnostics {
+        fields: fields.into_iter().collect(),
+        templates: Vec::new(),
+        warnings,
+    }
+}
+
+fn yaml_sequence_mappings_at<'a>(
+    value: &'a serde_yaml::Value,
+    key: &str,
+) -> Vec<&'a serde_yaml::Mapping> {
+    value
+        .as_mapping()
+        .and_then(|mapping| mapping.get(serde_yaml::Value::String(key.to_string())))
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_yaml::Value::as_mapping)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn yaml_mapping_contains_key(mapping: &serde_yaml::Mapping, key: &str) -> bool {
+    mapping.contains_key(serde_yaml::Value::String(key.to_string()))
+}
+
+fn merge_warnings(mut left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    left.extend(right);
+    left.sort();
+    left.dedup();
+    left
 }
 
 fn redacted_error_summary(message: &str) -> String {
@@ -657,6 +733,8 @@ model_routes:
         assert_eq!(report.exit_code(), 0);
         assert_eq!(report.resource_counts["credential_sets"], 1);
         assert_eq!(report.resource_counts["model_routes"], 1);
+        assert_eq!(report.deprecated_fields, Vec::<String>::new());
+        assert_eq!(report.deprecated_templates, Vec::<String>::new());
         let rendered = format!("{}\n{}", report.render_table(), report.render_json());
         let json_report: serde_json::Value = serde_json::from_str(&report.render_json()).unwrap();
         assert_eq!(json_report["side_effect_class"], "offline_readonly");
@@ -669,6 +747,48 @@ model_routes:
         assert!(!rendered.contains("secret-client-token"));
         assert!(!rendered.contains("secret-management-token"));
         assert!(!rendered.contains("synthetic-upstream-key"));
+    }
+
+    #[test]
+    fn check_config_reports_legacy_client_model_scope_field_without_side_effects() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::capture();
+        let root = unique_temp_root();
+        let keys = root.join("relay.keys");
+        let credential_store = root.join("credential-store.sqlite");
+        let registry_store = root.join("registry-store.sqlite");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&keys, "synthetic-upstream-key\n").unwrap();
+        env::set_var("KEY_POOL_ROUTER_SQLITE_CREDENTIAL_STORE", &credential_store);
+        env::set_var("KEY_POOL_ROUTER_SQLITE_REGISTRY_STORE", &registry_store);
+        let config_body = valid_config(&keys).replace(
+            "    token: secret-client-token",
+            "    token: secret-client-token\n    allowed_model_groups:\n      - gpt-example",
+        );
+        let config = write_config(&root, &config_body);
+
+        let report = check_config(CheckConfigOptions {
+            config_path: config,
+        });
+
+        assert_eq!(report.status, DiagnosticStatus::Ok);
+        assert_eq!(
+            report.deprecated_fields,
+            vec!["client_tokens.allowed_model_groups".to_string()]
+        );
+        assert_eq!(report.deprecated_templates, Vec::<String>::new());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning == "deprecated_config_field: client_tokens.allowed_model_groups is a legacy model-scope field name; check_config preserves current scope semantics"));
+        let rendered = format!("{}\n{}", report.render_table(), report.render_json());
+        assert!(rendered.contains("deprecated_config_field"));
+        assert!(!rendered.contains(&keys.to_string_lossy().to_string()));
+        assert!(!rendered.contains("secret-client-token"));
+        assert!(!rendered.contains("secret-management-token"));
+        assert!(!rendered.contains("synthetic-upstream-key"));
+        assert!(!credential_store.exists());
+        assert!(!registry_store.exists());
     }
 
     #[test]

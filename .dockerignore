@@ -11,6 +11,8 @@ key-pool-router/
 
 # Runtime state and local databases.
 data/
+db/
+logs/
 postgres_data/
 *.keys
 *.sqlite

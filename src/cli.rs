@@ -161,6 +161,7 @@ enum KeysCommandArgs {
     Stats(KeysStatsArgs),
     Import(KeysImportArgs),
     Probe(KeysProbeArgs),
+    Disable(KeysDisableArgs),
     ProbeApply {
         #[command(subcommand)]
         command: KeysProbeApplyCommandArgs,
@@ -381,6 +382,25 @@ struct KeysProbeArgs {
     expected_output: Option<String>,
     #[arg(id = "probe_timeout_seconds", long = "probe-timeout-seconds")]
     timeout_seconds: Option<u64>,
+    #[arg(long, conflicts_with = "yes")]
+    dry_run: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long, value_enum, default_value_t = crate::cli_report::OutputFormat::Table)]
+    output: crate::cli_report::OutputFormat,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    long_about = "Disable exactly one credential by non-secret credential_ref. Side-effect class: runtime_readonly with --dry-run, management_write with --yes. Calls upstreams: no. Confirmed disable mutates credential lifecycle state through management."
+)]
+struct KeysDisableArgs {
+    #[arg(long = "credential-set")]
+    credential_set_id: String,
+    #[arg(long = "credential-ref")]
+    credential_ref: String,
+    #[arg(long)]
+    reason: String,
     #[arg(long, conflicts_with = "yes")]
     dry_run: bool,
     #[arg(long)]
@@ -667,6 +687,24 @@ where
                     crate::cli_commands::keys::KeysProbeMode::Apply
                 } else {
                     crate::cli_commands::keys::KeysProbeMode::NeedsConfirmation
+                },
+                output: args.output,
+            },
+        )),
+        Some(CliCommand::Keys {
+            command: KeysCommandArgs::Disable(args),
+        }) => CliAction::Keys(crate::cli_commands::keys::KeysCommand::Disable(
+            crate::cli_commands::keys::KeysDisableOptions {
+                connection: operator_connection_options,
+                credential_set_id: args.credential_set_id,
+                credential_ref: args.credential_ref,
+                reason: args.reason,
+                mode: if args.dry_run {
+                    crate::cli_commands::keys::KeysDisableMode::DryRun
+                } else if args.yes {
+                    crate::cli_commands::keys::KeysDisableMode::Apply
+                } else {
+                    crate::cli_commands::keys::KeysDisableMode::NeedsConfirmation
                 },
                 output: args.output,
             },
@@ -1554,6 +1592,91 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn keys_disable_parse_supports_dry_run_and_confirmation_modes() {
+        let dry_run = parse_action_from([
+            "one-ai-key",
+            "--management-url",
+            "https://router.example",
+            "--management-token-env",
+            "ONE_AI_KEY_MANAGEMENT_TOKEN",
+            "keys",
+            "disable",
+            "--credential-set",
+            "relay-credentials",
+            "--credential-ref",
+            "cr:v1:pos:0",
+            "--reason",
+            "operator verified bad key",
+            "--dry-run",
+            "--output",
+            "json",
+        ])
+        .expect("keys disable dry-run should parse");
+
+        assert_eq!(
+            dry_run,
+            CliAction::Keys(crate::cli_commands::keys::KeysCommand::Disable(
+                crate::cli_commands::keys::KeysDisableOptions {
+                    connection: OperatorConnectionOptions {
+                        management_url: Some("https://router.example".to_string()),
+                        deprecated_base_url: None,
+                        management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                        management_token_stdin: false,
+                        timeout_seconds: 10,
+                    },
+                    credential_set_id: "relay-credentials".to_string(),
+                    credential_ref: "cr:v1:pos:0".to_string(),
+                    reason: "operator verified bad key".to_string(),
+                    mode: crate::cli_commands::keys::KeysDisableMode::DryRun,
+                    output: crate::cli_report::OutputFormat::Json,
+                }
+            ))
+        );
+
+        let needs_confirmation = parse_action_from([
+            "one-ai-key",
+            "keys",
+            "disable",
+            "--credential-set",
+            "relay-credentials",
+            "--credential-ref",
+            "cr:v1:pos:0",
+            "--reason",
+            "operator verified bad key",
+        ])
+        .expect("keys disable should parse before confirmation validation");
+
+        assert!(matches!(
+            needs_confirmation,
+            CliAction::Keys(crate::cli_commands::keys::KeysCommand::Disable(
+                crate::cli_commands::keys::KeysDisableOptions {
+                    mode: crate::cli_commands::keys::KeysDisableMode::NeedsConfirmation,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn keys_disable_rejects_dry_run_yes_combination() {
+        let parsed = parse_action_from([
+            "one-ai-key",
+            "keys",
+            "disable",
+            "--credential-set",
+            "relay-credentials",
+            "--credential-ref",
+            "cr:v1:pos:0",
+            "--reason",
+            "operator verified bad key",
+            "--dry-run",
+            "--yes",
+        ]);
+
+        assert!(parsed.is_err());
     }
 
     #[test]

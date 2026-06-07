@@ -359,6 +359,10 @@ pub enum ManagementMutationEndpoint {
         credential_set_id: String,
         credential_ref: String,
     },
+    CredentialSetCredentialDisable {
+        credential_set_id: String,
+        credential_ref: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -524,6 +528,17 @@ impl ManagementMutationEndpoint {
                     credential_set_path(credential_set_id, "credentials")?,
                     safe_credential_ref_path_segment(credential_ref)?
                 ) + "/apply-latest-probe",
+                Vec::new(),
+            ),
+            Self::CredentialSetCredentialDisable {
+                credential_set_id,
+                credential_ref,
+            } => EndpointRequest::new(
+                format!(
+                    "{}/{}",
+                    credential_set_path(credential_set_id, "credentials")?,
+                    safe_credential_ref_path_segment(credential_ref)?
+                ) + "/disable",
                 Vec::new(),
             ),
         };
@@ -787,7 +802,7 @@ pub fn is_management_mutation_path(method: Method, path: &str) -> bool {
         && ((parts.len() == 6 && parts[5] == "import")
             || (parts.len() == 7
                 && safe_credential_ref_path_segment(parts[5]).is_ok()
-                && matches!(parts[6], "probe" | "apply-latest-probe")))
+                && matches!(parts[6], "probe" | "apply-latest-probe" | "disable")))
 }
 
 fn credential_set_readonly_path(path: &str) -> bool {
@@ -1233,6 +1248,37 @@ mod tests {
         assert!(!is_readonly_management_path(
             Method::Post,
             "/management/credential-sets/relay_keys/credentials/cr:v1:pos:0/apply-latest-probe"
+        ));
+    }
+
+    #[test]
+    fn keys_disable_typed_mutation_endpoint_builds_disable_path_with_credential_ref() {
+        let disable = ManagementMutationEndpoint::CredentialSetCredentialDisable {
+            credential_set_id: "relay_keys".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+        }
+        .test_request_parts()
+        .expect("credential disable mutation endpoint should build");
+
+        assert_eq!(
+            disable,
+            (
+                "/management/credential-sets/relay_keys/credentials/cr:v1:pos:0/disable"
+                    .to_string(),
+                Vec::new()
+            )
+        );
+        assert!(is_management_mutation_path(
+            Method::Post,
+            "/management/credential-sets/relay_keys/credentials/cr:v1:pos:0/disable"
+        ));
+        assert!(!is_management_mutation_path(
+            Method::Post,
+            "/management/credential-sets/relay_keys/credentials/internal-id/disable"
+        ));
+        assert!(!is_readonly_management_path(
+            Method::Post,
+            "/management/credential-sets/relay_keys/credentials/cr:v1:pos:0/disable"
         ));
     }
 

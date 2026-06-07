@@ -8257,7 +8257,7 @@ pools:
         let fallback_first = fallback_snapshots[0];
 
         assert_eq!(first.effective_deadline, fallback_first.effective_deadline);
-        assert_eq!(fallback_first.attempt, 0);
+        assert_eq!(fallback_first.attempt, 1);
     }
 
     async fn spawn_upstream(router: Router) -> String {
@@ -23474,6 +23474,44 @@ pools:
         assert_eq!(event["body_committed"], true);
     }
 
+    #[tokio::test]
+    async fn management_response_filter_events_nulls_unsafe_rule_ids() {
+        let state = test_state();
+        state
+            .response_filter_events
+            .lock()
+            .expect("response filter events mutex poisoned")
+            .push(ResponseFilterEventInput {
+                request_id: "req_unsafe_rule".to_string(),
+                channel_id: "test".to_string(),
+                public_model: "gpt-test".to_string(),
+                rule_id: "unsafe rule id".to_string(),
+                action: "reject".to_string(),
+                content_kind: "json".to_string(),
+                reason_code: "rule_matched".to_string(),
+                outcome: "rejected".to_string(),
+                body_committed: false,
+            });
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/management/response-filter-events")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body_text.contains("unsafe rule id"));
+        let body = serde_json::from_str::<Value>(&body_text).unwrap();
+        assert_eq!(body["events"][0]["rule_id"], Value::Null);
+    }
+
     fn response_filter_event_input(
         request_id: &str,
         channel_id: &str,
@@ -23784,7 +23822,11 @@ pools:
             .find(|event| event["kind"] == "credential_transition_applied")
             .expect("automatic credential transition telemetry event");
         assert_eq!(transition["channel_id"], "test");
-        assert_eq!(transition["credential_id"], credential_id);
+        assert!(transition.get("credential_id").is_none());
+        assert_eq!(
+            transition["credential_id_hash"],
+            crate::credentials::short_hash(&credential_id)
+        );
         assert_eq!(transition["state"], "expired");
         assert_eq!(transition["reason"], "upstream_auth_invalid");
     }
@@ -23927,7 +23969,11 @@ pools:
             .find(|event| event["kind"] == "credential_lifecycle_persistence_dropped")
             .expect("automatic credential lifecycle persistence drop telemetry event");
         assert_eq!(dropped["channel_id"], "test");
-        assert_eq!(dropped["credential_id"], credential_id);
+        assert!(dropped.get("credential_id").is_none());
+        assert_eq!(
+            dropped["credential_id_hash"],
+            crate::credentials::short_hash(&credential_id)
+        );
         assert_eq!(dropped["state"], "expired");
         assert_eq!(dropped["reason"], "upstream_auth_invalid");
         assert_eq!(dropped["drop_reason"], "queue_unavailable");
@@ -24278,6 +24324,87 @@ pools:
             "attempt_limit_reached"
         );
         assert!(body["events"][0].get("credential_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn management_routing_telemetry_sanitizes_internal_credential_and_rule_ids() {
+        let state = test_state();
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::CredentialTransitionApplied {
+                request_id: "req_transition".to_string(),
+                channel_id: "test".to_string(),
+                credential_id: "internal/credential/id".to_string(),
+                state: "expired".to_string(),
+                reason: "upstream_auth_invalid".to_string(),
+            });
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::UpstreamFailureObserved {
+                request_id: "req_rule".to_string(),
+                channel_id: "test".to_string(),
+                failure: Box::new(UpstreamFailureTelemetry {
+                    public_model: Some("gpt-test".to_string()),
+                    credential_id_hash: "safe-hash".to_string(),
+                    attempt: 0,
+                    failure_source: "upstream_transaction".to_string(),
+                    failure_kind: "provider_unavailable".to_string(),
+                    failure_scope: "channel".to_string(),
+                    retryable: true,
+                    confidence: "high".to_string(),
+                    status: Some(503),
+                    classifier_id: "test-classifier".to_string(),
+                    classifier_version: "1".to_string(),
+                    adaptation_rule_id: Some("unsafe rule id".to_string()),
+                    retry_after_source: None,
+                    cooldown_seconds: None,
+                    directive: "retry_route_target".to_string(),
+                    denial_reason: None,
+                    duplicate_charge_risk: "unknown".to_string(),
+                    effective_deadline_remaining_ms: Some(1500),
+                    retry_pressure_accounted: true,
+                    retry_decision: "retry_route_target".to_string(),
+                    retry_decision_reason: Some("route_target_retry_allowed".to_string()),
+                }),
+            });
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/management/routing-telemetry")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body_text.contains("internal/credential/id"));
+        assert!(!body_text.contains("unsafe rule id"));
+        let body = serde_json::from_str::<Value>(&body_text).unwrap();
+        let events = body["events"].as_array().unwrap();
+        let transition = events
+            .iter()
+            .find(|event| event["kind"] == "credential_transition_applied")
+            .unwrap();
+        assert!(transition.get("credential_id").is_none());
+        assert!(transition["credential_id_hash"].as_str().is_some());
+        let failure = events
+            .iter()
+            .find(|event| event["kind"] == "upstream_failure_observed")
+            .unwrap();
+        assert_eq!(failure["failure"]["adaptation_rule_id"], Value::Null);
+        assert_eq!(
+            failure["failure"]["retry_decision_reason"],
+            "route_target_retry_allowed"
+        );
     }
 
     #[tokio::test]
@@ -28539,6 +28666,167 @@ model_routes:
     }
 
     #[tokio::test]
+    async fn route_target_fallback_uses_conservative_retry_timeout() {
+        let primary = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "upstream_unavailable",
+                            "message": "primary unavailable"
+                        }
+                    })),
+                )
+            }),
+        );
+        let primary_base = spawn_upstream(primary).await;
+        let fallback_hits = Arc::new(AtomicU64::new(0));
+        let fallback_hits_for_handler = fallback_hits.clone();
+        let fallback = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(1700)).await;
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "late-fallback-ok"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let fallback_base = spawn_upstream(fallback).await;
+
+        let mut pools = HashMap::new();
+        let mut credential_sets = HashMap::new();
+        for (name, api_base, key) in [
+            ("a_primary", primary_base, "primary-key"),
+            ("b_fallback", fallback_base, "fallback-key"),
+        ] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(&format!("{key}\n")),
+                },
+            );
+            pools.insert(
+                name.to_string(),
+                PoolConfig {
+                    endpoint_capabilities: Default::default(),
+                    enabled: true,
+                    account: None,
+                    policy_profile: None,
+                    routing_profile: None,
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    api_base,
+                    credential_set,
+                    auth_header: "authorization".to_string(),
+                    auth_prefix: "Bearer ".to_string(),
+                    error_rules: ErrorRulesConfig::default(),
+                },
+            );
+        }
+
+        let state = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "test-client".to_string(),
+                token: fixture_client_token(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: fixture_admin_token(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path: None,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: TimeoutConfig {
+                connect_seconds: Some(2),
+                non_streaming_total_seconds: Some(2),
+                streaming_idle_seconds: Some(300),
+            },
+            routing: crate::config::RoutingConfig::default(),
+            default_pool: Some("a_primary".to_string()),
+            providers: HashMap::new(),
+            accounts: HashMap::new(),
+            credential_sets,
+            model_routes: HashMap::from([priority_route("gpt-route", ["a_primary", "b_fallback"])]),
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: std::collections::HashMap::from([(
+                "default-routing".to_string(),
+                crate::config::RoutingProfileConfig {
+                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry:
+                        crate::config::SameRequestCredentialRetryConfig {
+                            enabled: false,
+                            max_retries: 0,
+                        },
+                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            pools,
+        }
+        .resolve()
+        .unwrap();
+        let state = AppState::new(state).unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            app(state.clone()).oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-route","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("request should complete before the full 2s fallback response")
+        .unwrap();
+
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned");
+        assert!(
+            telemetry.snapshot().iter().any(|event| {
+                matches!(
+                    event,
+                    RoutingTelemetry::UpstreamFailureObserved { failure, .. }
+                        if failure.attempt == 1
+                            && failure.failure_source == "local_transport"
+                            && failure.retry_decision == "return_current_error"
+                            && failure.retry_decision_reason.as_deref()
+                                == Some("attempt_limit_reached")
+                )
+            }),
+            "fallback timeout must consume the shared retry attempt and deny a second continuation"
+        );
+    }
+
+    #[tokio::test]
     async fn model_route_skips_target_with_no_available_credentials() {
         let primary_hits = Arc::new(Mutex::new(0usize));
         let primary_hits_for_handler = primary_hits.clone();
@@ -31937,7 +32225,7 @@ model_routes:
     }
 
     #[tokio::test]
-    async fn openai_compatible_retries_configured_number_of_credentials_in_same_request() {
+    async fn openai_compatible_retries_only_one_opted_in_credential_in_same_request() {
         let upstream_hits = Arc::new(AtomicU64::new(0));
         let upstream_hits_for_handler = upstream_hits.clone();
         let upstream = Router::new().route(
@@ -31973,6 +32261,24 @@ model_routes:
         let keys_file = temp_keys_file("upstream-key-1\nupstream-key-2\nupstream-key-3\n");
         let mut pool = openai_pool(api_base, "test-credentials");
         pool.routing_profile = Some("retry-routing".to_string());
+        pool.error_rules = ErrorRulesConfig {
+            adaptation_rules: vec![ErrorAdaptationRuleConfig {
+                id: "test-opt-in-429-retry".to_string(),
+                enabled: true,
+                matcher: ErrorAdaptationMatcherConfig {
+                    codes: vec!["rate_limit_exceeded".to_string()],
+                    limit_types: Vec::new(),
+                    statuses: vec!["429".to_string()],
+                },
+                action: ErrorAdaptationActionConfig {
+                    kind: Some(crate::error::FailureKind::RateLimited),
+                    primary_scope: Some(crate::error::FailureScope::Credential),
+                    retryable: Some(true),
+                    cooldown_seconds: Some(20),
+                },
+            }],
+            ..ErrorRulesConfig::default()
+        };
         let routing_profiles = std::collections::HashMap::from([
             (
                 "default-routing".to_string(),
@@ -32053,8 +32359,8 @@ model_routes:
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(upstream_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
         let channel = state.channels.get("test").unwrap();
         let pool = channel.pool.lock().await;
         let snapshot = pool.snapshot();
