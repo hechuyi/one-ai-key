@@ -503,6 +503,12 @@ fn conservative_next_attempt_budget(configured: Option<Duration>) -> Duration {
 }
 
 fn conservative_retry_evidence_allowed(input: &TransitionInput<'_>) -> bool {
+    if matches!(
+        input.snapshot.selection_reason,
+        SelectionReason::NamedChannel
+    ) {
+        return false;
+    }
     if !endpoint_retry_eligible(input.snapshot.endpoint) {
         return false;
     }
@@ -541,10 +547,7 @@ fn credential_retry_evidence_allowed(failure: &ClassifiedFailure) -> bool {
 fn endpoint_retry_eligible(endpoint: EndpointKind) -> bool {
     matches!(
         endpoint,
-        EndpointKind::Models
-            | EndpointKind::ChatCompletions
-            | EndpointKind::Responses
-            | EndpointKind::Embeddings
+        EndpointKind::ChatCompletions | EndpointKind::Responses
     )
 }
 
@@ -1499,6 +1502,68 @@ mod tests {
             }
         );
         assert_eq!(result.effective_deadline_remaining_ms, Some(1499));
+    }
+
+    #[test]
+    fn retry_gate_allows_only_initial_m3_endpoint_families() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let now = std::time::Instant::now();
+
+        for endpoint in [EndpointKind::Models, EndpointKind::Embeddings] {
+            let mut snapshot = snapshot_for(&selected);
+            snapshot.endpoint = endpoint;
+            snapshot.route_target_available = false;
+            snapshot.effective_deadline = Some(
+                now + std::time::Duration::from_millis(CONSERVATIVE_RETRY_BUDGET.as_millis() as u64),
+            );
+
+            let result = transition_after_failure(TransitionInput {
+                snapshot: &snapshot,
+                failure: retryable_5xx_provider_failure(),
+                failure_source: FailureSource::UpstreamTransaction,
+                now,
+                next_attempt_budget: Some(std::time::Duration::from_millis(50)),
+                policy: policy(),
+            });
+
+            assert_eq!(
+                result.retry,
+                RetryDirective::ReturnCurrentError {
+                    reason: RetryDecisionReason::FailureNotRetryable,
+                },
+                "{endpoint:?} must stay outside the initial M3 retry allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_gate_denies_named_channel_selection() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let now = std::time::Instant::now();
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.selection_reason = SelectionReason::NamedChannel;
+        snapshot.route_target_available = false;
+        snapshot.effective_deadline = Some(
+            now + std::time::Duration::from_millis(CONSERVATIVE_RETRY_BUDGET.as_millis() as u64),
+        );
+
+        let result = transition_after_failure(TransitionInput {
+            snapshot: &snapshot,
+            failure: retryable_5xx_provider_failure(),
+            failure_source: FailureSource::UpstreamTransaction,
+            now,
+            next_attempt_budget: Some(std::time::Duration::from_millis(50)),
+            policy: policy(),
+        });
+
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::FailureNotRetryable,
+            },
+        );
     }
 
     #[test]

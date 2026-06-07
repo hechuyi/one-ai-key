@@ -368,6 +368,22 @@ Acceptance gates:
   `duplicate_charge_risk`, and effective-deadline evidence are present without
   raw bodies, keys, tokens, full URLs, or upstream free-form text.
 
+Current closure evidence:
+
+- `transition_after_failure` owns the M3 gate and rejects endpoint families
+  outside non-streaming Chat/Responses, named-pool forwarding, streaming,
+  partial-output, non-replayable bodies, exhausted deadlines, and second retry
+  attempts;
+- `forward_with_pool` consumes at most one retry directive from the frozen route
+  plan and does not re-plan after an upstream failure;
+- runtime tests cover Chat/Responses 502, 503, and 504 pre-output failures with
+  exactly two upstream hits and second-response success;
+- runtime tests cover Embeddings, unknown endpoint families, and named-pool
+  requests with one upstream hit and stable retry-denial telemetry;
+- contract tests keep the endpoint allowlist, named-pool exclusion, retry
+  telemetry, streaming denial, and partial-output denial discoverable during
+  release verification.
+
 ## Parked Items
 
 The following are outside this roadmap and must not be implemented by extending

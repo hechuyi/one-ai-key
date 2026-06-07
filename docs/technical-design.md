@@ -175,7 +175,8 @@ directly instead of resolving a public model route. Provider adapters still
 define the body semantics. OpenAI-compatible named-pool requests can extract
 model context, enforce public-route scope rules, and use replayable forwarding
 when the endpoint permits it. Generic named-pool bodies are treated
-conservatively as streaming pass-through traffic.
+conservatively as streaming pass-through traffic. Named-pool forwarding is not
+part of the conservative pre-output stability retry allowlist.
 
 ## Model Catalog Semantics
 
@@ -224,9 +225,14 @@ The hard gates are:
 - request body must be replayable;
 - request must not be streaming;
 - no response bytes may have been sent to the client;
+- endpoint family must be in the retry allowlist;
+- selection must not be named-pool forwarding;
 - attempt limits must not be exhausted;
 - policy must allow the retry directive;
-- a frozen retry candidate must exist;
+- the selected retry directive must have the required continuation target:
+  credential retry needs the next frozen credential candidate, route-target retry
+  needs the next frozen route target, and same-target retry reuses the selected
+  target instead of requiring a new candidate;
 - the effective request deadline must fit another attempt.
 
 Same-request credential retry is opt-in. It can try a different available
@@ -237,9 +243,11 @@ Route-target retry is separate. It can move to another frozen route target when
 the failure scope and routing profile allow it.
 
 Same-target retry is a narrow stability guard. It allows one additional
-pre-output attempt for selected channel/provider failures when no fallback
-target remains, no cooldown evidence was supplied, and the normal hard gates
-pass.
+pre-output attempt for selected channel/provider failures when the request is
+non-streaming Chat Completions or Responses, no fallback target remains, no
+cooldown evidence was supplied, and the normal hard gates pass. Embeddings,
+unknown endpoints, `/v1/models`, named-pool forwarding, streaming requests, and
+partial-output paths are denied before same-target retry is considered.
 
 Duplicate-charge risk is telemetry, not billing truth. The current runtime
 emits `none` when the gateway has no evidence of a completed upstream

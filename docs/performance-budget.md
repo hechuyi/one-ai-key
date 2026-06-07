@@ -44,7 +44,7 @@ This service is a personal AI account and API-key router, not a heavy control pl
 - Route candidates are frozen once per request and carried through forwarding as one plan object. Do not recompute candidates after an upstream failure inside the same request.
 - Explicit upstream cooldown evidence such as `Retry-After` must override local default cooldown.
 - Same-request retry remains opt-in, not default.
-- Same-target transient retry is capped at one pre-output retry and uses the same replayability, streaming, partial-output, and effective-deadline gates as other retry directives. It must not retry guarded 2xx bodies, responses with cooldown evidence, or any response after client output has begun.
+- Same-target transient retry is capped at one pre-output retry and uses the same replayability, endpoint-family allowlist, named-pool exclusion, streaming, partial-output, and effective-deadline gates as other retry directives. The current allowlist is non-streaming Chat Completions and Responses only. It must not retry guarded 2xx bodies, `/v1/models`, Embeddings, unknown endpoints, named-pool forwarding, responses with cooldown evidence, or any response after client output has begun.
 
 ## Review Gates
 

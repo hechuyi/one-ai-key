@@ -184,6 +184,14 @@ events. If the failure followed a release change, compare the deployed version
 and checksum with the GitHub Release asset and verify that the route target still
 points at the intended upstream base URL.
 
+For non-streaming Chat Completions and Responses requests, one-ai-key may hide
+one selected-target pre-output 502, 503, 504, or transport failure when the body
+is replayable, no client bytes have been sent, the request deadline can fit the
+extra attempt, and the retry policy allows the chosen continuation. This is a
+single conservative retry, not a background health check. Streaming requests,
+Embeddings, named-pool forwarding, unknown endpoint families, and `/v1/models`
+are outside this retry allowlist.
+
 Do not debug a `502` by pasting raw upstream responses into docs or tickets.
 Capture the status code, redacted provider/account/channel id, policy profile,
 reason code, and whether any response bytes had already been sent to the client.
@@ -200,6 +208,14 @@ If `/ready` is healthy but client traffic receives `503`, inspect route preview
 and credential state rather than restarting blindly. Restarting does not repair
 expired credentials, empty key files, incorrect model routes, or stale staged
 runtime state.
+
+If the `503` came from a selected upstream target before response output, check
+recent routing telemetry or `failures tail` for `retry_same_target`,
+`retry_route_target`, `retry_credential`, or a stable denial reason such as
+`failure_not_retryable`, `streaming_not_retryable`,
+`effective_deadline_exhausted`, or `attempt_limit_reached`. A client-visible
+`503` after those gates means the conservative retry was either ineligible or
+already consumed.
 
 ### `no route candidate`
 

@@ -30,16 +30,34 @@ fn existing_runtime_tests_cover_pre_output_retry_and_retry_denials() {
     assert_contains_all(
         test_body(
             &main,
-            "single_route_target_transient_5xx_retries_before_client_error",
+            "m3_non_streaming_chat_and_responses_retry_502_503_504_once_before_output",
         ),
-        "single-route pre-output retry characterization",
+        "M3 Chat/Responses 502/503/504 retry matrix",
         &[
+            "\"/v1/chat/completions\"",
+            "\"/v1/responses\"",
+            "StatusCode::BAD_GATEWAY",
+            "StatusCode::SERVICE_UNAVAILABLE",
+            "StatusCode::GATEWAY_TIMEOUT",
             "retry_same_target",
-            "provider_unavailable",
-            "channel",
-            "same-target-ok",
             "upstream_hits.load(Ordering::SeqCst), 2",
             "duplicate_charge_risk == \"unknown\"",
+        ],
+    );
+
+    assert_contains_all(
+        test_body(
+            &main,
+            "m3_ineligible_endpoint_families_and_named_pool_do_not_retry",
+        ),
+        "M3 ineligible endpoint and named-pool retry denial characterization",
+        &[
+            "\"/v1/embeddings\"",
+            "\"/v1/unknown\"",
+            "\"/pools/test/v1/chat/completions\"",
+            "upstream_hits.load(Ordering::SeqCst), 1",
+            "failure_not_retryable",
+            "duplicate_charge_risk == \"none\"",
         ],
     );
 
@@ -139,6 +157,25 @@ fn existing_transition_tests_cover_stable_denial_and_duplicate_charge_codes() {
             "StreamingNotRetryable",
             "PartialOutputStarted",
         ],
+    );
+
+    assert_contains_all(
+        test_body(
+            &routing,
+            "retry_gate_allows_only_initial_m3_endpoint_families",
+        ),
+        "M3 endpoint-family retry allowlist boundary",
+        &[
+            "EndpointKind::Models",
+            "EndpointKind::Embeddings",
+            "FailureNotRetryable",
+        ],
+    );
+
+    assert_contains_all(
+        test_body(&routing, "retry_gate_denies_named_channel_selection"),
+        "M3 named-pool retry denial boundary",
+        &["SelectionReason::NamedChannel", "FailureNotRetryable"],
     );
 
     assert_contains_all(

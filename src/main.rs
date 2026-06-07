@@ -31902,6 +31902,245 @@ model_routes:
     }
 
     #[tokio::test]
+    async fn m3_non_streaming_chat_and_responses_retry_502_503_504_once_before_output() {
+        for endpoint_path in ["/v1/chat/completions", "/v1/responses"] {
+            for status in [
+                StatusCode::BAD_GATEWAY,
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::GATEWAY_TIMEOUT,
+            ] {
+                assert_m3_non_streaming_retry_once(endpoint_path, status).await;
+            }
+        }
+    }
+
+    async fn assert_m3_non_streaming_retry_once(endpoint_path: &'static str, status: StatusCode) {
+        let upstream_hits = Arc::new(AtomicU64::new(0));
+        let upstream_hits_for_handler = upstream_hits.clone();
+        let responses_endpoint = endpoint_path == "/v1/responses";
+        let success_text = format!(
+            "m3-{}-{}-ok",
+            if responses_endpoint {
+                "responses"
+            } else {
+                "chat"
+            },
+            status.as_u16()
+        );
+        let success_text_for_handler = success_text.clone();
+        let upstream = Router::new().route(
+            endpoint_path,
+            post(move || {
+                let upstream_hits = upstream_hits_for_handler.clone();
+                let success_text = success_text_for_handler.clone();
+                async move {
+                    let hit = upstream_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if hit == 1 {
+                        return (
+                            status,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "upstream_unavailable",
+                                    "message": "provider unavailable"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    if responses_endpoint {
+                        Json(serde_json::json!({
+                            "id": "m3-response",
+                            "object": "response",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "content": [
+                                        {"type": "output_text", "text": success_text}
+                                    ]
+                                }
+                            ]
+                        }))
+                        .into_response()
+                    } else {
+                        Json(serde_json::json!({
+                            "id": "m3-chat",
+                            "object": "chat.completion",
+                            "choices": [
+                                {"message": {"role": "assistant", "content": success_text}}
+                            ]
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state = test_state_with_api_base(&api_base);
+        let request_body = if responses_endpoint {
+            r#"{"model":"gpt-test","input":"ok","stream":false}"#
+        } else {
+            r#"{"model":"gpt-test","messages":[{"role":"user","content":"ok"}],"stream":false}"#
+        };
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(endpoint_path)
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let actual_text = if responses_endpoint {
+            value["output"][0]["content"][0]["text"].as_str()
+        } else {
+            value["choices"][0]["message"]["content"].as_str()
+        };
+        assert_eq!(actual_text, Some(success_text.as_str()));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .snapshot();
+        assert!(
+            telemetry.iter().any(|event| {
+                matches!(
+                    event,
+                    RoutingTelemetry::UpstreamFailureObserved { failure, .. }
+                        if failure.directive == "retry_same_target"
+                            && failure.retry_decision == "retry_same_target"
+                            && failure.retry_decision_reason.as_deref()
+                                == Some("pre_output_transient_retry_allowed")
+                            && failure.failure_kind == "provider_unavailable"
+                            && failure.failure_scope == "channel"
+                            && failure.status == Some(status.as_u16())
+                            && failure.duplicate_charge_risk == "unknown"
+                )
+            }),
+            "M3 retry telemetry must record the pre-output retry decision for {endpoint_path} {}",
+            status.as_u16()
+        );
+    }
+
+    #[tokio::test]
+    async fn m3_ineligible_endpoint_families_and_named_pool_do_not_retry() {
+        for (app_uri, upstream_path, request_body) in [
+            (
+                "/v1/embeddings",
+                "/v1/embeddings",
+                r#"{"model":"gpt-test","input":"ok"}"#,
+            ),
+            (
+                "/v1/unknown",
+                "/v1/unknown",
+                r#"{"model":"gpt-test","input":"ok"}"#,
+            ),
+            (
+                "/pools/test/v1/chat/completions",
+                "/v1/chat/completions",
+                r#"{"model":"gpt-test","messages":[{"role":"user","content":"ok"}],"stream":false}"#,
+            ),
+        ] {
+            assert_m3_ineligible_request_does_not_retry(app_uri, upstream_path, request_body).await;
+        }
+    }
+
+    async fn assert_m3_ineligible_request_does_not_retry(
+        app_uri: &'static str,
+        upstream_path: &'static str,
+        request_body: &'static str,
+    ) {
+        let upstream_hits = Arc::new(AtomicU64::new(0));
+        let upstream_hits_for_handler = upstream_hits.clone();
+        let upstream = Router::new().route(
+            upstream_path,
+            post(move || {
+                let upstream_hits = upstream_hits_for_handler.clone();
+                async move {
+                    let hit = upstream_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if hit == 1 {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "upstream_unavailable",
+                                    "message": "provider unavailable"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "id": "should-not-be-returned",
+                        "object": "response",
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [
+                                    {"type": "output_text", "text": "unexpected-retry"}
+                                ]
+                            }
+                        ]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state = test_state_with_api_base(&api_base);
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(app_uri)
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .snapshot();
+        assert!(
+            telemetry.iter().any(|event| {
+                matches!(
+                    event,
+                    RoutingTelemetry::UpstreamFailureObserved { failure, .. }
+                        if failure.directive == "return_error"
+                            && failure.retry_decision == "return_current_error"
+                            && failure.denial_reason.as_deref() == Some("failure_not_retryable")
+                            && failure.failure_kind == "provider_unavailable"
+                            && failure.failure_scope == "channel"
+                            && failure.status == Some(503)
+                            && failure.duplicate_charge_risk == "none"
+                            && (app_uri != "/pools/test/v1/chat/completions"
+                                || failure.public_model.as_deref() == Some("gpt-test"))
+                )
+            }),
+            "M3-ineligible request {app_uri} must record a stable retry denial"
+        );
+    }
+
+    #[tokio::test]
     async fn provider_unavailable_retry_after_marks_channel_cooling_down() {
         let upstream = Router::new().route(
             "/v1/chat/completions",

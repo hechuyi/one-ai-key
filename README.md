@@ -230,12 +230,15 @@ Default routing behavior is conservative:
   are sent to the client;
 - route-target retry can move to another frozen route candidate when enabled and
   the request is replayable;
+- non-streaming `/v1/chat/completions` and `/v1/responses` may absorb one
+  selected-target pre-output 502, 503, 504, or transport failure when all retry
+  gates pass;
 - provider/account `Retry-After` failure domains are soft route suppression:
   normal and degraded candidates win first, but a provider-cooling target may
   still serve as the last available candidate instead of producing an immediate
   local `no_route_candidate`;
-- streaming, non-replayable, and partial-output paths do not transparently
-  fallback;
+- streaming, non-replayable, partial-output, embeddings, named-pool, unknown
+  endpoint, and `/v1/models` paths do not transparently fallback;
 - duplicate-charge risk is recorded as telemetry when retrying after an upstream
   transaction whose charge status cannot be proven.
 

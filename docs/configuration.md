@@ -222,8 +222,11 @@ routing_profiles:
 ```
 
 Same-request retry is gated by replayability, streaming status, output commit
-state, attempt limits, policy, frozen candidates, and deadline budget. Streaming
-or partial-output responses do not transparently fallback.
+state, endpoint-family allowlist, named-pool exclusion, attempt limits, policy,
+frozen candidates, and deadline budget. The initial pre-output stability
+allowlist covers only non-streaming Chat Completions and Responses requests.
+Streaming, partial-output, Embeddings, named-pool forwarding, unknown endpoints,
+and `/v1/models` do not transparently fallback.
 
 ## Management
 
