@@ -102,6 +102,7 @@ cd "${WORK_DIR}"
 CLIENT_TOKEN="release-smoke-client-token"
 MANAGEMENT_TOKEN="release-smoke-management-token"
 UPSTREAM_TOKEN="release-smoke-upstream-token"
+INVALID_CLIENT_TOKEN="release-smoke-invalid-client-token"
 SERVICE_PORT=$(python3 - <<'PY'
 import socket
 with socket.socket() as sock:
@@ -200,6 +201,8 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 curl -fsS "http://127.0.0.1:${SERVICE_PORT}/health" >/dev/null
+curl -fsS "http://127.0.0.1:${SERVICE_PORT}/ready" \
+  | jq -e '.status == "ready" and (.serving_channels > 0) and (.credentials.available > 0)' >/dev/null
 
 MODELS_JSON=$(curl -fsS "http://127.0.0.1:${SERVICE_PORT}/v1/models" \
   -H "Authorization: Bearer ${CLIENT_TOKEN}")
@@ -214,6 +217,30 @@ curl -fsS "http://127.0.0.1:${SERVICE_PORT}/v1/chat/completions" \
   -d '{"model":"gpt-example","messages":[{"role":"user","content":"ping"}]}' \
   | jq -e '.choices[0].message.content == "release smoke ok"' >/dev/null
 
+INVALID_CLIENT_BODY="${WORK_DIR}/invalid-client.json"
+INVALID_CLIENT_STATUS=$(curl -sS -o "${INVALID_CLIENT_BODY}" -w "%{http_code}" \
+  "http://127.0.0.1:${SERVICE_PORT}/v1/models" \
+  -H "Authorization: Bearer ${INVALID_CLIENT_TOKEN}")
+if [[ "${INVALID_CLIENT_STATUS}" != "401" ]]; then
+  printf 'error: invalid client token returned HTTP %s instead of 401\n' "${INVALID_CLIENT_STATUS}" >&2
+  exit 1
+fi
+jq -e --arg invalid_client_token "${INVALID_CLIENT_TOKEN}" '
+  .error.message == "invalid router api key"
+  and (.error | tostring | contains($invalid_client_token) | not)
+' "${INVALID_CLIENT_BODY}" >/dev/null
+for forbidden_token in \
+  "${INVALID_CLIENT_TOKEN}" \
+  "${CLIENT_TOKEN}" \
+  "${MANAGEMENT_TOKEN}" \
+  "${UPSTREAM_TOKEN}"
+do
+  if grep -Fq "${forbidden_token}" "${INVALID_CLIENT_BODY}"; then
+    printf 'error: invalid client token response leaked token material\n' >&2
+    exit 1
+  fi
+done
+
 CHECK_MODELS=$(jq -c '.model_visibility_preview[] | select(.client_token_ref == "local-client") | .visible_models' check-config.json)
 CLIENT_MODELS=$(printf '%s\n' "${MODELS_JSON}" | jq -c '.data | map(.id)')
 if [[ "${CHECK_MODELS}" != "${CLIENT_MODELS}" ]]; then
@@ -226,25 +253,25 @@ MANAGEMENT_URL="http://127.0.0.1:${SERVICE_PORT}"
 COMMON=(--management-url "${MANAGEMENT_URL}" --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN)
 
 "${BIN}" "${COMMON[@]}" doctor --output json \
-  | jq -e '.status and .reason_code and .next_action' >/dev/null
+  | jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
 "${BIN}" "${COMMON[@]}" client-tokens list --output json \
-  | jq -e '.status == "ok" and .reason_code == "client_tokens_available" and .next_action' >/dev/null
+  | jq -e '.status == "ok" and .reason_code == "client_tokens_available" and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
 "${BIN}" "${COMMON[@]}" models list --client-token-ref local-client --output json \
-  | jq -e '.status == "ok" and .reason_code == "model_routes_available" and .next_action' >/dev/null
+  | jq -e '.status == "ok" and .reason_code == "model_routes_available" and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
 "${BIN}" "${COMMON[@]}" models explain --model gpt-example --client-token-ref local-client --output json \
-  | jq -e '.status == "ok" and .reason_code and .next_action' >/dev/null
+  | jq -e '.status == "ok" and .reason_code == "model_visible_to_client" and .side_effect_class == "runtime_readonly" and (.next_action.safe_argv | type == "array")' >/dev/null
 "${BIN}" "${COMMON[@]}" route explain gpt-example --client-token-ref local-client --output json \
-  | jq -e '.status == "ok" and .reason_code and .next_action' >/dev/null
+  | jq -e '.status == "ok" and .reason_code == "route_candidate_selected" and .side_effect_class == "runtime_readonly" and (.next_action.safe_argv | type == "array")' >/dev/null
 "${BIN}" "${COMMON[@]}" keys stats --credential-set relay_credentials --output json \
-  | jq -e '.status and .reason_code and .next_action' >/dev/null
+  | jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
 "${BIN}" "${COMMON[@]}" failures tail --last 20 --output json \
-  | jq -e '.status and .reason_code and .next_action' >/dev/null
+  | jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
 "${BIN}" "${COMMON[@]}" reload status --output json \
-  | jq -e '.status and .reason_code and .next_action' >/dev/null
+  | jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
 "${BIN}" "${COMMON[@]}" reload diff --output json \
-  | jq -e '.status and .reason_code and .next_action' >/dev/null
+  | jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
 "${BIN}" "${COMMON[@]}" reload apply --dry-run --output json \
-  | jq -e '.status == "planned" and .reason_code == "reload_apply_dry_run" and .next_action' >/dev/null
+  | jq -e '.status == "planned" and .reason_code == "reload_apply_dry_run" and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
 
 set +e
 NEGATIVE_OUTPUT=$("${BIN}" --management-url "${MANAGEMENT_URL}/v1" --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN models list --output json 2>&1)
