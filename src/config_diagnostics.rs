@@ -580,8 +580,11 @@ mod tests {
     use super::*;
     use std::{
         env,
-        sync::Mutex,
-        time::{SystemTime, UNIX_EPOCH},
+        io::ErrorKind,
+        net::TcpListener,
+        sync::{mpsc, Mutex},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -663,6 +666,17 @@ upstreams:
             serde_yaml::to_string(&keys_file.to_string_lossy().to_string())
                 .unwrap()
                 .trim()
+        )
+    }
+
+    fn visible_route_config(keys_file: &Path, api_base: &str) -> String {
+        valid_config(keys_file).replace("https://relay.example/v1", api_base)
+    }
+
+    fn no_route_config(keys_file: &Path) -> String {
+        valid_config(keys_file).replace(
+            "    models:\n      - public_model: gpt-example\n        upstream_model: provider/gpt-example\n",
+            "",
         )
     }
 
@@ -750,6 +764,88 @@ model_routes:
     }
 
     #[test]
+    fn check_config_does_not_connect_to_configured_upstream_base_url() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::capture();
+        env::remove_var("KEY_POOL_ROUTER_SQLITE_CREDENTIAL_STORE");
+        env::remove_var("KEY_POOL_ROUTER_SQLITE_REGISTRY_STORE");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let upstream_base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let accept_thread = thread::spawn(move || loop {
+            match listener.accept() {
+                Ok((_stream, _peer)) => {
+                    let _ = accepted_tx.send(());
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        });
+        let root = unique_temp_root();
+        let keys = root.join("relay.keys");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&keys, "synthetic-upstream-key\n").unwrap();
+        let config = write_config(&root, &visible_route_config(&keys, &upstream_base_url));
+
+        let report = check_config(CheckConfigOptions {
+            config_path: config,
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        let _ = stop_tx.send(());
+        accept_thread.join().unwrap();
+        assert_eq!(report.status, DiagnosticStatus::Ok);
+        assert_eq!(report.reason_code, "ok");
+        assert!(
+            accepted_rx.try_recv().is_err(),
+            "check_config must not connect to the configured upstream api_base"
+        );
+    }
+
+    #[test]
+    fn check_config_does_not_create_or_mutate_sqlite_store_paths() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::capture();
+        let root = unique_temp_root();
+        let keys = root.join("relay.keys");
+        let credential_store = root.join("credential-store.sqlite");
+        let registry_store = root.join("registry-store.sqlite");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&keys, "synthetic-upstream-key\n").unwrap();
+        fs::write(&credential_store, b"credential-store-sentinel").unwrap();
+        fs::write(&registry_store, b"registry-store-sentinel").unwrap();
+        env::set_var("KEY_POOL_ROUTER_SQLITE_CREDENTIAL_STORE", &credential_store);
+        env::set_var("KEY_POOL_ROUTER_SQLITE_REGISTRY_STORE", &registry_store);
+        let config = write_config(&root, &valid_config(&keys));
+
+        let report = check_config(CheckConfigOptions {
+            config_path: config,
+        });
+
+        assert_eq!(report.status, DiagnosticStatus::Ok);
+        assert_eq!(
+            fs::read(&credential_store).unwrap(),
+            b"credential-store-sentinel"
+        );
+        assert_eq!(
+            fs::read(&registry_store).unwrap(),
+            b"registry-store-sentinel"
+        );
+        assert!(!credential_store.with_extension("sqlite-wal").exists());
+        assert!(!credential_store.with_extension("sqlite-shm").exists());
+        assert!(!registry_store.with_extension("sqlite-wal").exists());
+        assert!(!registry_store.with_extension("sqlite-shm").exists());
+    }
+
+    #[test]
     fn check_config_reports_legacy_client_model_scope_field_without_side_effects() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _restore = EnvRestore::capture();
@@ -765,10 +861,11 @@ model_routes:
             "    token: secret-client-token",
             "    token: secret-client-token\n    allowed_model_groups:\n      - gpt-example",
         );
+        let original_config_body = config_body.clone();
         let config = write_config(&root, &config_body);
 
         let report = check_config(CheckConfigOptions {
-            config_path: config,
+            config_path: config.clone(),
         });
 
         assert_eq!(report.status, DiagnosticStatus::Ok);
@@ -789,6 +886,7 @@ model_routes:
         assert!(!rendered.contains("synthetic-upstream-key"));
         assert!(!credential_store.exists());
         assert!(!registry_store.exists());
+        assert_eq!(fs::read_to_string(config).unwrap(), original_config_body);
     }
 
     #[test]
@@ -826,6 +924,72 @@ model_routes:
         assert!(rendered.contains("local-client"));
         assert!(rendered.contains("gpt-example"));
         assert!(!rendered.contains("secret-client-token"));
+    }
+
+    #[test]
+    fn check_config_reports_stable_empty_visibility_reasons() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::capture();
+        env::remove_var("KEY_POOL_ROUTER_SQLITE_CREDENTIAL_STORE");
+        env::remove_var("KEY_POOL_ROUTER_SQLITE_REGISTRY_STORE");
+        let root = unique_temp_root();
+        let keys = root.join("relay.keys");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&keys, "synthetic-upstream-key\n").unwrap();
+
+        let model_route_missing = write_config(&root.join("no-route"), &no_route_config(&keys));
+        let report = check_config(CheckConfigOptions {
+            config_path: model_route_missing,
+        });
+        assert_eq!(report.status, DiagnosticStatus::Ok);
+        assert_eq!(
+            report.model_visibility_preview[0].visible_models,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            report.model_visibility_preview[0].reason_code,
+            "model_route_missing"
+        );
+
+        let client_scope_empty = write_config(
+            &root.join("scope-empty"),
+            &valid_config(&keys).replace(
+                "    token: secret-client-token",
+                "    token: secret-client-token\n    allowed_model_groups:\n      - not-gpt-example",
+            ),
+        );
+        let report = check_config(CheckConfigOptions {
+            config_path: client_scope_empty,
+        });
+        assert_eq!(report.status, DiagnosticStatus::Ok);
+        assert_eq!(
+            report.model_visibility_preview[0].visible_models,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            report.model_visibility_preview[0].reason_code,
+            "client_scope_empty"
+        );
+
+        let target_channel_disabled = write_config(
+            &root.join("disabled-channel"),
+            &valid_config(&keys).replace(
+                "    api_base: https://relay.example/v1",
+                "    api_base: https://relay.example/v1\n    enabled: false",
+            ),
+        );
+        let report = check_config(CheckConfigOptions {
+            config_path: target_channel_disabled,
+        });
+        assert_eq!(report.status, DiagnosticStatus::Ok);
+        assert_eq!(
+            report.model_visibility_preview[0].visible_models,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            report.model_visibility_preview[0].reason_code,
+            "target_channel_disabled"
+        );
     }
 
     #[test]
