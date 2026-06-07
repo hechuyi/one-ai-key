@@ -33,9 +33,13 @@ struct FailureWindow {
     requested_last: usize,
     effective_last: usize,
     routing_buffered_events: usize,
+    routing_capacity: usize,
+    routing_dropped_events: u64,
     routing_offset: usize,
     routing_limit: usize,
     response_filter_buffered_events: usize,
+    response_filter_capacity: usize,
+    response_filter_dropped_events: u64,
     response_filter_offset: usize,
     response_filter_limit: usize,
 }
@@ -45,10 +49,15 @@ impl FailureWindow {
         let combined_limit = self
             .routing_limit
             .saturating_add(self.response_filter_limit);
+        let dropped_events = self
+            .routing_dropped_events
+            .saturating_add(self.response_filter_dropped_events);
         serde_json::json!({
             "kind": "bounded_recent_events",
             "source": ["routing_telemetry", "response_filter_events"],
             "limit": combined_limit,
+            "capacity": self.routing_capacity.saturating_add(self.response_filter_capacity),
+            "dropped_events": dropped_events,
             "returned": returned,
             "truncated": self.routing_offset > 0 || self.response_filter_offset > 0,
             "cursor": Value::Null,
@@ -58,11 +67,15 @@ impl FailureWindow {
             "sources": {
                 "routing_telemetry": {
                     "buffered_events": self.routing_buffered_events,
+                    "capacity": self.routing_capacity,
+                    "dropped_events": self.routing_dropped_events,
                     "offset": self.routing_offset,
                     "limit": self.routing_limit,
                 },
                 "response_filter_events": {
                     "buffered_events": self.response_filter_buffered_events,
+                    "capacity": self.response_filter_capacity,
+                    "dropped_events": self.response_filter_dropped_events,
                     "offset": self.response_filter_offset,
                     "limit": self.response_filter_limit,
                 },
@@ -144,9 +157,13 @@ async fn fetch_failure_windows(
         requested_last,
         effective_last,
         routing_buffered_events,
+        routing_capacity: metadata_usize(&routing_metadata, "capacity"),
+        routing_dropped_events: metadata_u64(&routing_metadata, "dropped_events"),
         routing_offset,
         routing_limit: effective_last,
         response_filter_buffered_events,
+        response_filter_capacity: metadata_usize(&response_filter_metadata, "capacity"),
+        response_filter_dropped_events: metadata_u64(&response_filter_metadata, "dropped_events"),
         response_filter_offset,
         response_filter_limit: effective_last,
     };
@@ -154,11 +171,19 @@ async fn fetch_failure_windows(
 }
 
 fn buffered_events(snapshot: &Value) -> usize {
+    metadata_usize(snapshot, "buffered_events")
+}
+
+fn metadata_usize(snapshot: &Value, key: &str) -> usize {
     snapshot
-        .get("buffered_events")
+        .get(key)
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(0)
+}
+
+fn metadata_u64(snapshot: &Value, key: &str) -> u64 {
+    snapshot.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -225,9 +250,13 @@ fn test_window(routing: &Value, response_filter: &Value) -> FailureWindow {
         requested_last: DEFAULT_LAST,
         effective_last: DEFAULT_LAST,
         routing_buffered_events: buffered_events(routing),
+        routing_capacity: metadata_usize(routing, "capacity"),
+        routing_dropped_events: metadata_u64(routing, "dropped_events"),
         routing_offset: routing.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize,
         routing_limit: routing.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize,
         response_filter_buffered_events: buffered_events(response_filter),
+        response_filter_capacity: metadata_usize(response_filter, "capacity"),
+        response_filter_dropped_events: metadata_u64(response_filter, "dropped_events"),
         response_filter_offset: response_filter
             .get("offset")
             .and_then(Value::as_u64)
@@ -708,8 +737,8 @@ fn upstream_failure_class(failure_kind: &str, status: Option<u64>) -> &'static s
 
 fn router_action_for_directive(directive: &str) -> &'static str {
     match directive {
-        "retry" => "retried_before_output",
-        "fallback" => "fell_back_before_output",
+        "retry" | "retry_credential" | "retry_same_target" => "retried_before_output",
+        "fallback" | "retry_route_target" => "fell_back_before_output",
         "mark_credential" => "marked_credential",
         "mark_channel" => "marked_channel",
         "record_event_only" => "recorded_event_only",
@@ -740,7 +769,7 @@ fn retry_eligibility(
     {
         return "blocked_streaming".to_string();
     }
-    if directive == "retry" || directive == "fallback" {
+    if retry_directive_is_pre_output_continuation(directive) {
         "eligible_before_output".to_string()
     } else {
         "not_applicable".to_string()
@@ -778,6 +807,13 @@ fn client_visible_status(status: Option<u64>, directive: &str, retry_eligibility
         None if directive == "retry" => "not_applicable_retry_before_output".to_string(),
         None => "unknown".to_string(),
     }
+}
+
+fn retry_directive_is_pre_output_continuation(directive: &str) -> bool {
+    matches!(
+        directive,
+        "retry" | "fallback" | "retry_credential" | "retry_route_target" | "retry_same_target"
+    )
 }
 
 fn reason_code_for_class(failure_class: &str) -> &'static str {
@@ -1118,6 +1154,9 @@ fn safe_directive(value: Option<&Value>) -> Option<&'static str> {
     match value.and_then(Value::as_str).unwrap_or_default() {
         "retry" => Some("retry"),
         "fallback" => Some("fallback"),
+        "retry_credential" => Some("retry_credential"),
+        "retry_route_target" => Some("retry_route_target"),
+        "retry_same_target" => Some("retry_same_target"),
         "return_error" => Some("return_error"),
         "mark_credential" => Some("mark_credential"),
         "mark_channel" => Some("mark_channel"),
@@ -1300,6 +1339,8 @@ mod tests {
     fn routing_fixture() -> Value {
         serde_json::json!({
             "buffered_events": 6,
+            "capacity": 1024,
+            "dropped_events": 2,
             "offset": 0,
             "limit": 50,
             "events": [
@@ -1358,6 +1399,8 @@ mod tests {
     fn response_filter_fixture() -> Value {
         serde_json::json!({
             "buffered_events": 2,
+            "capacity": 1024,
+            "dropped_events": 3,
             "offset": 0,
             "limit": 50,
             "events": [
@@ -1483,6 +1526,105 @@ mod tests {
             report["data"]["explanation"]["final_outcome"],
             "client_visible_failure"
         );
+    }
+
+    #[test]
+    fn failures_preserves_m3_retry_directives_for_display_and_filtering() {
+        let routing = serde_json::json!({
+            "buffered_events": 3,
+            "offset": 0,
+            "limit": 50,
+            "events": [
+                {
+                    "kind": "upstream_failure_observed",
+                    "request_id": "req_retry_credential",
+                    "channel_id": "relay-a",
+                    "failure": {
+                        "failure_kind": "provider_unavailable",
+                        "failure_source": "upstream_transaction",
+                        "status": 502,
+                        "directive": "retry_credential",
+                        "public_model": "gpt-example"
+                    }
+                },
+                {
+                    "kind": "upstream_failure_observed",
+                    "request_id": "req_retry_route",
+                    "channel_id": "relay-a",
+                    "failure": {
+                        "failure_kind": "provider_unavailable",
+                        "failure_source": "upstream_transaction",
+                        "status": 503,
+                        "directive": "retry_route_target",
+                        "public_model": "gpt-example"
+                    }
+                },
+                {
+                    "kind": "upstream_failure_observed",
+                    "request_id": "req_retry_same",
+                    "channel_id": "relay-a",
+                    "failure": {
+                        "failure_kind": "provider_unavailable",
+                        "failure_source": "local_transport",
+                        "directive": "retry_same_target",
+                        "public_model": "gpt-example"
+                    }
+                }
+            ]
+        });
+        let response_filter = serde_json::json!({
+            "buffered_events": 0,
+            "offset": 0,
+            "limit": 50,
+            "events": []
+        });
+
+        let rendered = render_tail_report(
+            &routing,
+            &response_filter,
+            &FailureFilters {
+                request_id: None,
+                public_model: Some("gpt-example".to_string()),
+                channel_id: Some("relay-a".to_string()),
+                directive: Some("retry_route_target".to_string()),
+            },
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        let failures = report["data"]["failures"].as_array().unwrap();
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["request_id"], "req_retry_route");
+        assert_eq!(failures[0]["directive"], "retry_route_target");
+        assert_eq!(failures[0]["router_action"], "fell_back_before_output");
+        assert_eq!(failures[0]["retry_eligibility"], "eligible_before_output");
+        assert_eq!(
+            failures[0]["client_visible_status"],
+            "not_applicable_retry_before_output"
+        );
+
+        let rendered = render_tail_report(
+            &routing,
+            &response_filter,
+            &FailureFilters::default(),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        let failures = report["data"]["failures"].as_array().unwrap();
+        for directive in [
+            "retry_credential",
+            "retry_route_target",
+            "retry_same_target",
+        ] {
+            assert!(
+                failures.iter().any(|failure| {
+                    failure["directive"] == directive
+                        && failure["router_action"] != "returned_local_error"
+                        && failure["retry_eligibility"] == "eligible_before_output"
+                }),
+                "{directive} should be preserved as bounded retry evidence"
+            );
+        }
     }
 
     #[test]
@@ -1811,13 +1953,59 @@ mod tests {
         let report: Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(report["window"]["limit"], 100);
+        assert_eq!(report["window"]["dropped_events"], 5);
         assert_eq!(
             report["window"]["sources"]["routing_telemetry"]["limit"],
             50
         );
         assert_eq!(
+            report["window"]["sources"]["routing_telemetry"]["capacity"],
+            1024
+        );
+        assert_eq!(
+            report["window"]["sources"]["routing_telemetry"]["dropped_events"],
+            2
+        );
+        assert_eq!(
             report["window"]["sources"]["response_filter_events"]["limit"],
             50
+        );
+        assert_eq!(
+            report["window"]["sources"]["response_filter_events"]["capacity"],
+            1024
+        );
+        assert_eq!(
+            report["window"]["sources"]["response_filter_events"]["dropped_events"],
+            3
+        );
+    }
+
+    #[test]
+    fn failures_window_treats_missing_capacity_and_dropped_events_as_zero() {
+        let rendered = render_tail_report(
+            &serde_json::json!({"buffered_events": 0, "offset": 0, "limit": 50, "events": []}),
+            &serde_json::json!({"buffered_events": 0, "offset": 0, "limit": 50, "events": []}),
+            &FailureFilters::default(),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["window"]["dropped_events"], 0);
+        assert_eq!(
+            report["window"]["sources"]["routing_telemetry"]["capacity"],
+            0
+        );
+        assert_eq!(
+            report["window"]["sources"]["routing_telemetry"]["dropped_events"],
+            0
+        );
+        assert_eq!(
+            report["window"]["sources"]["response_filter_events"]["capacity"],
+            0
+        );
+        assert_eq!(
+            report["window"]["sources"]["response_filter_events"]["dropped_events"],
+            0
         );
     }
 }

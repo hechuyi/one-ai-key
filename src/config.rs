@@ -863,10 +863,11 @@ impl AppConfig {
         let management_event_window_capacity = management
             .event_window_capacity
             .unwrap_or_else(default_management_event_window_capacity);
-        anyhow::ensure!(
-            management_event_window_capacity > 0,
-            "management.event_window_capacity must be greater than zero"
-        );
+        let management_event_window_capacity = bounded_positive_usize(
+            management_event_window_capacity,
+            "management.event_window_capacity",
+            event_window_capacity_hard_max(),
+        )?;
         let management_ip_allowlist =
             resolve_management_ip_allowlist(self.listen, management.ip_allowlist.clone())?;
 
@@ -1895,9 +1896,10 @@ impl RoutingConfig {
                 self.max_model_catalog_channels.unwrap_or(16),
                 "routing.max_model_catalog_channels",
             )?,
-            telemetry_buffer_capacity: positive_usize(
+            telemetry_buffer_capacity: bounded_positive_usize(
                 self.telemetry_buffer_capacity.unwrap_or(1024),
                 "routing.telemetry_buffer_capacity",
+                event_window_capacity_hard_max(),
             )?,
         })
     }
@@ -1947,10 +1949,11 @@ impl ResponseFilterConfig {
         })?;
         Ok(ResolvedResponseFilterConfig {
             policy,
-            event_window_capacity: positive_usize(
+            event_window_capacity: bounded_positive_usize(
                 self.event_window_capacity
                     .unwrap_or_else(default_response_filter_event_window_capacity),
                 "response_filter.event_window_capacity",
+                event_window_capacity_hard_max(),
             )?,
             alert_window: seconds_duration(
                 self.alert_window_seconds
@@ -1995,6 +1998,14 @@ fn positive_usize(value: usize, field: &str) -> anyhow::Result<usize> {
     Ok(value)
 }
 
+fn bounded_positive_usize(value: usize, field: &str, max: usize) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        (1..=max).contains(&value),
+        "{field} must be in range 1 to {max}"
+    );
+    Ok(value)
+}
+
 pub(crate) fn default_enabled() -> bool {
     true
 }
@@ -2029,6 +2040,10 @@ fn default_management_event_window_capacity() -> usize {
 
 fn default_response_filter_event_window_capacity() -> usize {
     1024
+}
+
+fn event_window_capacity_hard_max() -> usize {
+    4096
 }
 
 fn default_response_filter_alert_window_seconds() -> u64 {
@@ -2177,6 +2192,30 @@ pools:
         document.resolve_with_credential_repository(&FileCredentialRepository::new())
     }
 
+    fn resolve_config_with_management_event_window_capacity(
+        capacity: usize,
+    ) -> anyhow::Result<ResolvedConfig> {
+        let raw = config_yaml("{}").replacen(
+            "management:\n  admin_token: synthetic-management-token",
+            &format!(
+                "management:\n  admin_token: synthetic-management-token\n  event_window_capacity: {capacity}"
+            ),
+            1,
+        );
+        resolve_config(&raw)
+    }
+
+    fn resolve_config_with_routing_telemetry_buffer_capacity(
+        capacity: usize,
+    ) -> anyhow::Result<ResolvedConfig> {
+        let raw = config_yaml("{}").replacen(
+            "default_pool: relay",
+            &format!("default_pool: relay\nrouting:\n  telemetry_buffer_capacity: {capacity}"),
+            1,
+        );
+        resolve_config(&raw)
+    }
+
     fn classify(error_rules: &str, status: u16, body: &[u8]) -> ClassifiedFailure {
         let resolved = resolve_config(&config_yaml(error_rules)).unwrap();
         resolved.pools["relay"]
@@ -2194,6 +2233,37 @@ pools:
             resolved.response_filter_alert_window,
             Duration::from_secs(900)
         );
+    }
+
+    #[test]
+    fn response_filter_event_settings_accept_hard_max_capacity() {
+        let resolved = resolve_document_with_response_filter(ResponseFilterConfig {
+            enabled: false,
+            replacement: None,
+            event_window_capacity: Some(4096),
+            alert_window_seconds: None,
+            rules: Vec::new(),
+        })
+        .expect("maximum response filter event window should resolve");
+
+        assert_eq!(resolved.response_filter_event_window_capacity, 4096);
+    }
+
+    #[test]
+    fn response_filter_event_settings_reject_capacity_above_hard_max() {
+        let err = resolve_document_with_response_filter(ResponseFilterConfig {
+            enabled: false,
+            replacement: None,
+            event_window_capacity: Some(4097),
+            alert_window_seconds: None,
+            rules: Vec::new(),
+        })
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("response_filter.event_window_capacity"));
+        assert!(err.to_string().contains("1 to 4096"));
     }
 
     #[test]
@@ -2240,9 +2310,63 @@ pools:
         ] {
             let err = resolve_document_with_response_filter(config).unwrap_err();
             assert!(
-                err.to_string().contains(field) && err.to_string().contains("greater than zero"),
+                err.to_string().contains(field)
+                    && (err.to_string().contains("greater than zero")
+                        || err.to_string().contains("1 to 4096")),
                 "unexpected error for {field}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn routing_telemetry_settings_default_to_1024() {
+        let resolved = resolve_config(&config_yaml("{}")).expect("default config resolves");
+
+        assert_eq!(resolved.routing.telemetry_buffer_capacity, 1024);
+    }
+
+    #[test]
+    fn routing_telemetry_settings_accept_hard_max_capacity() {
+        let resolved = resolve_config_with_routing_telemetry_buffer_capacity(4096)
+            .expect("maximum routing telemetry buffer should resolve");
+
+        assert_eq!(resolved.routing.telemetry_buffer_capacity, 4096);
+    }
+
+    #[test]
+    fn routing_telemetry_settings_reject_zero_and_above_hard_max_capacity() {
+        for capacity in [0, 4097] {
+            let err = resolve_config_with_routing_telemetry_buffer_capacity(capacity).unwrap_err();
+
+            assert!(err
+                .to_string()
+                .contains("routing.telemetry_buffer_capacity"));
+            assert!(err.to_string().contains("1 to 4096"));
+        }
+    }
+
+    #[test]
+    fn management_event_window_settings_default_to_1024() {
+        let resolved = resolve_config(&config_yaml("{}")).expect("default config resolves");
+
+        assert_eq!(resolved.management_event_window_capacity, 1024);
+    }
+
+    #[test]
+    fn management_event_window_settings_accept_hard_max_capacity() {
+        let resolved = resolve_config_with_management_event_window_capacity(4096)
+            .expect("maximum management event window should resolve");
+
+        assert_eq!(resolved.management_event_window_capacity, 4096);
+    }
+
+    #[test]
+    fn management_event_window_settings_reject_zero_and_above_hard_max_capacity() {
+        for capacity in [0, 4097] {
+            let err = resolve_config_with_management_event_window_capacity(capacity).unwrap_err();
+
+            assert!(err.to_string().contains("management.event_window_capacity"));
+            assert!(err.to_string().contains("1 to 4096"));
         }
     }
 
@@ -2457,7 +2581,7 @@ adaptation_rules:
 
             assert_eq!(failure.kind, FailureKind::RateLimited);
             assert_eq!(failure.primary_scope, FailureScope::Credential);
-            assert!(failure.retryable);
+            assert!(!failure.retryable);
         }
     }
 

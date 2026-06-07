@@ -2014,16 +2014,16 @@ fn display_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use axum::{
-        Json, Router,
         routing::{get, post},
+        Json, Router,
     };
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use std::{
         fs,
         path::Path,
         sync::{
-            Arc, Mutex,
             atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
         },
     };
 
@@ -3004,10 +3004,8 @@ mod tests {
         assert!(rendered.contains("\"command\": \"keys list\""));
         assert!(rendered.contains("\"side_effect_class\": \"runtime_readonly\""));
         assert!(rendered.contains("\"effect_vector\""));
-        assert!(
-            rendered
-                .contains("\"probe_summary_status\": \"unavailable_without_summary_projection\"")
-        );
+        assert!(rendered
+            .contains("\"probe_summary_status\": \"unavailable_without_summary_projection\""));
         assert!(
             rendered.contains("\"credential_ref_status\": \"available_from_summary_projection\"")
         );

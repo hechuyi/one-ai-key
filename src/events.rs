@@ -239,6 +239,7 @@ pub struct ResponseFilterEventInput {
 #[derive(Debug, Clone)]
 pub struct ResponseFilterEventBuffer {
     capacity: usize,
+    dropped_events: u64,
     next_id: u64,
     events: VecDeque<ResponseFilterEvent>,
 }
@@ -247,6 +248,7 @@ impl ResponseFilterEventBuffer {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
+            dropped_events: 0,
             next_id: 0,
             events: VecDeque::with_capacity(capacity),
         }
@@ -262,6 +264,7 @@ impl ResponseFilterEventBuffer {
         created_at_unix_seconds: u64,
     ) -> Option<ResponseFilterEvent> {
         if self.capacity == 0 {
+            self.record_dropped_event();
             return None;
         }
         self.next_id = self.next_id.saturating_add(1);
@@ -280,6 +283,7 @@ impl ResponseFilterEventBuffer {
         };
         if self.events.len() == self.capacity {
             self.events.pop_front();
+            self.record_dropped_event();
         }
         self.events.push_back(event.clone());
         Some(event)
@@ -293,11 +297,25 @@ impl ResponseFilterEventBuffer {
         self.capacity
     }
 
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events
+    }
+
+    pub fn record_dropped_event(&mut self) {
+        self.record_dropped_events(1);
+    }
+
+    pub fn record_dropped_events(&mut self, dropped: u64) {
+        self.dropped_events = self.dropped_events.saturating_add(dropped);
+    }
+
     pub fn snapshot(&self) -> Vec<ResponseFilterEvent> {
         self.events.iter().cloned().collect()
     }
 
     pub fn replace_capacity(&mut self, capacity: usize) {
+        let dropped = self.events.len().saturating_sub(capacity);
+        self.record_dropped_events(u64::try_from(dropped).unwrap_or(u64::MAX));
         self.capacity = capacity;
         while self.events.len() > self.capacity {
             self.events.pop_front();
@@ -398,12 +416,12 @@ impl RoutingTelemetryBuffer {
 
     pub fn push(&mut self, event: RoutingTelemetry) {
         if self.capacity == 0 {
-            self.dropped_events = self.dropped_events.saturating_add(1);
+            self.record_dropped_event();
             return;
         }
         if self.events.len() == self.capacity {
             self.events.pop_front();
-            self.dropped_events = self.dropped_events.saturating_add(1);
+            self.record_dropped_event();
         }
         self.events.push_back(event);
     }
@@ -412,8 +430,20 @@ impl RoutingTelemetryBuffer {
         self.events.len()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events
+    }
+
+    pub fn record_dropped_event(&mut self) {
+        self.record_dropped_events(1);
+    }
+
+    pub fn record_dropped_events(&mut self, dropped: u64) {
+        self.dropped_events = self.dropped_events.saturating_add(dropped);
     }
 
     pub fn snapshot(&self) -> Vec<RoutingTelemetry> {
@@ -428,6 +458,18 @@ impl RoutingTelemetryBuffer {
             }
         }
         counters
+    }
+
+    pub fn replace_capacity(&mut self, capacity: usize) {
+        let dropped = self.events.len().saturating_sub(capacity);
+        self.record_dropped_events(u64::try_from(dropped).unwrap_or(u64::MAX));
+        self.capacity = capacity;
+        while self.events.len() > self.capacity {
+            self.events.pop_front();
+        }
+        self.events.shrink_to_fit();
+        self.events
+            .reserve(self.capacity.saturating_sub(self.events.len()));
     }
 }
 
@@ -1556,6 +1598,45 @@ mod tests {
     }
 
     #[test]
+    fn routing_telemetry_buffer_shrink_counts_removed_old_events() {
+        let mut buffer = RoutingTelemetryBuffer::new(4);
+        for request_id in ["req-1", "req-2", "req-3", "req-4"] {
+            buffer.push(RoutingTelemetry::RouteSelected {
+                request_id: request_id.to_string(),
+                registry_generation: 2,
+                channel_id: "channel-a".to_string(),
+            });
+        }
+
+        buffer.replace_capacity(2);
+
+        let events = buffer.snapshot();
+        assert_eq!(buffer.capacity(), 2);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| match event {
+                    RoutingTelemetry::RouteSelected { request_id, .. } => request_id.as_str(),
+                    _ => panic!("expected route_selected event"),
+                })
+                .collect::<Vec<_>>(),
+            vec!["req-3", "req-4"]
+        );
+        assert_eq!(buffer.dropped_events(), 2);
+    }
+
+    #[test]
+    fn routing_telemetry_buffer_can_record_external_dropped_event() {
+        let mut buffer = RoutingTelemetryBuffer::new(2);
+
+        buffer.record_dropped_event();
+
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.dropped_events(), 1);
+    }
+
+    #[test]
     fn credential_transition_routing_telemetry_serializes_without_secret_material() {
         let event = RoutingTelemetry::CredentialTransitionApplied {
             request_id: "req-1".to_string(),
@@ -1688,6 +1769,19 @@ mod tests {
         assert_eq!(events[1].event_id, 3);
         assert_eq!(events[1].rule_id, "rule-c");
         assert!(events.iter().all(|event| event.created_at_unix_seconds > 0));
+        assert_eq!(buffer.dropped_events(), 1);
+    }
+
+    #[test]
+    fn response_filter_event_buffer_zero_capacity_counts_dropped_events() {
+        let mut buffer = ResponseFilterEventBuffer::new(0);
+
+        let pushed = buffer.push(test_response_filter_event_input("req-1", "rule-a"));
+
+        assert_eq!(pushed, None);
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.snapshot(), Vec::new());
+        assert_eq!(buffer.dropped_events(), 1);
     }
 
     #[test]
@@ -1733,6 +1827,35 @@ mod tests {
         assert_eq!(event.event_id, 4);
         assert_eq!(buffer.capacity(), 1);
         assert_eq!(buffer.snapshot()[0].request_id, "req-4");
+        assert_eq!(buffer.dropped_events(), 3);
+    }
+
+    #[test]
+    fn response_filter_event_buffer_shrink_counts_removed_old_events() {
+        let mut buffer = ResponseFilterEventBuffer::new(4);
+        buffer.push(test_response_filter_event_input("req-1", "rule-a"));
+        buffer.push(test_response_filter_event_input("req-2", "rule-b"));
+        buffer.push(test_response_filter_event_input("req-3", "rule-c"));
+        buffer.push(test_response_filter_event_input("req-4", "rule-d"));
+
+        buffer.replace_capacity(2);
+
+        let events = buffer.snapshot();
+        assert_eq!(buffer.capacity(), 2);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].request_id, "req-3");
+        assert_eq!(events[1].request_id, "req-4");
+        assert_eq!(buffer.dropped_events(), 2);
+    }
+
+    #[test]
+    fn response_filter_event_buffer_can_record_external_dropped_event() {
+        let mut buffer = ResponseFilterEventBuffer::new(2);
+
+        buffer.record_dropped_event();
+
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.dropped_events(), 1);
     }
 
     #[test]

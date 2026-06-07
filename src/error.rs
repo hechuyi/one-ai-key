@@ -396,6 +396,15 @@ impl ErrorClassifier {
             );
         }
 
+        if status == 429 {
+            return (
+                FailureKind::RateLimited,
+                FailureScope::Credential,
+                false,
+                FailureConfidence::Low,
+            );
+        }
+
         (
             FailureKind::Unknown,
             FailureScope::RequestOnly,
@@ -451,11 +460,9 @@ impl Default for ErrorClassifier {
             expire_codes: vec!["invalid_api_key".to_string()],
             keep_statuses: Vec::new(),
             switch_statuses: vec![
-                StatusMatcher::Exact(429),
-                StatusMatcher::Range {
-                    start: 500,
-                    end: 599,
-                },
+                StatusMatcher::Exact(502),
+                StatusMatcher::Exact(503),
+                StatusMatcher::Exact(504),
             ],
             expire_statuses: vec![StatusMatcher::Exact(401), StatusMatcher::Exact(403)],
             adaptation_rules: Vec::new(),
@@ -844,10 +851,63 @@ mod tests {
 
         assert_eq!(code.kind, FailureKind::Unknown);
         assert_eq!(code.primary_scope, FailureScope::RequestOnly);
-        assert_eq!(rate_limited_status.kind, FailureKind::Unknown);
-        assert_eq!(rate_limited_status.primary_scope, FailureScope::RequestOnly);
+        assert_eq!(rate_limited_status.kind, FailureKind::RateLimited);
+        assert_eq!(rate_limited_status.primary_scope, FailureScope::Credential);
+        assert!(!rate_limited_status.retryable);
         assert_eq!(provider_status.kind, FailureKind::Unknown);
         assert_eq!(provider_status.primary_scope, FailureScope::RequestOnly);
+    }
+
+    #[test]
+    fn explicit_switch_status_429_remains_retryable_opt_in() {
+        let classifier = ErrorClassifierSpec {
+            switch_statuses: Some(vec!["429".to_string()]),
+            ..Default::default()
+        }
+        .build()
+        .unwrap();
+
+        let failure = classifier.classify_failure(429, &[], b"{}");
+
+        assert_eq!(failure.kind, FailureKind::RateLimited);
+        assert_eq!(failure.primary_scope, FailureScope::Credential);
+        assert!(failure.retryable);
+    }
+
+    #[test]
+    fn default_transient_statuses_are_limited_to_502_503_504() {
+        let classifier = ErrorClassifier::default();
+
+        for status in [502, 503, 504] {
+            let failure = classifier.classify_failure(status, &[], b"{}");
+            assert_eq!(failure.kind, FailureKind::ProviderUnavailable);
+            assert_eq!(failure.primary_scope, FailureScope::Channel);
+            assert!(failure.retryable);
+        }
+
+        for status in [500, 599] {
+            let failure = classifier.classify_failure(status, &[], b"{}");
+            assert_eq!(failure.kind, FailureKind::Unknown);
+            assert_eq!(failure.primary_scope, FailureScope::RequestOnly);
+            assert!(!failure.retryable);
+        }
+    }
+
+    #[test]
+    fn explicit_5xx_switch_statuses_keep_classifier_opt_in_for_500_and_599() {
+        let classifier = ErrorClassifierSpec {
+            switch_statuses: Some(vec!["5xx".to_string()]),
+            ..Default::default()
+        }
+        .build()
+        .unwrap();
+
+        for status in [500, 599] {
+            let failure = classifier.classify_failure(status, &[], b"{}");
+            assert_eq!(failure.kind, FailureKind::ProviderUnavailable);
+            assert_eq!(failure.primary_scope, FailureScope::Channel);
+            assert!(failure.retryable);
+        }
     }
 
     #[test]
@@ -1015,7 +1075,7 @@ mod tests {
 
             assert_eq!(failure.kind, FailureKind::RateLimited);
             assert_eq!(failure.primary_scope, FailureScope::Credential);
-            assert!(failure.retryable);
+            assert!(!failure.retryable);
         }
     }
 

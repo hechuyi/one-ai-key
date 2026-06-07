@@ -29,6 +29,7 @@ use crate::{
     routing::{
         apply_retry_directive_to_attempt_state, FailureSource, FrozenRetryCandidates,
         RequestSelectionSnapshot, RetryAttemptContinuation, SelectionReason,
+        CONSERVATIVE_RETRY_BUDGET,
     },
     state::{AppState, ChannelId, PoolState},
     success_guard::{
@@ -44,6 +45,7 @@ use crate::{
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::BTreeSet,
+    sync::{Arc, Mutex, TryLockError},
     time::{Duration, Instant},
 };
 
@@ -85,6 +87,7 @@ fn response_filter_event_options(
     snapshot: &RequestSelectionSnapshot,
 ) -> ResponseFilterEventOptions {
     let events = state.response_filter_events.clone();
+    let lock_contention_drops = state.response_filter_event_lock_contention_drops.clone();
     ResponseFilterEventOptions {
         context: ResponseFilterEventContext {
             request_id: snapshot.request_id.clone(),
@@ -96,11 +99,26 @@ fn response_filter_event_options(
                 .unwrap_or_else(|| "unknown".to_string()),
         },
         sink: std::sync::Arc::new(move |event| {
-            let _ = events
-                .lock()
-                .expect("response filter events mutex poisoned")
-                .push(event);
+            record_response_filter_event_to_buffer(&events, &lock_contention_drops, event);
         }),
+    }
+}
+
+fn record_response_filter_event_to_buffer(
+    events: &Arc<Mutex<crate::events::ResponseFilterEventBuffer>>,
+    lock_contention_drops: &Arc<AtomicU64>,
+    event: crate::events::ResponseFilterEventInput,
+) {
+    match events.try_lock() {
+        Ok(mut events) => {
+            let _ = events.push(event);
+        }
+        Err(TryLockError::WouldBlock) => {
+            lock_contention_drops.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TryLockError::Poisoned(err)) => {
+            let _ = err.into_inner().push(event);
+        }
     }
 }
 
@@ -171,9 +189,11 @@ fn emit_precommit_response_filter_events(
 ) {
     let context = response_filter_event_options(state, route_plan, snapshot).context;
     let content_kind = response_filter_content_kind(headers);
-    if let Ok(mut events) = state.response_filter_events.lock() {
-        for matched_rule in matches {
-            events.push(crate::events::ResponseFilterEventInput {
+    for matched_rule in matches {
+        record_response_filter_event_to_buffer(
+            &state.response_filter_events,
+            &state.response_filter_event_lock_contention_drops,
+            crate::events::ResponseFilterEventInput {
                 request_id: context.request_id.clone(),
                 channel_id: context.channel_id.clone(),
                 public_model: context.public_model.clone(),
@@ -183,8 +203,8 @@ fn emit_precommit_response_filter_events(
                 reason_code: matched_rule.reason_code.to_string(),
                 outcome: "rejected".to_string(),
                 body_committed: false,
-            });
-        }
+            },
+        );
     }
 }
 
@@ -775,14 +795,20 @@ fn effective_deadline_for_request(
 fn upstream_timeout_for_effective_deadline(
     effective_deadline: Option<Instant>,
     non_streaming_total: Duration,
+    retry_attempt: bool,
 ) -> Duration {
+    let base_timeout = if retry_attempt {
+        non_streaming_total.min(CONSERVATIVE_RETRY_BUDGET)
+    } else {
+        non_streaming_total
+    };
     effective_deadline
         .map(|deadline| {
             deadline
                 .saturating_duration_since(Instant::now())
-                .min(non_streaming_total)
+                .min(base_timeout)
         })
-        .unwrap_or(non_streaming_total)
+        .unwrap_or(base_timeout)
 }
 
 async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response {
@@ -1234,6 +1260,7 @@ async fn forward_with_pool(
             upstream = upstream.timeout(upstream_timeout_for_effective_deadline(
                 *effective_deadline,
                 state.timeout_profile.non_streaming_total,
+                attempt > 0,
             ));
         }
         if !outbound.body.is_empty() {
@@ -1261,7 +1288,9 @@ async fn forward_with_pool(
                     &mut frozen_retry_candidates,
                     &mut attempt,
                 ) {
-                    RetryAttemptContinuation::RetrySameTarget => continue,
+                    RetryAttemptContinuation::RetrySameTarget => {
+                        continue;
+                    }
                     RetryAttemptContinuation::RetryRouteTarget => {
                         return PoolForwardResult::RouteFallback(response);
                     }
@@ -1333,7 +1362,9 @@ async fn forward_with_pool(
                         RetryAttemptContinuation::RetryRouteTarget => {
                             return PoolForwardResult::RouteFallback(response);
                         }
-                        RetryAttemptContinuation::RetrySameTarget => continue,
+                        RetryAttemptContinuation::RetrySameTarget => {
+                            continue;
+                        }
                         RetryAttemptContinuation::ReturnCurrentError { .. } => {}
                         RetryAttemptContinuation::FrozenCandidateDrift { .. } => {
                             return PoolForwardResult::Response(json_error(
@@ -1358,7 +1389,7 @@ async fn forward_with_pool(
                         &prefix,
                     ) {
                         if let Some(failure) = rejection.failure {
-                            let directive = transition_observed_failure(
+                            let _ = transition_observed_failure(
                                 state,
                                 &pool_state,
                                 &snapshot,
@@ -1366,27 +1397,6 @@ async fn forward_with_pool(
                                 FailureSource::ResponseFilterPrecommit,
                             )
                             .await;
-                            match apply_retry_directive_to_attempt_state(
-                                directive,
-                                &mut frozen_retry_candidates,
-                                &mut attempt,
-                            ) {
-                                RetryAttemptContinuation::RetryCredential { credential_id } => {
-                                    retry_credential_id = Some(credential_id);
-                                    continue;
-                                }
-                                RetryAttemptContinuation::RetryRouteTarget => {
-                                    return PoolForwardResult::RouteFallback(rejection.response);
-                                }
-                                RetryAttemptContinuation::RetrySameTarget => continue,
-                                RetryAttemptContinuation::ReturnCurrentError { .. } => {}
-                                RetryAttemptContinuation::FrozenCandidateDrift { .. } => {
-                                    return PoolForwardResult::Response(json_error(
-                                        StatusCode::BAD_GATEWAY,
-                                        "retry candidate drifted from frozen request selection",
-                                    ));
-                                }
-                            }
                         }
                         return PoolForwardResult::Response(rejection.response);
                     }
@@ -1437,7 +1447,9 @@ async fn forward_with_pool(
                             );
                             return PoolForwardResult::RouteFallback(response);
                         }
-                        RetryAttemptContinuation::RetrySameTarget => continue,
+                        RetryAttemptContinuation::RetrySameTarget => {
+                            continue;
+                        }
                         RetryAttemptContinuation::ReturnCurrentError { .. } => {}
                         RetryAttemptContinuation::FrozenCandidateDrift { .. } => {
                             return PoolForwardResult::Response(json_error(
@@ -1483,7 +1495,9 @@ async fn forward_with_pool(
                         );
                         return PoolForwardResult::RouteFallback(response);
                     }
-                    RetryAttemptContinuation::RetrySameTarget => continue,
+                    RetryAttemptContinuation::RetrySameTarget => {
+                        continue;
+                    }
                     RetryAttemptContinuation::ReturnCurrentError { .. } => {}
                     RetryAttemptContinuation::FrozenCandidateDrift { .. } => {
                         return PoolForwardResult::Response(json_error(
@@ -1521,12 +1535,92 @@ async fn forward_with_pool(
                 let response = response_with_headers(status, response_headers, Body::from(bytes));
                 return PoolForwardResult::RouteFallback(response);
             }
-            RetryAttemptContinuation::RetrySameTarget => continue,
+            RetryAttemptContinuation::RetrySameTarget => {
+                continue;
+            }
             RetryAttemptContinuation::ReturnCurrentError { .. }
             | RetryAttemptContinuation::FrozenCandidateDrift { .. } => {}
         }
 
         let response = response_with_headers(status, response_headers, Body::from(bytes));
         return PoolForwardResult::Response(response);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{ResponseFilterEventBuffer, ResponseFilterEventInput};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    };
+
+    #[test]
+    fn record_response_filter_event_to_buffer_records_when_lock_available() {
+        let events = Arc::new(Mutex::new(ResponseFilterEventBuffer::new(2)));
+        let external_dropped = Arc::new(AtomicU64::new(0));
+
+        record_response_filter_event_to_buffer(
+            &events,
+            &external_dropped,
+            response_filter_event_input("req-1"),
+        );
+
+        let events = events
+            .lock()
+            .expect("response filter events mutex poisoned");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events.dropped_events(), 0);
+        assert_eq!(external_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(events.snapshot()[0].request_id, "req-1");
+    }
+
+    #[test]
+    fn record_response_filter_event_to_buffer_accounts_contended_external_drop_without_blocking() {
+        let events = Arc::new(Mutex::new(ResponseFilterEventBuffer::new(2)));
+        let external_dropped = Arc::new(AtomicU64::new(0));
+        let guard = events
+            .lock()
+            .expect("response filter events mutex poisoned");
+        let recorder_events = events.clone();
+        let recorder_external_dropped = external_dropped.clone();
+        let (recorded_tx, recorded_rx) = std::sync::mpsc::channel();
+        let recorder = std::thread::spawn(move || {
+            record_response_filter_event_to_buffer(
+                &recorder_events,
+                &recorder_external_dropped,
+                response_filter_event_input("req-contended"),
+            );
+            recorded_tx.send(()).unwrap();
+        });
+
+        recorded_rx
+            .recv_timeout(Duration::from_millis(50))
+            .expect("recording should not wait for a contended response-filter event mutex");
+        drop(guard);
+        recorder.join().unwrap();
+
+        let events = events
+            .lock()
+            .expect("response filter events mutex poisoned");
+        assert_eq!(events.len(), 0);
+        assert_eq!(events.dropped_events(), 0);
+        assert_eq!(external_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(events.snapshot(), Vec::new());
+    }
+
+    fn response_filter_event_input(request_id: &str) -> ResponseFilterEventInput {
+        ResponseFilterEventInput {
+            request_id: request_id.to_string(),
+            channel_id: "channel-a".to_string(),
+            public_model: "gpt-test".to_string(),
+            rule_id: "rule-a".to_string(),
+            action: "reject".to_string(),
+            content_kind: "json".to_string(),
+            reason_code: "rule_matched".to_string(),
+            outcome: "rejected".to_string(),
+            body_committed: false,
+        }
     }
 }

@@ -431,11 +431,9 @@ fn is_safe_public_model_label(public_model: &str) -> bool {
     {
         return false;
     }
-    public_model
-        .bytes()
-        .all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
-        })
+    public_model.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
+    })
 }
 
 fn looks_like_windows_absolute_path(value: &str) -> bool {
@@ -1037,11 +1035,9 @@ mod tests {
                 "diagnostic_labels": ["openai_compatible", "line\nlabel"]
             })
         );
-        assert!(
-            report["candidates"][0]["endpoint_capabilities"]
-                .get("raw_secret")
-                .is_none()
-        );
+        assert!(report["candidates"][0]["endpoint_capabilities"]
+            .get("raw_secret")
+            .is_none());
         assert!(!rendered_json.contains("SHOULD_NOT_RENDER"));
 
         let rendered_table =

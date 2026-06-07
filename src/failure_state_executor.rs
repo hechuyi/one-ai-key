@@ -1,3 +1,5 @@
+use std::sync::{atomic::AtomicU64, Arc, Mutex};
+
 use crate::{
     credentials::CredentialId,
     events::{RoutingTelemetry, RoutingTelemetryBuffer},
@@ -236,6 +238,7 @@ fn enqueue_automatic_lifecycle_persistence(
         );
         record_routing_telemetry(
             &state.routing_telemetry,
+            &state.routing_telemetry_lock_contention_drops,
             RoutingTelemetry::CredentialLifecyclePersistenceDropped {
                 request_id: request_id.to_string(),
                 channel_id: channel_id.0.clone(),
@@ -249,12 +252,15 @@ fn enqueue_automatic_lifecycle_persistence(
 }
 
 fn record_routing_telemetry(
-    telemetry: &std::sync::Arc<std::sync::Mutex<RoutingTelemetryBuffer>>,
+    telemetry: &Arc<Mutex<RoutingTelemetryBuffer>>,
+    lock_contention_drops: &Arc<AtomicU64>,
     event: RoutingTelemetry,
 ) {
-    if let Ok(mut telemetry) = telemetry.try_lock() {
-        telemetry.push(event);
-    }
+    crate::failure_observer::record_routing_telemetry_to_buffer(
+        telemetry,
+        lock_contention_drops,
+        event,
+    );
 }
 
 fn reason_text(reason: FailureReason) -> &'static str {
@@ -282,5 +288,52 @@ fn reason_code(reason: FailureReason) -> &'static str {
         FailureReason::KeySwitchCooldown => "key_switch_cooldown",
         FailureReason::ClientOrModelError => "client_or_model_error",
         FailureReason::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn record_routing_telemetry_accounts_contended_external_drop_without_blocking() {
+        let telemetry = Arc::new(Mutex::new(RoutingTelemetryBuffer::new(2)));
+        let external_dropped = Arc::new(AtomicU64::new(0));
+        let guard = telemetry.lock().expect("routing telemetry mutex poisoned");
+        let recorder_telemetry = telemetry.clone();
+        let recorder_external_dropped = external_dropped.clone();
+        let (recorded_tx, recorded_rx) = std::sync::mpsc::channel();
+        let recorder = std::thread::spawn(move || {
+            record_routing_telemetry(
+                &recorder_telemetry,
+                &recorder_external_dropped,
+                route_selected_event("req-contended"),
+            );
+            recorded_tx.send(()).unwrap();
+        });
+
+        assert!(
+            recorded_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_ok(),
+            "recording should not wait for a contended routing telemetry mutex"
+        );
+        drop(guard);
+        recorder.join().unwrap();
+
+        let telemetry = telemetry.lock().expect("routing telemetry mutex poisoned");
+        assert_eq!(telemetry.len(), 0);
+        assert_eq!(telemetry.dropped_events(), 0);
+        assert_eq!(external_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(telemetry.snapshot(), Vec::new());
+    }
+
+    fn route_selected_event(request_id: &str) -> RoutingTelemetry {
+        RoutingTelemetry::RouteSelected {
+            request_id: request_id.to_string(),
+            registry_generation: 1,
+            channel_id: "channel-a".to_string(),
+        }
     }
 }

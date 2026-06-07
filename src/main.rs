@@ -1091,6 +1091,7 @@ mod tests {
     };
 
     static TEMP_KEYS_COUNTER: AtomicU64 = AtomicU64::new(1);
+    static TEST_TRANSITION_SNAPSHOT_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[test]
     fn cli_legacy_config_invocation_selects_server_mode() {
@@ -3566,6 +3567,25 @@ pools:
                 "forward hot path must consume frozen route state instead of re-reading channel registry"
             );
         }
+    }
+
+    #[test]
+    fn same_target_retry_path_rechecks_route_state_before_forwarding() {
+        let source = production_source("src/proxy.rs");
+        let function_start = source
+            .find("async fn forward_with_pool")
+            .expect("forward_with_pool exists");
+        let function_end = source[function_start..]
+            .find("\nfn route_state_unavailable_response")
+            .map(|offset| function_start + offset)
+            .unwrap_or(source.len());
+        let body = &source[function_start..function_end];
+
+        assert!(body.contains("RetryAttemptContinuation::RetrySameTarget"));
+        assert!(
+            !body.contains("bypass_route_state_for_same_target_retry"),
+            "same-target retry must re-check disabled, configured-disabled, cooldown, and credential availability before forwarding"
+        );
     }
 
     #[test]
@@ -7901,7 +7921,10 @@ pools:
             cooldown: None,
             retry_after_source: None,
             confidence: FailureConfidence::High,
-            upstream_status: Some(429),
+            upstream_status: Some(match kind {
+                FailureKind::ProviderUnavailable => 502,
+                _ => 429,
+            }),
             upstream_code: Some("phase2_unavailable".to_string()),
             upstream_limit_type: None,
             classifier_id: "phase2-classifier".to_string(),
@@ -7954,8 +7977,14 @@ pools:
     #[test]
     fn phase2_stop_card_retry_decision_reasons_cover_current_retry_gates() {
         let next = CredentialId("phase2-next-credential".to_string());
-        let retryable_credential =
+        let mut retryable_credential =
             phase2_stop_card_failure(FailureKind::RateLimited, FailureScope::Credential, true);
+        retryable_credential.adaptation_rule_id = Some("phase2-explicit-retry".to_string());
+        let transient_channel = phase2_stop_card_failure(
+            FailureKind::ProviderUnavailable,
+            FailureScope::Channel,
+            true,
+        );
         let retry_enabled = phase2_stop_card_policy(true, 1, true);
 
         assert_phase2_stop_card_reason(
@@ -7999,35 +8028,19 @@ pools:
         attempt_limit_without_route_target.route_target_available = false;
         assert_phase2_stop_card_reason(
             &attempt_limit_without_route_target,
-            retryable_credential.clone(),
+            transient_channel,
             retry_enabled,
             RetryDecisionReason::AttemptLimitReached,
         );
-        let mut policy_disabled_without_route_target =
-            phase2_stop_card_snapshot(vec![next.clone()], true, false, 0, None);
-        policy_disabled_without_route_target.route_target_available = false;
-        assert_phase2_stop_card_reason(
-            &policy_disabled_without_route_target,
-            retryable_credential.clone(),
-            phase2_stop_card_policy(false, 1, true),
-            RetryDecisionReason::PolicyDisabled,
+        let mut channel_cooldown_failure = phase2_stop_card_failure(
+            FailureKind::ProviderUnavailable,
+            FailureScope::Channel,
+            true,
         );
-        let mut no_frozen_candidate_without_route_target =
-            phase2_stop_card_snapshot(Vec::new(), true, false, 0, None);
-        no_frozen_candidate_without_route_target.route_target_available = false;
-        assert_phase2_stop_card_reason(
-            &no_frozen_candidate_without_route_target,
-            retryable_credential,
-            retry_enabled,
-            RetryDecisionReason::NoFrozenCandidate,
-        );
+        channel_cooldown_failure.cooldown = Some(Duration::from_secs(1));
         assert_phase2_stop_card_reason(
             &phase2_stop_card_snapshot(Vec::new(), true, false, 0, Some(0)),
-            phase2_stop_card_failure(
-                FailureKind::ProviderUnavailable,
-                FailureScope::Channel,
-                true,
-            ),
+            channel_cooldown_failure.clone(),
             phase2_stop_card_policy(true, 1, false),
             RetryDecisionReason::RouteTargetRetryDisabled,
         );
@@ -8036,18 +8049,14 @@ pools:
         no_route_candidate_snapshot.route_target_available = false;
         assert_phase2_stop_card_reason(
             &no_route_candidate_snapshot,
-            phase2_stop_card_failure(
-                FailureKind::ProviderUnavailable,
-                FailureScope::Channel,
-                true,
-            ),
+            channel_cooldown_failure,
             retry_enabled,
             RetryDecisionReason::NoRouteCandidate,
         );
     }
 
     #[test]
-    fn phase2_stop_card_route_target_retry_uses_explicit_retry_route_target_directive() {
+    fn phase2_stop_card_transient_channel_failure_uses_route_target_before_same_target_retry() {
         let snapshot = phase2_stop_card_snapshot(Vec::new(), true, false, 0, Some(0));
 
         assert_eq!(
@@ -8065,8 +8074,9 @@ pools:
     }
 
     #[test]
-    fn phase2_stop_card_non_2xx_route_fallback_records_duplicate_charge_risk() {
-        let snapshot = phase2_stop_card_snapshot(Vec::new(), true, false, 0, Some(0));
+    fn phase2_stop_card_non_2xx_same_target_retry_records_duplicate_charge_risk() {
+        let mut snapshot = phase2_stop_card_snapshot(Vec::new(), true, false, 0, Some(0));
+        snapshot.route_target_available = false;
         let result = crate::routing::transition_after_failure(TransitionInput {
             snapshot: &snapshot,
             failure: phase2_stop_card_failure(
@@ -8080,7 +8090,7 @@ pools:
             policy: phase2_stop_card_policy(false, 0, true),
         });
 
-        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
+        assert_eq!(result.retry, RetryDirective::RetrySameTarget);
         assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
     }
 
@@ -8211,6 +8221,7 @@ pools:
         .resolve()
         .unwrap();
 
+        let _snapshot_guard = TEST_TRANSITION_SNAPSHOT_LOCK.lock().await;
         crate::routing::clear_test_transition_snapshots();
         let response = app(AppState::new(config).unwrap())
             .oneshot(
@@ -8233,12 +8244,20 @@ pools:
             .iter()
             .find(|snapshot| snapshot.channel_id == ChannelId("deadline_primary".to_string()))
             .expect("primary route target failure transition snapshot");
-        let second = snapshots
+        let primary_snapshots = snapshots
             .iter()
-            .find(|snapshot| snapshot.channel_id == ChannelId("deadline_fallback".to_string()))
-            .expect("fallback route target failure transition snapshot");
+            .filter(|snapshot| snapshot.channel_id == ChannelId("deadline_primary".to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(primary_snapshots.len(), 1);
+        let fallback_snapshots = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.channel_id == ChannelId("deadline_fallback".to_string()))
+            .collect::<Vec<_>>();
+        assert!(!fallback_snapshots.is_empty());
+        let fallback_first = fallback_snapshots[0];
 
-        assert_eq!(first.effective_deadline, second.effective_deadline);
+        assert_eq!(first.effective_deadline, fallback_first.effective_deadline);
+        assert_eq!(fallback_first.attempt, 0);
     }
 
     async fn spawn_upstream(router: Router) -> String {
@@ -11346,8 +11365,9 @@ pools:
             .iter()
             .any(|code| code == "rate_limit_cooldown"));
         assert_eq!(value["expire_codes"][0], "invalid_api_key");
-        assert_eq!(value["switch_statuses"][0], "429");
-        assert_eq!(value["switch_statuses"][1], "5xx");
+        assert_eq!(value["switch_statuses"][0], "502");
+        assert_eq!(value["switch_statuses"][1], "503");
+        assert_eq!(value["switch_statuses"][2], "504");
         assert_eq!(value["expire_statuses"][0], "401");
         assert_eq!(value["expire_statuses"][1], "403");
         assert_eq!(value["adaptation_rules"][0]["id"], "relay-cooldown");
@@ -24143,6 +24163,55 @@ pools:
     }
 
     #[tokio::test]
+    async fn routing_telemetry_runtime_reload_shrink_updates_management_capacity() {
+        let mut document =
+            test_config_with_api_base("https://example.com/v1").into_registry_document();
+        document.routing = crate::config::RoutingConfig {
+            max_route_candidates: None,
+            max_model_catalog_channels: None,
+            telemetry_buffer_capacity: Some(3),
+        };
+        let state = AppState::new(document.resolve().unwrap()).unwrap();
+        {
+            let mut telemetry = state
+                .routing_telemetry
+                .lock()
+                .expect("routing telemetry mutex poisoned");
+            for request_id in ["req_1", "req_2", "req_3"] {
+                telemetry.push(RoutingTelemetry::RouteSelected {
+                    request_id: request_id.to_string(),
+                    registry_generation: 2,
+                    channel_id: "test".to_string(),
+                });
+            }
+        }
+
+        let mut reloaded_document =
+            test_config_with_api_base("https://example.com/v1").into_registry_document();
+        reloaded_document.routing = crate::config::RoutingConfig {
+            max_route_candidates: None,
+            max_model_catalog_channels: None,
+            telemetry_buffer_capacity: Some(1),
+        };
+        state
+            .rebuild_runtime_from_resolved_config(reloaded_document.resolve().unwrap(), Some(2))
+            .unwrap();
+
+        let routing =
+            management_response_json(&app(state.clone()), "/management/routing-telemetry").await;
+        assert_eq!(routing["buffered_events"], 1);
+        assert_eq!(routing["capacity"], 1);
+        assert_eq!(routing["dropped_events"], 2);
+        assert_eq!(routing["events"][0]["request_id"], "req_3");
+
+        let runtime = management_response_json(&app(state), "/management/runtime").await;
+        assert_eq!(runtime["routing_telemetry_capacity"], 1);
+        assert_eq!(runtime["routing_telemetry_events"], 1);
+        assert_eq!(runtime["routing_telemetry_dropped_events"], 2);
+        assert_eq!(runtime["recent_retry_counters"]["window_capacity"], 1);
+    }
+
+    #[tokio::test]
     async fn management_routing_telemetry_preserves_retry_decision_fields_without_secret_material()
     {
         let state = test_state();
@@ -28311,7 +28380,7 @@ model_routes:
     }
 
     #[tokio::test]
-    async fn openai_compatible_replayable_request_falls_back_to_next_model_route_target() {
+    async fn openai_compatible_replayable_request_uses_route_fallback_before_same_target_retry() {
         let primary_hits = Arc::new(Mutex::new(0usize));
         let primary_hits_for_handler = primary_hits.clone();
         let primary = Router::new().route(
@@ -28333,16 +28402,22 @@ model_routes:
             }),
         );
         let primary_base = spawn_upstream(primary).await;
+        let fallback_hits = Arc::new(Mutex::new(0usize));
+        let fallback_hits_for_handler = fallback_hits.clone();
         let fallback = Router::new().route(
             "/v1/chat/completions",
-            post(|| async {
-                Json(serde_json::json!({
-                    "id": "fixture",
-                    "object": "chat.completion",
-                    "choices": [
-                        {"message": {"role": "assistant", "content": "fallback-ok"}}
-                    ]
-                }))
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    *fallback_hits.lock().await += 1;
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "fallback-ok"}}
+                        ]
+                    }))
+                }
             }),
         );
         let fallback_base = spawn_upstream(fallback).await;
@@ -28440,13 +28515,9 @@ model_routes:
             .unwrap();
 
         assert_eq!(*primary_hits.lock().await, 1);
+        assert_eq!(*fallback_hits.lock().await, 1);
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let value: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            value["choices"][0]["message"]["content"].as_str(),
-            Some("fallback-ok")
-        );
+        let _body = to_bytes(response.into_body(), 4096).await.unwrap();
 
         let response = app(state)
             .oneshot(
@@ -28464,7 +28535,7 @@ model_routes:
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(*primary_hits.lock().await, 1);
+        assert_eq!(*fallback_hits.lock().await, 2);
     }
 
     #[tokio::test]
@@ -28740,6 +28811,7 @@ model_routes:
                 .unwrap();
         }
 
+        let _snapshot_guard = TEST_TRANSITION_SNAPSHOT_LOCK.lock().await;
         crate::routing::clear_test_transition_snapshots();
         let response = app(state)
             .oneshot(
@@ -30413,16 +30485,20 @@ model_routes:
 
     #[tokio::test]
     async fn channel_failure_transition_does_not_override_manual_disabled_state() {
+        let upstream_hits = Arc::new(AtomicU64::new(0));
         let (upstream_hit_tx, upstream_hit_rx) = oneshot::channel::<()>();
         let upstream_hit_tx = Arc::new(Mutex::new(Some(upstream_hit_tx)));
         let (release_tx, release_rx) = oneshot::channel::<()>();
         let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let upstream_hits_for_handler = upstream_hits.clone();
         let upstream = Router::new().route(
             "/v1/chat/completions",
             post(move || {
+                let upstream_hits = upstream_hits_for_handler.clone();
                 let upstream_hit_tx = upstream_hit_tx.clone();
                 let release_rx = release_rx.clone();
                 async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
                     if let Some(tx) = upstream_hit_tx.lock().await.take() {
                         let _ = tx.send(());
                     }
@@ -30463,7 +30539,11 @@ model_routes:
         let _ = release_tx.send(());
         let response = request_task.await.unwrap();
 
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "channel_disabled");
         assert_eq!(
             *state.channels.get("test").unwrap().health.lock().unwrap(),
             ChannelHealth::Disabled {
@@ -31242,6 +31322,7 @@ model_routes:
 
         let app_state = AppState::new(state).unwrap();
 
+        let _snapshot_guard = TEST_TRANSITION_SNAPSHOT_LOCK.lock().await;
         crate::routing::clear_test_transition_snapshots();
         let response = app(app_state.clone())
             .oneshot(
@@ -31982,7 +32063,7 @@ model_routes:
     }
 
     #[tokio::test]
-    async fn openai_compatible_429_exhausts_credentials_then_falls_back_to_next_route_target() {
+    async fn openai_compatible_429_returns_current_error_without_route_target_fallback() {
         let primary_authorizations = Arc::new(Mutex::new(Vec::<String>::new()));
         let primary_authorizations_for_handler = primary_authorizations.clone();
         let primary = Router::new().route(
@@ -31999,10 +32080,7 @@ model_routes:
                     (
                         StatusCode::TOO_MANY_REQUESTS,
                         Json(serde_json::json!({
-                            "error": {
-                                "code": "rate_limit_exceeded",
-                                "message": "slow down"
-                            }
+                            "message": "slow down"
                         })),
                     )
                 }
@@ -32135,23 +32213,14 @@ model_routes:
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let value: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            value["choices"][0]["message"]["content"].as_str(),
-            Some("fallback-ok")
-        );
-        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let _body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
 
         let primary_authorizations = primary_authorizations.lock().await.clone();
         assert_eq!(
             primary_authorizations,
-            vec![
-                "Bearer phase3b-primary-key-1".to_string(),
-                "Bearer phase3b-primary-key-2".to_string(),
-                "Bearer phase3b-primary-key-3".to_string(),
-            ]
+            vec!["Bearer phase3b-primary-key-1".to_string()]
         );
 
         let telemetry = state
@@ -32170,13 +32239,13 @@ model_routes:
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(primary_failures.len(), 3);
-        assert_eq!(primary_failures[0].directive, "retry_credential");
-        assert_eq!(primary_failures[1].directive, "retry_credential");
-        assert_eq!(primary_failures[2].directive, "retry_route_target");
-        assert!(primary_failures
-            .iter()
-            .all(|failure| failure.duplicate_charge_risk == "unknown"));
+        assert_eq!(primary_failures.len(), 1);
+        assert_eq!(primary_failures[0].directive, "return_error");
+        assert_eq!(
+            primary_failures[0].denial_reason.as_deref(),
+            Some("failure_not_retryable")
+        );
+        assert_eq!(primary_failures[0].duplicate_charge_risk, "none");
 
         let telemetry_json = serde_json::to_string(&telemetry).unwrap();
         assert!(!telemetry_json.contains("phase3b-primary-key"));
@@ -32184,8 +32253,7 @@ model_routes:
     }
 
     #[tokio::test]
-    async fn openai_compatible_429_falls_back_to_next_route_target_with_same_request_retry_disabled(
-    ) {
+    async fn openai_compatible_429_does_not_route_fallback_with_same_request_retry_disabled() {
         let primary_authorizations = Arc::new(Mutex::new(Vec::<String>::new()));
         let primary_authorizations_for_handler = primary_authorizations.clone();
         let primary = Router::new().route(
@@ -32319,14 +32387,9 @@ model_routes:
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let value: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            value["choices"][0]["message"]["content"].as_str(),
-            Some("fallback-ok")
-        );
-        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let _body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
         assert_eq!(
             primary_authorizations.lock().await.as_slice(),
             ["Bearer phase3b-single-primary-key"]
@@ -32348,8 +32411,12 @@ model_routes:
                 _ => None,
             })
             .expect("primary failure telemetry");
-        assert_eq!(primary_failure.directive, "retry_route_target");
-        assert_eq!(primary_failure.duplicate_charge_risk, "unknown");
+        assert_eq!(primary_failure.directive, "return_error");
+        assert_eq!(
+            primary_failure.denial_reason.as_deref(),
+            Some("policy_disabled")
+        );
+        assert_eq!(primary_failure.duplicate_charge_risk, "none");
 
         let telemetry_json = serde_json::to_string(&telemetry).unwrap();
         assert!(!telemetry_json.contains("phase3b-single-primary-key"));
@@ -32510,7 +32577,7 @@ model_routes:
     }
 
     #[tokio::test]
-    async fn response_filter_precommit_rejection_expires_credential_and_retries_clean_key() {
+    async fn response_filter_precommit_rejection_expires_credential_and_returns_error() {
         let hits = Arc::new(AtomicU64::new(0));
         let hits_for_handler = hits.clone();
         let upstream = Router::new().route(
@@ -32590,13 +32657,14 @@ model_routes:
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["choices"][0]["message"]["content"], "clean-response");
+        assert_eq!(value["error"]["code"], "response_filter_rejected");
         let body_text = String::from_utf8(body.to_vec()).unwrap();
         assert!(!body_text.contains("blocked-marker"));
+        assert!(!body_text.contains("clean-response"));
 
         let channel = state.channels.get("test").unwrap();
         let pool = channel.pool.lock().await;
@@ -32631,8 +32699,9 @@ model_routes:
             "response_filter_rejected"
         );
         assert_eq!(failure["failure"]["failure_scope"], "credential");
-        assert_eq!(failure["failure"]["directive"], "retry_credential");
-        assert_eq!(failure["failure"]["duplicate_charge_risk"], "unknown");
+        assert_eq!(failure["failure"]["directive"], "return_error");
+        assert_eq!(failure["failure"]["denial_reason"], "failure_not_retryable");
+        assert_eq!(failure["failure"]["duplicate_charge_risk"], "none");
         let transition = events
             .iter()
             .find(|event| {
@@ -32646,16 +32715,22 @@ model_routes:
 
     #[tokio::test]
     async fn response_filter_precommit_rejection_cools_channel_without_forwarding_content() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_for_handler = hits.clone();
         let upstream = Router::new().route(
             "/v1/chat/completions",
-            post(|| async {
-                Json(serde_json::json!({
-                    "id": "fixture",
-                    "object": "chat.completion",
-                    "choices": [
-                        {"message": {"role": "assistant", "content": "blocked-marker"}}
-                    ]
-                }))
+            post(move || {
+                let hits = hits_for_handler.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "blocked-marker"}}
+                        ]
+                    }))
+                }
             }),
         );
         let api_base = spawn_upstream(upstream).await;
@@ -32693,6 +32768,7 @@ model_routes:
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"]["code"], "response_filter_rejected");
@@ -32717,6 +32793,19 @@ model_routes:
 
         let telemetry =
             management_response_json(&app(state.clone()), "/management/routing-telemetry").await;
+        let failure = telemetry["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event["kind"] == "upstream_failure_observed"
+                    && event["failure"]["failure_source"] == "response_filter_precommit"
+            })
+            .expect("response-filter precommit failure telemetry");
+        assert_eq!(failure["failure"]["failure_scope"], "channel");
+        assert_eq!(failure["failure"]["directive"], "return_error");
+        assert_eq!(failure["failure"]["denial_reason"], "failure_not_retryable");
+        assert_eq!(failure["failure"]["duplicate_charge_risk"], "none");
         let transition = telemetry["events"]
             .as_array()
             .unwrap()
@@ -32878,7 +32967,7 @@ model_routes:
     }
 
     #[tokio::test]
-    async fn response_filter_precommit_channel_cooldown_falls_back_to_clean_route_target() {
+    async fn response_filter_precommit_channel_cooldown_returns_error_without_route_fallback() {
         let primary = Router::new().route(
             "/v1/chat/completions",
             post(|| async {
@@ -32891,16 +32980,22 @@ model_routes:
                 }))
             }),
         );
+        let fallback_hits = Arc::new(AtomicU64::new(0));
+        let fallback_hits_for_handler = fallback_hits.clone();
         let fallback = Router::new().route(
             "/v1/chat/completions",
-            post(|| async {
-                Json(serde_json::json!({
-                    "id": "fixture",
-                    "object": "chat.completion",
-                    "choices": [
-                        {"message": {"role": "assistant", "content": "clean-response"}}
-                    ]
-                }))
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "clean-response"}}
+                        ]
+                    }))
+                }
             }),
         );
         let primary_base = spawn_upstream(primary).await;
@@ -33000,10 +33095,9 @@ model_routes:
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let value: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["choices"][0]["message"]["content"], "clean-response");
         let body_text = String::from_utf8(body.to_vec()).unwrap();
         assert!(!body_text.contains("blocked-marker"));
 
@@ -33025,11 +33119,13 @@ model_routes:
             })
             .expect("response-filter precommit failure telemetry");
         assert_eq!(failure["failure"]["failure_scope"], "channel");
-        assert_eq!(failure["failure"]["directive"], "retry_route_target");
+        assert_eq!(failure["failure"]["directive"], "return_error");
+        assert_eq!(failure["failure"]["denial_reason"], "failure_not_retryable");
+        assert_eq!(failure["failure"]["duplicate_charge_risk"], "none");
     }
 
     #[tokio::test]
-    async fn guarded_success_json_error_route_target_fallback_records_unknown_risk() {
+    async fn guarded_success_json_error_returns_error_without_route_fallback() {
         let fallback_hits = Arc::new(AtomicU64::new(0));
         let fallback_hits_for_handler = fallback_hits.clone();
         let primary = Router::new().route(
@@ -33163,11 +33259,11 @@ model_routes:
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["choices"][0]["message"]["content"], "fallback-ok");
+        assert_eq!(value["error"]["code"], "guarded_success_envelope");
 
         let telemetry =
             management_response_json(&app(state), "/management/routing-telemetry").await;
@@ -33180,10 +33276,12 @@ model_routes:
                     && event["failure"]["failure_source"] == "guarded_success_envelope"
             })
             .expect("guarded success failure telemetry event");
+        assert_eq!(guarded_failure["failure"]["directive"], "return_error");
         assert_eq!(
-            guarded_failure["failure"]["duplicate_charge_risk"],
-            "unknown"
+            guarded_failure["failure"]["denial_reason"],
+            "failure_not_retryable"
         );
+        assert_eq!(guarded_failure["failure"]["duplicate_charge_risk"], "none");
     }
 
     #[tokio::test]

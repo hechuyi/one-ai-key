@@ -62,6 +62,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub events: EventLog,
     pub routing_telemetry: Arc<StdMutex<RoutingTelemetryBuffer>>,
+    pub routing_telemetry_lock_contention_drops: Arc<AtomicU64>,
+    pub response_filter_event_lock_contention_drops: Arc<AtomicU64>,
     pub lifecycle_persistence: LifecyclePersistenceQueue,
 }
 
@@ -670,6 +672,8 @@ impl AppState {
             routing_telemetry: Arc::new(StdMutex::new(RoutingTelemetryBuffer::new(
                 config.routing.telemetry_buffer_capacity,
             ))),
+            routing_telemetry_lock_contention_drops: Arc::new(AtomicU64::new(0)),
+            response_filter_event_lock_contention_drops: Arc::new(AtomicU64::new(0)),
             lifecycle_persistence,
         })
     }
@@ -761,6 +765,10 @@ impl AppState {
             .lock()
             .expect("response filter events lock poisoned")
             .replace_capacity(config.response_filter_event_window_capacity);
+        self.routing_telemetry
+            .lock()
+            .expect("routing telemetry lock poisoned")
+            .replace_capacity(config.routing.telemetry_buffer_capacity);
         *self
             .response_filter_alert_window
             .write()
@@ -2157,6 +2165,56 @@ mod tests {
                 .expect("response filter alert window lock poisoned"),
             Duration::from_secs(23)
         );
+    }
+
+    #[test]
+    fn runtime_reload_updates_routing_telemetry_capacity_and_dropped_count() {
+        let keys_file = temp_path("key-pool-router-routing-telemetry-reload-keys");
+        fs::write(&keys_file, "k1\n").unwrap();
+        let mut document = single_pool_config(keys_file.clone(), None).into_registry_document();
+        document.routing = crate::config::RoutingConfig {
+            max_route_candidates: None,
+            max_model_catalog_channels: None,
+            telemetry_buffer_capacity: Some(3),
+        };
+        let state = AppState::new(document.resolve().unwrap()).unwrap();
+        {
+            let mut telemetry = state
+                .routing_telemetry
+                .lock()
+                .expect("routing telemetry lock poisoned");
+            for request_id in ["request-one", "request-two", "request-three"] {
+                telemetry.push(crate::events::RoutingTelemetry::RouteSelected {
+                    request_id: request_id.to_string(),
+                    registry_generation: 2,
+                    channel_id: "test".to_string(),
+                });
+            }
+        }
+
+        let mut reloaded_document = single_pool_config(keys_file, None).into_registry_document();
+        reloaded_document.routing = crate::config::RoutingConfig {
+            max_route_candidates: None,
+            max_model_catalog_channels: None,
+            telemetry_buffer_capacity: Some(1),
+        };
+        state
+            .rebuild_runtime_from_resolved_config(reloaded_document.resolve().unwrap(), Some(2))
+            .unwrap();
+
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry lock poisoned");
+        assert_eq!(telemetry.capacity(), 1);
+        assert_eq!(telemetry.dropped_events(), 2);
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert!(matches!(
+            &snapshot[0],
+            crate::events::RoutingTelemetry::RouteSelected { request_id, .. }
+                if request_id == "request-three"
+        ));
     }
 
     #[test]

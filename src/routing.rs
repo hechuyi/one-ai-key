@@ -136,6 +136,8 @@ pub enum RetryDecisionReason {
     NoRouteCandidate,
 }
 
+pub const CONSERVATIVE_RETRY_BUDGET: Duration = Duration::from_millis(1500);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureReason {
     UpstreamAuthInvalid,
@@ -361,12 +363,9 @@ pub fn transition_after_failure(input: TransitionInput<'_>) -> TransitionResult 
         .map(|deadline| deadline.saturating_duration_since(input.now));
     let effective_deadline_remaining_ms = effective_deadline_remaining
         .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64);
-    let effective_deadline_exhausted = effective_deadline_remaining.is_some_and(|remaining| {
-        remaining.is_zero()
-            || input
-                .next_attempt_budget
-                .is_some_and(|budget| remaining < budget)
-    });
+    let next_attempt_budget = conservative_next_attempt_budget(input.next_attempt_budget);
+    let effective_deadline_exhausted = effective_deadline_remaining
+        .is_some_and(|remaining| remaining.is_zero() || remaining < next_attempt_budget);
     let retry = if rejects_source_gated_channel_balance(&input) || !input.failure.retryable {
         RetryDirective::ReturnCurrentError {
             reason: RetryDecisionReason::FailureNotRetryable,
@@ -391,32 +390,40 @@ pub fn transition_after_failure(input: TransitionInput<'_>) -> TransitionResult 
         RetryDirective::ReturnCurrentError {
             reason: RetryDecisionReason::FailureNotRetryable,
         }
+    } else if !conservative_retry_evidence_allowed(&input) {
+        RetryDirective::ReturnCurrentError {
+            reason: RetryDecisionReason::FailureNotRetryable,
+        }
     } else if matches!(input.failure.primary_scope, FailureScope::Channel) {
-        if input.policy.route_target_retry_enabled && input.snapshot.route_target_available {
-            RetryDirective::RetryRouteTarget
-        } else if same_target_transient_retry_allowed(&input) {
-            RetryDirective::RetrySameTarget
-        } else if !input.policy.route_target_retry_enabled {
+        if !input.policy.route_target_retry_enabled {
             RetryDirective::ReturnCurrentError {
                 reason: RetryDecisionReason::RouteTargetRetryDisabled,
             }
+        } else if input.snapshot.route_target_available {
+            RetryDirective::RetryRouteTarget
+        } else if input.snapshot.attempt >= 1 {
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::AttemptLimitReached,
+            }
+        } else if same_target_transient_retry_allowed(&input) {
+            RetryDirective::RetrySameTarget
         } else {
             RetryDirective::ReturnCurrentError {
                 reason: RetryDecisionReason::NoRouteCandidate,
             }
         }
-    } else if input.snapshot.attempt >= input.policy.max_same_request_retries {
-        if credential_retry_exhausted_route_fallback_allowed(&input) {
-            RetryDirective::RetryRouteTarget
-        } else {
-            RetryDirective::ReturnCurrentError {
-                reason: RetryDecisionReason::AttemptLimitReached,
-            }
-        }
-    } else if !input.policy.retry_switched_key_in_same_request {
-        credential_retry_exhausted_directive(&input, RetryDecisionReason::PolicyDisabled)
     } else if matches!(input.failure.primary_scope, FailureScope::Credential) {
-        if let Some(credential_id) = input.snapshot.retry_candidates.first() {
+        if !input.policy.retry_switched_key_in_same_request {
+            credential_retry_exhausted_directive(&input, RetryDecisionReason::PolicyDisabled)
+        } else if input.snapshot.attempt >= input.policy.max_same_request_retries {
+            if credential_retry_exhausted_route_fallback_allowed(&input) {
+                RetryDirective::RetryRouteTarget
+            } else {
+                RetryDirective::ReturnCurrentError {
+                    reason: RetryDecisionReason::AttemptLimitReached,
+                }
+            }
+        } else if let Some(credential_id) = input.snapshot.retry_candidates.first() {
             if credential_id == &input.snapshot.credential_id {
                 credential_retry_exhausted_directive(&input, RetryDecisionReason::NoFrozenCandidate)
             } else {
@@ -455,9 +462,8 @@ fn credential_retry_exhausted_directive(
 }
 
 fn credential_retry_exhausted_route_fallback_allowed(input: &TransitionInput<'_>) -> bool {
-    matches!(input.failure.primary_scope, FailureScope::Credential)
-        && input.policy.route_target_retry_enabled
-        && input.snapshot.route_target_available
+    let _ = input;
+    false
 }
 
 fn duplicate_charge_risk(
@@ -467,15 +473,14 @@ fn duplicate_charge_risk(
     match (failure_source, retry) {
         (_, RetryDirective::ReturnCurrentError { .. }) => DuplicateChargeRisk::None,
         (FailureSource::UpstreamTransaction, _) => DuplicateChargeRisk::Unknown,
-        (FailureSource::LocalTransport, _) => DuplicateChargeRisk::None,
+        (FailureSource::LocalTransport, _) => DuplicateChargeRisk::Unknown,
         (FailureSource::GuardedSuccessEnvelope, _) => DuplicateChargeRisk::Unknown,
         (FailureSource::ResponseFilterPrecommit, _) => DuplicateChargeRisk::Unknown,
     }
 }
 
 fn same_target_transient_retry_allowed(input: &TransitionInput<'_>) -> bool {
-    input.policy.route_target_retry_enabled
-        && input.snapshot.attempt == 0
+    input.snapshot.attempt == 0
         && input.failure.cooldown.is_none()
         && matches!(
             (input.failure.kind, input.failure.primary_scope),
@@ -486,9 +491,60 @@ fn same_target_transient_retry_allowed(input: &TransitionInput<'_>) -> bool {
             FailureSource::UpstreamTransaction => input
                 .failure
                 .upstream_status
-                .is_some_and(|status| (500..=599).contains(&status)),
+                .is_some_and(|status| matches!(status, 502 | 503 | 504)),
             FailureSource::GuardedSuccessEnvelope | FailureSource::ResponseFilterPrecommit => false,
         }
+}
+
+fn conservative_next_attempt_budget(configured: Option<Duration>) -> Duration {
+    let _ = configured;
+    CONSERVATIVE_RETRY_BUDGET
+}
+
+fn conservative_retry_evidence_allowed(input: &TransitionInput<'_>) -> bool {
+    if !endpoint_retry_eligible(input.snapshot.endpoint) {
+        return false;
+    }
+    match input.failure_source {
+        FailureSource::LocalTransport => matches!(
+            (input.failure.kind, input.failure.primary_scope),
+            (FailureKind::ProviderUnavailable, FailureScope::Channel)
+        ),
+        FailureSource::UpstreamTransaction => {
+            if matches!(
+                (input.failure.kind, input.failure.primary_scope),
+                (FailureKind::ProviderUnavailable, FailureScope::Channel)
+            ) {
+                return input
+                    .failure
+                    .upstream_status
+                    .is_some_and(|status| matches!(status, 502 | 503 | 504));
+            }
+            credential_retry_evidence_allowed(&input.failure)
+        }
+        FailureSource::GuardedSuccessEnvelope | FailureSource::ResponseFilterPrecommit => false,
+    }
+}
+
+fn credential_retry_evidence_allowed(failure: &ClassifiedFailure) -> bool {
+    matches!(
+        (failure.kind, failure.primary_scope),
+        (FailureKind::RateLimited, FailureScope::Credential)
+            | (FailureKind::QuotaExhausted, FailureScope::Credential)
+    ) && (failure.upstream_code.is_some()
+        || failure.upstream_limit_type.is_some()
+        || failure.adaptation_rule_id.is_some()
+        || failure.retry_after_source.is_some())
+}
+
+fn endpoint_retry_eligible(endpoint: EndpointKind) -> bool {
+    matches!(
+        endpoint,
+        EndpointKind::Models
+            | EndpointKind::ChatCompletions
+            | EndpointKind::Responses
+            | EndpointKind::Embeddings
+    )
 }
 
 fn rejects_source_gated_channel_balance(input: &TransitionInput<'_>) -> bool {
@@ -542,10 +598,47 @@ mod tests {
         }
     }
 
+    fn adapted_retryable_rate_limit_failure() -> ClassifiedFailure {
+        ClassifiedFailure {
+            retryable: true,
+            upstream_status: Some(429),
+            adaptation_rule_id: Some("test-opt-in-429".to_string()),
+            ..failure(FailureKind::RateLimited, FailureScope::Credential)
+        }
+    }
+
+    fn adapted_retryable_quota_failure() -> ClassifiedFailure {
+        ClassifiedFailure {
+            retryable: true,
+            upstream_status: Some(400),
+            upstream_code: Some("insufficient_quota".to_string()),
+            adaptation_rule_id: Some("test-opt-in-quota".to_string()),
+            ..failure(FailureKind::QuotaExhausted, FailureScope::Credential)
+        }
+    }
+
+    fn adapted_retryable_client_failure() -> ClassifiedFailure {
+        ClassifiedFailure {
+            retryable: true,
+            upstream_status: Some(400),
+            upstream_code: Some("bad_request".to_string()),
+            adaptation_rule_id: Some("test-opt-in-client".to_string()),
+            ..failure(FailureKind::ClientError, FailureScope::RequestOnly)
+        }
+    }
+
     fn retryable_5xx_provider_failure() -> ClassifiedFailure {
         ClassifiedFailure {
             retryable: true,
             upstream_status: Some(502),
+            ..failure(FailureKind::ProviderUnavailable, FailureScope::Channel)
+        }
+    }
+
+    fn retryable_provider_failure_with_status(status: u16) -> ClassifiedFailure {
+        ClassifiedFailure {
+            retryable: true,
+            upstream_status: Some(status),
             ..failure(FailureKind::ProviderUnavailable, FailureScope::Channel)
         }
     }
@@ -1017,7 +1110,12 @@ mod tests {
                 reason: FailureReason::RelayBalanceUnavailable,
             }
         );
-        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::FailureNotRetryable
+            }
+        );
         assert_eq!(pool.snapshot().quota_exhausted_credentials, 0);
     }
 
@@ -1076,8 +1174,40 @@ mod tests {
                 reason: FailureReason::UpstreamProviderUnavailable,
             }
         );
-        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::FailureNotRetryable
+            }
+        );
         assert_eq!(pool.snapshot().expired_credentials, 0);
+    }
+
+    #[test]
+    fn retry_gate_bare_429_is_not_retryable_and_does_not_route_fallback() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.route_target_available = true;
+
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            ClassifiedFailure {
+                retryable: true,
+                upstream_status: Some(429),
+                ..failure(FailureKind::RateLimited, FailureScope::Credential)
+            },
+            std::time::Instant::now(),
+            retry_policy(),
+        ));
+
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::FailureNotRetryable,
+            }
+        );
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::None);
     }
 
     #[test]
@@ -1168,7 +1298,10 @@ mod tests {
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            ClassifiedFailure {
+                primary_scope: FailureScope::Credential,
+                ..retryable_5xx_provider_failure()
+            },
             std::time::Instant::now(),
             retry_policy(),
         ));
@@ -1193,7 +1326,7 @@ mod tests {
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            retryable_5xx_provider_failure(),
             std::time::Instant::now(),
             retry_policy(),
         ));
@@ -1218,7 +1351,7 @@ mod tests {
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            adapted_retryable_rate_limit_failure(),
             std::time::Instant::now(),
             retry_policy(),
         ));
@@ -1286,6 +1419,87 @@ mod tests {
     }
 
     #[test]
+    fn retry_gate_denies_when_effective_deadline_cannot_fit_conservative_budget() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let now = std::time::Instant::now();
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.route_target_available = false;
+        snapshot.effective_deadline = Some(now + std::time::Duration::from_millis(1499));
+
+        let result = transition_after_failure(TransitionInput {
+            snapshot: &snapshot,
+            failure: retryable_5xx_provider_failure(),
+            failure_source: FailureSource::UpstreamTransaction,
+            now,
+            next_attempt_budget: Some(std::time::Duration::from_secs(10)),
+            policy: policy(),
+        });
+
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::EffectiveDeadlineExhausted,
+            }
+        );
+        assert_eq!(result.effective_deadline_remaining_ms, Some(1499));
+    }
+
+    #[test]
+    fn retry_gate_denies_when_effective_deadline_cannot_fit_default_retry_timeout() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let now = std::time::Instant::now();
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.route_target_available = false;
+        snapshot.effective_deadline = Some(now + std::time::Duration::from_millis(1499));
+
+        let result = transition_after_failure(TransitionInput {
+            snapshot: &snapshot,
+            failure: retryable_5xx_provider_failure(),
+            failure_source: FailureSource::UpstreamTransaction,
+            now,
+            next_attempt_budget: None,
+            policy: policy(),
+        });
+
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::EffectiveDeadlineExhausted,
+            }
+        );
+        assert_eq!(result.effective_deadline_remaining_ms, Some(1499));
+    }
+
+    #[test]
+    fn retry_gate_denies_when_configured_budget_is_smaller_than_default_retry_timeout() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let now = std::time::Instant::now();
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.route_target_available = false;
+        snapshot.effective_deadline = Some(now + std::time::Duration::from_millis(1499));
+
+        let result = transition_after_failure(TransitionInput {
+            snapshot: &snapshot,
+            failure: retryable_5xx_provider_failure(),
+            failure_source: FailureSource::UpstreamTransaction,
+            now,
+            next_attempt_budget: Some(std::time::Duration::from_millis(50)),
+            policy: policy(),
+        });
+
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::EffectiveDeadlineExhausted,
+            }
+        );
+        assert_eq!(result.effective_deadline_remaining_ms, Some(1499));
+    }
+
+    #[test]
     fn retry_gate_denies_attempt_at_limit() {
         let mut pool = pool();
         let selected = pool.select().unwrap();
@@ -1298,7 +1512,7 @@ mod tests {
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            retryable_5xx_provider_failure(),
             std::time::Instant::now(),
             retry_policy(),
         ));
@@ -1312,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn phase3b_credential_attempt_limit_falls_back_to_route_target_when_available() {
+    fn phase3b_credential_attempt_limit_returns_error_even_when_route_target_available() {
         let mut pool = pool();
         let selected = pool.select().unwrap();
         let next = pool.retry_candidates_from_current(1)[0]
@@ -1324,17 +1538,22 @@ mod tests {
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            adapted_retryable_rate_limit_failure(),
             std::time::Instant::now(),
             retry_policy(),
         ));
 
-        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
-        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::AttemptLimitReached
+            }
+        );
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::None);
     }
 
     #[test]
-    fn phase3b_empty_frozen_credential_candidates_falls_back_to_route_target_when_available() {
+    fn phase3b_non_transient_credential_failure_returns_error_even_when_route_target_available() {
         let mut pool = pool();
         let selected = pool.select().unwrap();
         let mut snapshot = snapshot_for(&selected);
@@ -1342,17 +1561,22 @@ mod tests {
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            adapted_retryable_rate_limit_failure(),
             std::time::Instant::now(),
             retry_policy(),
         ));
 
-        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
-        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::NoFrozenCandidate
+            }
+        );
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::None);
     }
 
     #[test]
-    fn phase3b_same_request_retry_disabled_falls_back_to_route_target_when_available() {
+    fn phase3b_same_request_retry_disabled_returns_error_even_when_route_target_available() {
         let mut pool = pool();
         let selected = pool.select().unwrap();
         let mut snapshot = snapshot_for(&selected);
@@ -1360,17 +1584,22 @@ mod tests {
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            adapted_retryable_rate_limit_failure(),
             std::time::Instant::now(),
             policy(),
         ));
 
-        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
-        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::PolicyDisabled
+            }
+        );
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::None);
     }
 
     #[test]
-    fn phase3b_same_request_retry_disabled_with_positive_max_retries_falls_back_to_route_target() {
+    fn phase3b_same_request_retry_disabled_with_positive_max_retries_returns_error() {
         let mut pool = pool();
         let selected = pool.select().unwrap();
         let mut snapshot = snapshot_for(&selected);
@@ -1384,13 +1613,18 @@ mod tests {
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            adapted_retryable_rate_limit_failure(),
             std::time::Instant::now(),
             policy,
         ));
 
-        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
-        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::PolicyDisabled
+            }
+        );
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::None);
     }
 
     #[test]
@@ -1441,7 +1675,7 @@ mod tests {
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            adapted_retryable_rate_limit_failure(),
             std::time::Instant::now(),
             retry_policy(),
         ));
@@ -1452,18 +1686,41 @@ mod tests {
                 credential_id: next
             }
         );
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
     }
 
     #[test]
-    fn retry_gate_rejects_candidate_equal_to_failed_credential() {
+    fn retry_gate_allows_adapted_credential_retry_and_denies_client_errors() {
         let mut pool = pool();
         let selected = pool.select().unwrap();
-        let mut snapshot = retry_snapshot_for(&selected, selected.credential_id.clone());
-        snapshot.route_target_available = false;
+        let next = pool.retry_candidates_from_current(1)[0]
+            .credential_id
+            .clone();
+        let snapshot = retry_snapshot_for(&selected, next.clone());
+
+        for failure in [
+            adapted_retryable_rate_limit_failure(),
+            adapted_retryable_quota_failure(),
+        ] {
+            let result = transition_after_failure(upstream_input(
+                &snapshot,
+                failure,
+                std::time::Instant::now(),
+                retry_policy(),
+            ));
+
+            assert_eq!(
+                result.retry,
+                RetryDirective::RetryCredential {
+                    credential_id: next.clone()
+                }
+            );
+            assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
+        }
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            adapted_retryable_client_failure(),
             std::time::Instant::now(),
             retry_policy(),
         ));
@@ -1471,9 +1728,38 @@ mod tests {
         assert_eq!(
             result.retry,
             RetryDirective::ReturnCurrentError {
-                reason: RetryDecisionReason::NoFrozenCandidate
+                reason: RetryDecisionReason::FailureNotRetryable
             }
         );
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::None);
+    }
+
+    #[test]
+    fn retry_gate_denies_provider_unavailable_credential_5xx_as_non_transient() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let next = pool.retry_candidates_from_current(1)[0]
+            .credential_id
+            .clone();
+        let snapshot = retry_snapshot_for(&selected, next);
+
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            ClassifiedFailure {
+                primary_scope: FailureScope::Credential,
+                ..retryable_5xx_provider_failure()
+            },
+            std::time::Instant::now(),
+            retry_policy(),
+        ));
+
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::FailureNotRetryable
+            }
+        );
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::None);
     }
 
     #[test]
@@ -1486,7 +1772,7 @@ mod tests {
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::ProviderUnavailable, FailureScope::Channel),
+            retryable_5xx_provider_failure(),
             std::time::Instant::now(),
             policy,
         ));
@@ -1497,6 +1783,25 @@ mod tests {
                 reason: RetryDecisionReason::RouteTargetRetryDisabled,
             }
         );
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::None);
+    }
+
+    #[test]
+    fn channel_scoped_transient_failure_uses_route_target_before_same_target_retry() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.route_target_available = true;
+
+        let result = transition_after_failure(upstream_input(
+            &snapshot,
+            retryable_5xx_provider_failure(),
+            std::time::Instant::now(),
+            policy(),
+        ));
+
+        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
     }
 
     #[test]
@@ -1508,7 +1813,10 @@ mod tests {
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::ProviderUnavailable, FailureScope::Channel),
+            ClassifiedFailure {
+                cooldown: Some(std::time::Duration::from_secs(1)),
+                ..retryable_5xx_provider_failure()
+            },
             std::time::Instant::now(),
             policy(),
         ));
@@ -1540,6 +1848,52 @@ mod tests {
     }
 
     #[test]
+    fn transient_502_503_504_retry_same_target_evidence_is_allowed() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+
+        for status in [502, 503, 504] {
+            let mut snapshot = snapshot_for(&selected);
+            snapshot.route_target_available = false;
+
+            let result = transition_after_failure(upstream_input(
+                &snapshot,
+                retryable_provider_failure_with_status(status),
+                std::time::Instant::now(),
+                policy(),
+            ));
+
+            assert_eq!(result.retry, RetryDirective::RetrySameTarget);
+            assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
+        }
+    }
+
+    #[test]
+    fn transient_500_or_599_is_not_same_target_retry_evidence() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+
+        for status in [500, 599] {
+            let mut snapshot = snapshot_for(&selected);
+            snapshot.route_target_available = false;
+
+            let result = transition_after_failure(upstream_input(
+                &snapshot,
+                retryable_provider_failure_with_status(status),
+                std::time::Instant::now(),
+                policy(),
+            ));
+
+            assert_eq!(
+                result.retry,
+                RetryDirective::ReturnCurrentError {
+                    reason: RetryDecisionReason::FailureNotRetryable,
+                }
+            );
+        }
+    }
+
+    #[test]
     fn transient_same_target_retry_is_limited_to_one_attempt() {
         let mut pool = pool();
         let selected = pool.select().unwrap();
@@ -1557,7 +1911,7 @@ mod tests {
         assert_eq!(
             result.retry,
             RetryDirective::ReturnCurrentError {
-                reason: RetryDecisionReason::NoRouteCandidate,
+                reason: RetryDecisionReason::AttemptLimitReached,
             }
         );
     }
@@ -1612,33 +1966,35 @@ mod tests {
         assert_eq!(
             result.retry,
             RetryDirective::ReturnCurrentError {
-                reason: RetryDecisionReason::NoRouteCandidate,
+                reason: RetryDecisionReason::FailureNotRetryable,
             }
         );
     }
 
     #[test]
-    fn upstream_transaction_fallback_has_unknown_duplicate_charge_risk() {
+    fn upstream_transaction_same_target_retry_has_unknown_duplicate_charge_risk() {
         let mut pool = pool();
         let selected = pool.select().unwrap();
-        let snapshot = snapshot_for(&selected);
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.route_target_available = false;
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::ProviderUnavailable, FailureScope::Channel),
+            retryable_5xx_provider_failure(),
             std::time::Instant::now(),
             policy(),
         ));
 
-        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
+        assert_eq!(result.retry, RetryDirective::RetrySameTarget);
         assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
     }
 
     #[test]
-    fn local_transport_retry_has_no_duplicate_charge_risk_without_upstream_transaction_evidence() {
+    fn local_transport_retry_has_unknown_duplicate_charge_risk_without_subtype_evidence() {
         let mut pool = pool();
         let selected = pool.select().unwrap();
-        let snapshot = snapshot_for(&selected);
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.route_target_available = false;
 
         let result = transition_after_failure(TransitionInput {
             snapshot: &snapshot,
@@ -1649,8 +2005,8 @@ mod tests {
             policy: policy(),
         });
 
-        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
-        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::None);
+        assert_eq!(result.retry, RetryDirective::RetrySameTarget);
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
     }
 
     #[test]
@@ -1668,8 +2024,13 @@ mod tests {
             policy: policy(),
         });
 
-        assert_eq!(result.retry, RetryDirective::RetryRouteTarget);
-        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::Unknown);
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::FailureNotRetryable
+            }
+        );
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::None);
     }
 
     #[test]
@@ -1702,19 +2063,24 @@ mod tests {
         let next = pool.retry_candidates_from_current(1)[0]
             .credential_id
             .clone();
-        let snapshot = retry_snapshot_for(&selected, next);
+        let snapshot = retry_snapshot_for(&selected, next.clone());
         let policy = retry_policy();
 
         let result = transition_after_failure(upstream_input(
             &snapshot,
-            retryable_failure(FailureKind::RateLimited, FailureScope::Credential),
+            adapted_retryable_rate_limit_failure(),
             std::time::Instant::now(),
             policy,
         ));
         let directive = result.retry;
         apply_state_mutation_for_test(&mut pool, result.mutation);
 
-        assert!(matches!(directive, RetryDirective::RetryCredential { .. }));
+        assert_eq!(
+            directive,
+            RetryDirective::RetryCredential {
+                credential_id: next
+            }
+        );
         assert_eq!(pool.select().unwrap().key, "k2");
     }
 

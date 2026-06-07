@@ -7,13 +7,13 @@ use crate::{
     endpoint_capabilities::{EndpointCapabilitiesStatus, EndpointSupport},
     management_errors::ManagementServiceError,
     management_status::{
-        ChannelHealthStatus, RuntimeCredentialCounts, add_key_pool_snapshot_counts,
-        channel_health_status, channel_health_status_from_health,
+        add_key_pool_snapshot_counts, channel_health_status, channel_health_status_from_health,
+        ChannelHealthStatus, RuntimeCredentialCounts,
     },
     provider::ProviderKind,
     route_plan::{
-        ChannelRouteState, ModelRoute, RoutePreviewCandidate, RoutePreviewInput,
-        RoutePreviewReason, RouteStrategy, RouteTarget, preview_route,
+        preview_route, ChannelRouteState, ModelRoute, RoutePreviewCandidate, RoutePreviewInput,
+        RoutePreviewReason, RouteStrategy, RouteTarget,
     },
     state::{AppState, ChannelHealth, ChannelId, ChannelRoutePlanContext},
 };
@@ -851,11 +851,9 @@ fn is_safe_public_model_label(public_model: &str) -> bool {
     {
         return false;
     }
-    public_model
-        .bytes()
-        .all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
-        })
+    public_model.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
+    })
 }
 
 fn looks_like_windows_absolute_path(value: &str) -> bool {

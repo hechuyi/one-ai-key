@@ -75,14 +75,16 @@ If a rejecting rule matches that prefix, the proxy records a redacted event with
 can trigger this pre-commit path only when the guard has a complete pass result;
 cap, deadline, unsupported, compressed, and partial prefixes are not treated as
 proof that the full response lacks a required marker. The plain `reject` action
-stops there. The explicit lifecycle actions additionally synthesize a
-high-confidence `response_filter_rejected` failure and pass it through the same
-Phase 2 retry gates as upstream failures:
+stops there and only returns the local sanitized error. The explicit lifecycle
+actions synthesize a high-confidence `response_filter_rejected` failure before
+the response is committed, then apply the requested lifecycle mutation:
 
-- `reject_and_expire_credential` marks the selected credential expired and may
-  retry a frozen clean credential when same-request credential retry is enabled.
-- `reject_and_cooldown_channel` cools down the selected channel and may fall
-  back to another route target when route-target retry is enabled.
+- `reject_and_expire_credential` marks the selected credential expired.
+- `reject_and_cooldown_channel` cools down the selected channel.
+
+For the current request, these pre-commit lifecycle actions return the current
+response-filter error. They do not trigger transparent same-request retry,
+clean-credential replay, or route-target fallback.
 
 Streaming requests, non-replayable bodies, matches after any body bytes have
 been committed, compressed/non-UTF-8 responses, and prefix misses remain bounded
@@ -92,9 +94,9 @@ content filtering only; they do not perform post-output transparent fallback.
 
 When response-filter event capture is enabled, the proxy writes only bounded metadata to the in-memory `response_filter_events` ring after a rule outcome is known. The event is not itself replayed into routing or lifecycle decisions. Only the explicit `reject_and_expire_credential` and `reject_and_cooldown_channel` actions can create lifecycle evidence, and only while the guarded prefix is still pre-commit. `GET /management/response-filter-events` exposes:
 
-`event_id`, `created_at_unix_seconds`, `request_id`, `channel_id`, `public_model`, `rule_id`, `action`, `content_kind`, `reason_code`, `outcome`, and `body_committed`.
+`capacity`, `dropped_events`, and `events`. Each event contains `event_id`, `created_at_unix_seconds`, `request_id`, `channel_id`, `public_model`, `rule_id`, `action`, `content_kind`, `reason_code`, `outcome`, and `body_committed`.
 
-The event stream never stores matched text, raw chunks, request bodies, response bodies, upstream keys, client tokens, credential ids, or absolute key paths. Ring capacity defaults to 1024 events and is updated by runtime reload.
+The event stream never stores matched text, raw chunks, request bodies, response bodies, upstream keys, client tokens, credential ids, or absolute key paths. Ring capacity defaults to 1024 events, rejects public configuration outside 1 to 4096, and is updated by runtime reload. `dropped_events` includes capacity eviction, runtime-reload shrink, and lock-contended best-effort append drops.
 
 `GET /management/alerts` derives a management-only `response_filter_contamination` alert when at least three filter events for the same `(channel_id, rule_id)` occur inside `response_filter.alert_window_seconds`, which defaults to 900 seconds. The alert includes channel id, rule id, redact/reject counts, reason codes, and the window size. Alerts decay when matching events age out of the window. Alerts summarize operator-visible contamination signals only; they are not routing telemetry and are not lifecycle evidence.
 

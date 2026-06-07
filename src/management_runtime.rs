@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -13,14 +14,14 @@ use crate::{
         RoutingTelemetry,
     },
     management_alerts::{
-        ManagementAlertStatus, model_route_all_target_suppression_alerts,
-        response_filter_contamination_alerts_for_state,
+        model_route_all_target_suppression_alerts, response_filter_contamination_alerts_for_state,
+        ManagementAlertStatus,
     },
-    management_errors::{ManagementServiceError, registry_store_error},
+    management_errors::{registry_store_error, ManagementServiceError},
     management_registry::resolve_staged_registry_document,
     management_status::{
-        CredentialPoolAlertStatus, CredentialSetSnapshotCache, RuntimeCredentialCounts,
-        RuntimeReadinessProjection, credential_pool_alerts, runtime_readiness_projection,
+        credential_pool_alerts, runtime_readiness_projection, CredentialPoolAlertStatus,
+        CredentialSetSnapshotCache, RuntimeCredentialCounts, RuntimeReadinessProjection,
     },
     registry_store::RegistryStoreHandle,
     state::{AppState, ChannelHealth, RuntimeTopologySummary},
@@ -29,6 +30,8 @@ use crate::{
 #[derive(Debug, Serialize)]
 pub struct ResponseFilterEventsResponse {
     pub buffered_events: usize,
+    pub capacity: usize,
+    pub dropped_events: u64,
     pub offset: usize,
     pub limit: usize,
     pub events: Vec<ResponseFilterEvent>,
@@ -36,6 +39,8 @@ pub struct ResponseFilterEventsResponse {
 
 pub fn response_filter_events_response(
     snapshot: Vec<ResponseFilterEvent>,
+    capacity: usize,
+    dropped_events: u64,
     offset: usize,
     limit: usize,
 ) -> ResponseFilterEventsResponse {
@@ -43,6 +48,8 @@ pub fn response_filter_events_response(
     let events = snapshot.into_iter().skip(offset).take(limit).collect();
     ResponseFilterEventsResponse {
         buffered_events,
+        capacity,
+        dropped_events,
         offset,
         limit,
         events,
@@ -54,12 +61,21 @@ pub fn response_filter_events_snapshot_response(
     offset: usize,
     limit: usize,
 ) -> ResponseFilterEventsResponse {
-    let snapshot = state
-        .response_filter_events
-        .lock()
-        .expect("response filter events mutex poisoned")
-        .snapshot();
-    response_filter_events_response(snapshot, offset, limit)
+    let (snapshot, capacity, dropped_events) = {
+        let events = state
+            .response_filter_events
+            .lock()
+            .expect("response filter events mutex poisoned");
+        (
+            events.snapshot(),
+            events.capacity(),
+            total_dropped_events(
+                events.dropped_events(),
+                &state.response_filter_event_lock_contention_drops,
+            ),
+        )
+    };
+    response_filter_events_response(snapshot, capacity, dropped_events, offset, limit)
 }
 
 #[derive(Debug, Serialize)]
@@ -103,11 +119,18 @@ pub fn routing_telemetry_snapshot_response(
             .expect("routing telemetry mutex poisoned");
         (
             telemetry.snapshot(),
-            state.routing.telemetry_buffer_capacity,
-            telemetry.dropped_events(),
+            telemetry.capacity(),
+            total_dropped_events(
+                telemetry.dropped_events(),
+                &state.routing_telemetry_lock_contention_drops,
+            ),
         )
     };
     routing_telemetry_response(snapshot, capacity, dropped_events, offset, limit)
+}
+
+fn total_dropped_events(buffer_dropped_events: u64, lock_contention_drops: &AtomicU64) -> u64 {
+    buffer_dropped_events.saturating_add(lock_contention_drops.load(Ordering::Relaxed))
 }
 
 #[derive(Debug, Serialize)]
@@ -267,12 +290,12 @@ pub async fn runtime_response(
         },
         recent_retry_counters: RuntimeRecentRetryCounters::from_window(
             sample.recent_retry_counters,
-            state.routing.telemetry_buffer_capacity,
+            sample.routing_telemetry_capacity,
         ),
         management_events: sample.management_events,
         management_event_window_capacity: sample.management_event_window_capacity,
         routing_telemetry_events: sample.routing_telemetry_events,
-        routing_telemetry_capacity: state.routing.telemetry_buffer_capacity,
+        routing_telemetry_capacity: sample.routing_telemetry_capacity,
         routing_telemetry_dropped_events: sample.routing_telemetry_dropped_events,
         response_filter_events: sample.response_filter_events,
         response_filter_event_capacity: sample.response_filter_event_capacity,
@@ -403,6 +426,7 @@ struct RuntimeSnapshotSample {
     management_events: usize,
     management_event_window_capacity: usize,
     routing_telemetry_events: usize,
+    routing_telemetry_capacity: usize,
     routing_telemetry_dropped_events: u64,
     response_filter_events: usize,
     response_filter_event_capacity: usize,
@@ -500,14 +524,23 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
         .read()
         .expect("client token registry lock poisoned")
         .len();
-    let (routing_telemetry_events, routing_telemetry_dropped_events, recent_retry_counters) = {
+    let (
+        routing_telemetry_events,
+        routing_telemetry_capacity,
+        routing_telemetry_dropped_events,
+        recent_retry_counters,
+    ) = {
         let telemetry = state
             .routing_telemetry
             .lock()
             .expect("routing telemetry mutex poisoned");
         (
             telemetry.len(),
-            telemetry.dropped_events(),
+            telemetry.capacity(),
+            total_dropped_events(
+                telemetry.dropped_events(),
+                &state.routing_telemetry_lock_contention_drops,
+            ),
             telemetry.retry_pressure_snapshot(),
         )
     };
@@ -535,6 +568,7 @@ async fn collect_runtime_snapshot(state: &AppState) -> RuntimeSnapshotSample {
         management_events: state.events.len(),
         management_event_window_capacity: state.events.window_capacity(),
         routing_telemetry_events,
+        routing_telemetry_capacity,
         routing_telemetry_dropped_events,
         response_filter_events,
         response_filter_event_capacity,
@@ -837,7 +871,7 @@ pub async fn serving_health_response(state: &AppState) -> ServingHealthResponse 
     let credential_spare_capacity = credential_spare_capacity_summary(&sample);
     let retry_pressure = RuntimeRecentRetryCounters::from_window(
         sample.recent_retry_counters,
-        state.routing.telemetry_buffer_capacity,
+        sample.routing_telemetry_capacity,
     );
     ServingHealthResponse {
         status,
@@ -873,7 +907,7 @@ pub async fn resilience_health_response(state: &AppState) -> ResilienceHealthRes
     let credential_spare_capacity = credential_spare_capacity_summary(&sample);
     let retry_pressure = RuntimeRecentRetryCounters::from_window(
         sample.recent_retry_counters,
-        state.routing.telemetry_buffer_capacity,
+        sample.routing_telemetry_capacity,
     );
     let status = if sample.serving_channels == 0 || sample.credential_set_blocking_alerts > 0 {
         "blocked"
@@ -1025,6 +1059,8 @@ fn current_unix_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     fn item_body<'a>(source: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
         let start = source
             .find(start_marker)
@@ -1034,6 +1070,24 @@ mod tests {
             .map(|offset| start + offset)
             .unwrap_or_else(|| panic!("{end_marker} follows {start_marker}"));
         &source[start..end]
+    }
+
+    #[test]
+    fn response_filter_events_response_reports_capacity_and_dropped_events() {
+        let response = response_filter_events_response(Vec::new(), 1024, 3, 0, 50);
+
+        assert_eq!(response.buffered_events, 0);
+        assert_eq!(response.capacity, 1024);
+        assert_eq!(response.dropped_events, 3);
+        assert_eq!(response.offset, 0);
+        assert_eq!(response.limit, 50);
+    }
+
+    #[test]
+    fn total_dropped_events_includes_external_lock_contention_drops() {
+        let external = std::sync::atomic::AtomicU64::new(2);
+
+        assert_eq!(total_dropped_events(3, &external), 5);
     }
 
     #[test]

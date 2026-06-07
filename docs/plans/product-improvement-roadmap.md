@@ -138,10 +138,13 @@ Park:
 - persistent failure ledger as a required prerequisite.
 
 Failure evidence is not a routing input and must not be used to absorb
-upstream jitter. The existing routing telemetry window is an in-memory ring
-buffer controlled by `routing.telemetry_buffer_capacity`; the default is 1024
-events. When full, the ring drops the oldest event. This roadmap does not make
-persistent failure storage a prerequisite.
+upstream jitter. The minimum failure evidence comes only from two in-memory
+rings: routing telemetry controlled by `routing.telemetry_buffer_capacity` and
+response-filter events controlled by `response_filter.event_window_capacity`.
+Both default to 1024 events and reject public configuration outside 1 to 4096.
+Overflow, dropped appends, and runtime-reload shrink only increment the relevant
+dropped counter; they must not block proxy requests or management reads. This
+roadmap does not introduce a persistent failure ledger.
 
 Failure evidence should be minimal: request id, time bucket, endpoint family,
 public model, channel/credential reference when safe, failure kind, retry
@@ -154,8 +157,9 @@ Acceptance gates:
   mutation boundaries;
 - no command prints raw keys, raw tokens, token hashes, absolute key paths, raw
   request/response bodies, or full upstream URLs with token-like components;
-- failure evidence is bounded and redacted, with the default routing telemetry
-  window remaining 1024 in-memory events unless explicitly configured;
+- failure evidence is bounded and redacted, with routing telemetry and
+  response-filter event windows remaining 1024 in-memory events by default and
+  capped at 4096 events when explicitly configured;
 - status output is one-screen operational context, not an analytics product.
 
 ### M3: Conservative Pre-Output Stability

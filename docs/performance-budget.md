@@ -19,7 +19,10 @@ This service is a personal AI account and API-key router, not a heavy control pl
 - Client-token model scope expansion is compiled into `AppState.runtime_catalogs`. Request forwarding, `/v1/models`, named-pool replayable authorization, and routing preview may test public-model membership against that in-memory map, but must not join against registry storage, client-token storage, or upstream catalog responses.
 - Upstream error bodies are bounded by `max_error_body_bytes`.
 - One shared `reqwest::Client` is used per `AppState`; do not create a client per request.
-- Routing telemetry is an in-memory ring buffer bounded by `routing.telemetry_buffer_capacity`; the default is 1024 events.
+- Routing telemetry is an in-memory ring buffer bounded by `routing.telemetry_buffer_capacity`; the default is 1024 events and the hard maximum is 4096.
+- Response-filter events are a separate in-memory ring buffer bounded by `response_filter.event_window_capacity`; the default is 1024 events and the hard maximum is 4096.
+- Routing telemetry and response-filter event `dropped_events` include capacity eviction, runtime-reload shrink, and lock-contended best-effort append drops.
+- CLI failure summaries read bounded in-memory sources only. `one-ai-key failures` defaults to 50 records per source and caps each source at 200 records; it must not introduce persistent failure storage.
 - Automatic credential lifecycle persistence from proxy-side failure handling uses a bounded non-blocking queue. Enqueue failure must be observable through routing telemetry, but must not fall back to synchronous credential-store I/O on the request path.
 - Provider/account failure-domain suppression is in-memory runtime state only. Request planning may consult the compiled account/provider breaker maps, but must not persist breaker transitions or query registry storage on the request path. 429/rate-limit evidence must remain credential scoped and must not open provider-wide suppression.
 - Management operations may do disk I/O, but blocking filesystem work must run outside Tokio worker threads.
@@ -31,7 +34,7 @@ This service is a personal AI account and API-key router, not a heavy control pl
 - Credential runtime state is in memory and scales linearly with credential count.
 - For the current local workload, hundreds to low thousands of credentials are acceptable.
 - Credential IDs and fingerprints must not store raw secrets.
-- Management event logs are append-only JSONL during the bootstrap phase, but only a bounded recent window is kept in memory for management listing. `management.event_window_capacity` controls that in-memory window and defaults to 1024 events. Startup replay reads the JSONL source directly. SQLite can replace this behind the same event-store boundary when channel/account management grows.
+- Management event logs are append-only JSONL during the bootstrap phase, but only a bounded recent window is kept in memory for management listing. `management.event_window_capacity` controls that in-memory window, defaults to 1024 events, and has a hard maximum of 4096. Startup replay reads the JSONL source directly. SQLite can replace this behind the same event-store boundary when channel/account management grows. Management JSONL is not persistent failure storage.
 
 ## Routing Budget
 

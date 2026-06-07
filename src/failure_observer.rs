@@ -1,7 +1,12 @@
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, TryLockError,
+};
+
 use crate::{
     credentials::short_hash,
     error::{ClassifiedFailure, FailureConfidence, FailureKind, FailureScope, RetryAfterSource},
-    events::RoutingTelemetry,
+    events::{RoutingTelemetry, RoutingTelemetryBuffer},
     failure_state_executor::apply_state_mutation,
     routing::{
         transition_after_failure, DuplicateChargeRisk, FailureSource, RequestSelectionSnapshot,
@@ -54,8 +59,28 @@ pub async fn transition_observed_failure(
 }
 
 pub fn record_routing_telemetry(state: &AppState, event: RoutingTelemetry) {
-    if let Ok(mut telemetry) = state.routing_telemetry.try_lock() {
-        telemetry.push(event);
+    record_routing_telemetry_to_buffer(
+        &state.routing_telemetry,
+        &state.routing_telemetry_lock_contention_drops,
+        event,
+    );
+}
+
+pub(crate) fn record_routing_telemetry_to_buffer(
+    telemetry: &Arc<Mutex<RoutingTelemetryBuffer>>,
+    lock_contention_drops: &Arc<AtomicU64>,
+    event: RoutingTelemetry,
+) {
+    match telemetry.try_lock() {
+        Ok(mut buffer) => {
+            buffer.push(event);
+        }
+        Err(TryLockError::WouldBlock) => {
+            lock_contention_drops.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TryLockError::Poisoned(err)) => {
+            err.into_inner().push(event);
+        }
     }
 }
 
@@ -69,7 +94,7 @@ async fn apply_error_action(
     let _mutation_guard = pool_state.mutation_gate.lock().await;
     let mut pool = pool_state.pool.lock().await;
     let policy = routing_policy_for_pool(pool_state);
-    let mut result = transition_after_failure(TransitionInput {
+    let result = transition_after_failure(TransitionInput {
         snapshot,
         failure,
         failure_source,
@@ -84,12 +109,6 @@ async fn apply_error_action(
         snapshot,
         result.mutation.clone(),
     );
-    if matches!(result.retry, RetryDirective::RetrySameTarget) && telemetry.is_empty() {
-        result.retry = RetryDirective::ReturnCurrentError {
-            reason: RetryDecisionReason::NoRouteCandidate,
-        };
-        result.duplicate_charge_risk = DuplicateChargeRisk::None;
-    }
     (result, telemetry)
 }
 
@@ -341,5 +360,112 @@ mod tests {
 
         assert_eq!(telemetry.failure_source, "guarded_success_envelope");
         assert_eq!(telemetry.duplicate_charge_risk, "unknown");
+    }
+
+    #[test]
+    fn record_routing_telemetry_to_buffer_records_when_lock_available() {
+        let telemetry = std::sync::Arc::new(std::sync::Mutex::new(RoutingTelemetryBuffer::new(2)));
+        let external_dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        record_routing_telemetry_to_buffer(
+            &telemetry,
+            &external_dropped,
+            route_selected_event("req-1"),
+        );
+
+        let telemetry = telemetry.lock().expect("routing telemetry mutex poisoned");
+        assert_eq!(telemetry.len(), 1);
+        assert_eq!(telemetry.dropped_events(), 0);
+        assert_eq!(
+            external_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(telemetry.snapshot(), vec![route_selected_event("req-1")]);
+    }
+
+    #[test]
+    fn record_routing_telemetry_to_buffer_accounts_contended_external_drop_without_blocking() {
+        let telemetry = std::sync::Arc::new(std::sync::Mutex::new(RoutingTelemetryBuffer::new(2)));
+        let external_dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let guard = telemetry.lock().expect("routing telemetry mutex poisoned");
+        let recorder_telemetry = telemetry.clone();
+        let recorder_external_dropped = external_dropped.clone();
+        let (recorded_tx, recorded_rx) = std::sync::mpsc::channel();
+        let recorder = std::thread::spawn(move || {
+            record_routing_telemetry_to_buffer(
+                &recorder_telemetry,
+                &recorder_external_dropped,
+                route_selected_event("req-contended"),
+            );
+            recorded_tx.send(()).unwrap();
+        });
+
+        assert!(
+            recorded_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_ok(),
+            "recording should not wait for a contended routing telemetry mutex"
+        );
+        drop(guard);
+        recorder.join().unwrap();
+
+        let telemetry = telemetry.lock().expect("routing telemetry mutex poisoned");
+        assert_eq!(telemetry.len(), 0);
+        assert_eq!(telemetry.dropped_events(), 0);
+        assert_eq!(
+            external_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(telemetry.snapshot(), Vec::new());
+    }
+
+    #[test]
+    fn record_routing_telemetry_to_buffer_preserves_subsequent_records_after_contended_drop() {
+        let telemetry = std::sync::Arc::new(std::sync::Mutex::new(RoutingTelemetryBuffer::new(2)));
+        let external_dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let guard = telemetry.lock().expect("routing telemetry mutex poisoned");
+        let recorder_telemetry = telemetry.clone();
+        let recorder_external_dropped = external_dropped.clone();
+        let (recorded_tx, recorded_rx) = std::sync::mpsc::channel();
+        let recorder = std::thread::spawn(move || {
+            record_routing_telemetry_to_buffer(
+                &recorder_telemetry,
+                &recorder_external_dropped,
+                route_selected_event("req-contended"),
+            );
+            recorded_tx.send(()).unwrap();
+        });
+
+        recorded_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .expect("recording should not wait for a contended routing telemetry mutex");
+        drop(guard);
+        recorder.join().unwrap();
+
+        record_routing_telemetry_to_buffer(
+            &telemetry,
+            &external_dropped,
+            route_selected_event("req-after"),
+        );
+
+        let telemetry = telemetry.lock().expect("routing telemetry mutex poisoned");
+        assert_eq!(telemetry.len(), 1);
+        assert_eq!(telemetry.dropped_events(), 0);
+        assert_eq!(
+            external_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            telemetry.snapshot(),
+            vec![route_selected_event("req-after")]
+        );
+    }
+
+    fn route_selected_event(request_id: &str) -> RoutingTelemetry {
+        RoutingTelemetry::RouteSelected {
+            request_id: request_id.to_string(),
+            registry_generation: 1,
+            channel_id: "channel-a".to_string(),
+        }
     }
 }
