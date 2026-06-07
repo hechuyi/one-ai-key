@@ -107,8 +107,8 @@ upstream credentials, or a deployment host.
    basename.
 6. Run `scripts/release-smoke.sh`; it must exercise the extracted artifact with
    local placeholder tokens and a local mock upstream.
-7. Create the release commit and tag after checking that runtime state and
-   generated artifacts are not staged.
+7. Run `scripts/check-staged-denylist.sh`, then create the release commit and
+   tag after checking that runtime state and generated artifacts are not staged.
 8. Upload the tarball and `.sha256` sidecar as GitHub Release assets.
 9. Download the uploaded tarball and `.sha256` sidecar into a tempdir and verify
    the checksum from the uploaded sidecar. Confirm tag, Cargo version, asset
@@ -128,6 +128,12 @@ upstream credentials, or a deployment host.
 The release commit or tag must not include `dist/`, runtime config, SQLite
 databases, key files, token files, JSONL logs, private agent files,
 `AGENTS.md`, `target/`, or local deployment state.
+
+The staged-path denylist is executable evidence. Human inspection of
+`git diff --cached --name-only` is only accepted after
+`scripts/check-staged-denylist.sh` exits 0. The gate rejects repository-local
+build output, runtime state, local config, database/log/key/token material,
+private scripts, `key-pool-router/`, and `AGENTS.md`.
 
 Local `config/`, `data/`, `db/`, `logs/`, `dist/`, `target/`, and deployment
 state directories are operational or build outputs. Keep them ignored and out of

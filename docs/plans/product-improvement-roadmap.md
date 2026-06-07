@@ -36,6 +36,31 @@ replacement stories, or one-off support workarounds as product requirements.
 Convert recurring lessons into stable routing, reporting, or release rules, then
 delete the support context.
 
+## Capability Release Contract
+
+Treat every future version as a capability package, not a pile of adjacent
+fixes. A version may carry at most two product capabilities unless it is
+explicitly a refactor-only boundary release. Each capability must name:
+
+- the user-visible workflow it completes;
+- the modules that own the core behavior;
+- the adapters that are allowed to expose it, such as CLI or management routes;
+- the modules it must not touch;
+- the fixed stop node that ends the work.
+
+Each version entry must include five gates before implementation starts:
+user-visible value, negative scope, architecture boundary check, regression test
+gate, and documentation gate. A release that says only "lay foundation" is not
+acceptable unless the foundation itself removes a concrete duplicate path or
+creates an executable safety gate. Temporary compatibility paths must either be
+closed by the stop node or recorded as explicit debt with an owner.
+
+Presentation layers must not become second business systems. CLI command modules
+parse arguments, call a bounded service or management projection, and render a
+redacted report. Management handlers expose already-defined capability actions
+and projections. They must not duplicate config resolution, route planning,
+retry policy, or request-path behavior.
+
 ## Product Boundary
 
 one-ai-key should remain:
@@ -255,6 +280,11 @@ This is the only stability behavior in this roadmap. It is a small capability
 package over explicit routing/profile mechanics, not a new stability engine and
 not a runtime YAML preset.
 
+M3 owns actual jitter absorption. M1 and M2 explain whether the router is usable
+and what happened recently; they do not hide upstream failures from clients.
+Only selected-target pre-output failures can consume M3's conservative retry
+budget. Route-admission failures remain explainable local failures.
+
 M3 distinguishes route admission failure from selected-target pre-output
 failure. Route admission failures include missing client scope, missing public
 model route, disabled target/channel, empty or unusable credential pool, hard
@@ -320,7 +350,23 @@ Acceptance gates:
 - every retry decision has a recorded eligibility reason;
 - every denial has a stable reason code;
 - retry evidence is visible in management-only failure/explain output;
-- the hot path still satisfies the hard invariants above.
+- the hot path still satisfies the hard invariants above;
+- direct behavior tests prove eligible non-streaming Chat/Responses 502, 503,
+  and 504 pre-output failures perform exactly two total upstream attempts when
+  all gates pass and return the second successful response;
+- route admission failures, `/v1/models`, embeddings, named-pool requests,
+  unknown endpoint families, streaming requests, non-replayable requests,
+  partial-output paths, and deadline-exhausted requests perform no transparent
+  retry/fallback;
+- credential retry, frozen route-target fallback, and same-target retry consume
+  the same one-extra-attempt budget and never chain inside one original client
+  request;
+- `no_route_candidate` tests distinguish soft provider-cooling last-resort
+  admission from hard blockers such as disabled channels, hard channel cooldown,
+  and empty credential pools;
+- retry telemetry tests prove `directive`, `denial_reason`,
+  `duplicate_charge_risk`, and effective-deadline evidence are present without
+  raw bodies, keys, tokens, full URLs, or upstream free-form text.
 
 ## Parked Items
 
@@ -356,10 +402,23 @@ Before closing the roadmap:
 - filtered tests must prove they matched non-zero intended tests;
 - `cargo test --locked` or a justified narrower release gate must pass;
 - `git diff --check` must pass;
+- an executable staged-path denylist must pass before commit/release evidence is
+  accepted;
 - staged files must exclude `dist/`, `target/`, `key-pool-router/`, `config/`,
   `data/`, SQLite, logs, keys, raw fixtures, and `AGENTS.md`;
 - docs must describe stable product behavior, not support transcripts or future
   feature promises.
+
+Documentation acceptance is task-based, not terminology-based. A cold personal
+operator must be able to install a release artifact, generate local config,
+replace placeholders, add one upstream key, run `check-config`, start the
+service, configure an OpenAI-compatible client, verify `/v1/models`, send one
+harmless model-bearing request, and run the first read-only operator reports
+using only README and `docs/operations.md`. README must define first-use terms
+in user language: client token, management token, upstream key, public model,
+and management URL. Internal terms such as runtime snapshot, provider/account
+failure domain, hot path, milestone, or stop node belong in technical or plan
+documents, not in the first-run path.
 
 ## Plan Closure
 

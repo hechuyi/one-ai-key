@@ -11,11 +11,10 @@ release-smoked from the published artifact.
 
 **Architecture:** `v0.2` is a closure release, not a new data-plane feature
 release. It validates the existing CLI/management/reporting contracts against a
-published artifact and documents the supported operator path. It may perform
-one optional `src/main.rs` boundary extraction only after the release-confidence
-gate is closed and only if that extraction does not delay the release.
-Request-path stability work starts in `v0.3` under a separate conservative
-pre-output stability plan.
+published artifact and documents the supported operator path. It does not
+perform route/app boundary extraction; that work is recorded as deferred
+architecture debt. Request-path stability work starts in `v0.3` under a separate
+conservative pre-output stability plan.
 
 **Tech Stack:** Rust, Axum, clap, serde/serde_json, local mock upstream tests,
 local Docker/Nix Linux x86_64 release build, shell smoke scripts, GitHub release
@@ -136,8 +135,8 @@ Allowed in `v0.2`:
   resolver/compiler ownership or changing accepted config semantics;
 - characterization tests for already implemented conservative pre-output
   behavior;
-- one optional narrow `src/main.rs` boundary extraction with zero behavior
-  change after the release-confidence gate is closed;
+- explicit recording that `src/main.rs` route/app boundary extraction is
+  deferred;
 - documentation that describes stable product usage, not support-chat history.
 
 Not allowed in `v0.2`:
@@ -478,6 +477,11 @@ with route registration merely to create a new catch-all module.
 Expected `v0.2` write set:
 
 - Create: `docs/plans/operator-confidence-release-plan.md`
+- Create: `scripts/check-staged-denylist.sh` when the staged-path release gate
+  is not yet executable.
+- Modify: `.gitignore`
+- Modify: `.dockerignore`
+- Modify: `scripts/local-ci.sh`
 - Modify: `scripts/release-smoke.sh`
 - Modify: `README.md`
 - Modify: `docs/operations.md`
@@ -561,6 +565,11 @@ export CARGO_TARGET_DIR="${TMPDIR:-/tmp}/one-ai-key-operator-confidence-target"
 Expected: all local Cargo verification in this plan writes build cache outside
 the repository. Remove that directory after the local verification batch if no
 longer needed.
+
+Release-closure CI must run with `CARGO_TARGET_DIR` outside the repository, or
+through a wrapper that enforces that constraint. Repository-local `target/` is
+tolerated only as ignored transient state during ordinary development; it is not
+acceptable release-closure evidence.
 
 - [ ] **Step 1: Confirm clean worktree**
 
@@ -1006,11 +1015,19 @@ Run:
 ```bash
 git status -sb --untracked-files=all
 git diff --check
+scripts/check-staged-denylist.sh
 git diff --cached --name-only
 ```
 
 Expected: no staged `dist/`, `target/`, `key-pool-router/`, `config/`, `data/`,
 SQLite, logs, key files, private scripts, or `AGENTS.md`.
+
+The denylist gate is executable. Human inspection of
+`git diff --cached --name-only` is valid evidence only after
+`scripts/check-staged-denylist.sh` exits 0. The release gate fails if any staged
+path matches repository-local build output, runtime state, local config,
+database/log/key/token material, private scripts, `key-pool-router/`, or
+`AGENTS.md`.
 
 Complete this fixed anti-platform checklist against the staged diff:
 
@@ -1110,11 +1127,22 @@ Initial `v0.3` acceptance tests are limited to:
 
 - route-admission `no_route_candidate` is not retried;
 - non-streaming `/v1/responses` 503-before-body retries once when all gates pass;
+- non-streaming `/v1/chat/completions` 502/503/504-before-body retries once when
+  all gates pass;
+- `/v1/models`, embeddings, named-pool requests, and unknown endpoint families
+  do not retry and do not create a second upstream hit;
 - streaming Chat/Responses never retry, even on pre-header failure;
 - route-target retry uses only frozen candidates;
 - single-target transient failure retries the same target at most once;
 - `Retry-After` or hard cooldown blocks same-target retry;
 - credential retry, route-target retry, and same-target retry do not chain;
+- route-admission failures produce no upstream hit;
+- soft provider-cooling may be used as a last-resort candidate when every
+  otherwise valid target is provider-cooling, while disabled channels, hard
+  channel cooldown, and empty credential pools remain hard blockers;
+- retry and denial telemetry records directive, denial reason,
+  duplicate-charge risk, and effective-deadline evidence without raw bodies,
+  free-form upstream text, keys, tokens, or full URLs;
 - the retry path performs no YAML, SQLite, registry, credential-store,
   client-token-store, live catalog, background-health, or persistent-ledger read.
 

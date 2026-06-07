@@ -279,16 +279,24 @@ Guard outcomes: `pass`, `classified`, `cap_exhausted`, `deadline_exhausted`, `pa
 
 ## Phase 3B: Pre-Output Retry/Fallback Reliability Tightening
 
-**Purpose:** tighten same-request retry and route-target fallback so LiteLLM/New API-style backend failures are exhausted internally before client-visible output, while preserving one-ai-key's lightweight, no-surprise, high-performance boundary.
+**Purpose:** tighten same-request retry and route-target fallback so one small
+eligible pre-output backend miss can be absorbed before client-visible output,
+while preserving one-ai-key's lightweight, no-surprise, high-performance
+boundary.
 
 This stop node may be implemented before or after Phase 4. It refines the retry/fallback reliability contract but must not retroactively block a completed Phase 3. It stops immediately if acceptance requires live model aggregation, request-path storage joins, full buffering of successful responses, or post-output transparent fallback.
 
 Scope:
 
-- [x] For non-streaming requests with replayable bodies, before returning an upstream-derived client error, exhaust all allowed same-request credential retries and frozen route-target fallback attempts within the unified attempt-state gates.
+- [x] For non-streaming requests with replayable bodies, before returning an
+  upstream-derived client error, allow at most one extra upstream attempt within
+  the unified attempt-state gates.
 - [x] Same-request credential retry must exclude credentials already failed in the current request and must not switch back to the same key.
 - [x] Route-target retry uses frozen candidates from the original route planning result. It skips targets that are already cooling down, disabled, or without an eligible credential, and its inclusion/skip reasons are explainable in telemetry and routing preview.
 - [x] Single-target transient provider failures get one same-target pre-output retry when no frozen route target remains, no cooldown evidence is present, and the normal replayability, streaming, partial-output, and deadline gates allow another attempt.
+- [x] Same-request credential retry, frozen route-target retry, and same-target
+  retry are mutually exclusive consumers of the one-extra-attempt budget and
+  must not chain inside the same original client request.
 - [x] Streaming, non-replayable, and partial-output paths never fallback or retry. They return stable denial reasons instead of attempting continuation.
 - [x] `Retry-After` and typed channel-failure evidence may influence transient cooldown. They never override manual disablement or configured disablement.
 - [x] Retry/fallback decisions do not parse free-form upstream text and do not record raw response bodies, request bodies, upstream keys, client tokens, or token-like values.
@@ -296,10 +304,18 @@ Scope:
 Stop-card tests:
 
 - Bad selected key retries to a good credential in the same request without reusing the failed credential.
-- Credential candidate exhaustion falls through to the next eligible frozen route target when route-target retry remains allowed.
+- Credential candidate exhaustion falls through to the next eligible frozen
+  route target only when the one-extra-attempt budget has not already been
+  consumed.
 - Candidate exhaustion without an eligible route target returns stable `no_frozen_candidate`, `attempt_limit_reached`, or `no_route_candidate` denial/error codes as appropriate.
-- Primary target `5xx`, `429`, and typed guarded-`2xx` failures fallback to the next eligible frozen target when replayability, deadline, and policy gates allow it.
+- Primary target `502`, `503`, and `504` pre-output failures fallback to the
+  next eligible frozen target when replayability, deadline, endpoint-family, and
+  policy gates allow it. Default `429` and guarded-`2xx` failures do not consume
+  the conservative retry budget unless a later plan explicitly changes that
+  contract.
 - Single-route `5xx` provider failures retry the same target once before returning a client-visible error; `Retry-After` cooldown evidence, guarded-success 2xx failures, streaming, non-replayable, and partial-output paths do not use same-target retry.
+- `/v1/models`, embeddings, named-pool requests, and unknown endpoint families
+  do not retry and do not create a second upstream hit.
 - Streaming, non-replayable, and partial-output paths produce no fallback and expose the stable denial reason.
 - Telemetry records retry directive, denial reason, and duplicate-charge-risk classification without raw body/key/token material.
 - Retry pressure remains bounded under repeated failures.
@@ -416,7 +432,7 @@ This roadmap has hard stopping points. Do not continue into the next phase when 
 | Phase 1B | Channel balance suppression transition table, reset scope, all-target fail-closed behavior, and schemas pass | Account/provider/credential-set suppression becomes necessary. |
 | Phase 2 | Retry denial, duplicate-charge risk, retry pressure, and effective deadline schemas pass | Guarded fallback needs behavior not representable by the unified retry path. |
 | Phase 3 | 2xx guard passes byte/time/SSE/prefix/retry tests without full buffering | Guard requires broad schema validation, full buffering, or fallback after output. |
-| Phase 3B | Pre-output credential retry and frozen route-target fallback exhaust eligible candidates for replayable non-streaming requests before client errors | Reliability acceptance requires mid-stream continuation fallback, free-text keyword disablement, live model aggregation, active probe daemons, request-path storage joins, full successful-response buffering, or post-output transparent fallback. |
+| Phase 3B | Pre-output credential retry, frozen route-target fallback, or same-target retry consumes one mutually exclusive extra attempt for replayable non-streaming requests before client errors | Reliability acceptance requires chained retries, more than one extra attempt, mid-stream continuation fallback, free-text keyword disablement, live model aggregation, active probe daemons, request-path storage joins, full successful-response buffering, or post-output transparent fallback. |
 | Phase 4 | Response-filter events, alerts, framing, and explicit pre-commit lifecycle action tests pass | Filter hits need post-output mutation, automatic disablement, or full successful-response buffering to satisfy acceptance. |
 | Phase 5 | Explain, docs, health truth table, and final release hygiene pass | New product surfaces such as UI, billing, or persistent model trust are required. |
 

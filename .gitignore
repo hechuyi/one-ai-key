@@ -22,6 +22,7 @@
 /.env.*
 /.env*
 /config.yaml
+/config/
 /docker-compose.override.yml
 /key-pool-router/
 /keys/
