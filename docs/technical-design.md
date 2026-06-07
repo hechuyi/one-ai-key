@@ -259,7 +259,15 @@ better route exists.
 
 Provider/account failure domains are runtime-only suppression state layered
 above channel health. They are intentionally in memory and do not become
-database-backed circuit breakers.
+database-backed circuit breakers. An explicit provider/account cooldown, such
+as upstream `Retry-After`, is a soft route state rather than an absolute
+admission blocker: normal candidates are preferred, degraded candidates are
+preferred over provider-cooling candidates, and provider-cooling candidates are
+used only when every otherwise valid target is in that soft state. Inside one
+frozen fallback chain, a provider-cooling target is skipped while later route
+targets remain, so a shared-account failure does not immediately retry a sibling
+channel before external fallback. Single-target default and named-pool
+forwarding can still use the provider-cooling target as a last resort.
 
 Manual or configured disablement remains authoritative. Automatic cooldown
 expiry or success recovery must not re-enable disabled providers, accounts,
