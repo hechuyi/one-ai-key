@@ -31,7 +31,7 @@ The latest convergence review adds these hard corrections:
 - `doctor` defaults to compiled runtime health only and must not become an implicit alert/probe aggregation platform;
 - all operator reports use a unified redacted envelope with structured `safe_argv`, not dynamic shell command strings;
 - release closure includes local artifact smoke, representative operator-command smoke, GitHub release asset checks, docs cold-read, and ignore/denylist verification;
-- the active execution baseline is post-M2 stop-card, with M3 as the next implementation gate.
+- the active execution baseline is M1-M4 completed through the documented task evidence and milestone stop-card evidence, with release/operations evidence follow-up as the remaining gate.
 
 ## Product Principles
 
@@ -104,8 +104,8 @@ The plan is allowed to use up to five subagents, but only after the main control
 | --- | --- | --- | --- |
 | M1 | Already reconciled and committed. Future workers verify rather than reopen M1 unless a regression test fails. | None. | `src/cli.rs`, `src/main.rs`, `src/cli_report.rs`, `src/cli_effects.rs`, this plan. |
 | M2 | Closed after commits `242ecbc9` (`fix(cli): reconcile M2 report contract`) and `c1523f4d` (`fix(cli): harden keys safe argv validation`). Future workers verify rather than reopen M2 unless a regression test fails. | No further M2 feature lanes are open. | `src/cli.rs`, `src/cli_commands/mod.rs`, `src/cli_report.rs`, `src/operator_client.rs`, route registration, this plan. |
-| M3 | Commit mutating-command confirmation envelope and verify `credential_ref` resolver gate. | Serialize `keys import`, `keys probe`, and `keys probe-apply` unless the main controller first commits a module split such as `keys_import.rs`, `keys_probe.rs`, and `keys_probe_apply.rs` plus shared report/effect helpers. `models onboard-plan` may run separately after its effect class is frozen. | `src/cli.rs`, `src/operator_client.rs`, `src/cli_report.rs`, `src/cli_commands/keys.rs` or split key modules, this plan. |
-| M4 | Commit reload/capability shared DTO shape before command display work. | Backend-only reload and capability schema work can run in parallel when write sets are disjoint. CLI display updates to `models.rs`, `route.rs`, and `cli_report.rs` are serialized unless a shared explanation DTO/render extension point is committed first. | `src/cli.rs`, `src/cli_report.rs`, `src/operator_client.rs`, `src/cli_commands/models.rs`, `src/cli_commands/route.rs`, request-path files, this plan. |
+| M3 | Closed by the checked task sequence and documented evidence in the M3 section. Future workers verify rather than reopen M3 unless a regression test fails. | No further M3 feature lanes are open. Release/operations evidence follow-up may reference existing M3 evidence, but must not add import/probe/onboarding scope. | `src/cli.rs`, `src/operator_client.rs`, `src/cli_report.rs`, `src/cli_commands/keys.rs` or split key modules, this plan. |
+| M4 | Closed by the checked task sequence and documented evidence in the M4 section. Future workers verify rather than reopen M4 unless a regression test fails. | No further M4 feature lanes are open. Release/operations evidence follow-up may reference existing reload/capability/default-model evidence, but must not add protocol shims, counters, or dynamic capability scope. | `src/cli.rs`, `src/cli_report.rs`, `src/operator_client.rs`, `src/cli_commands/models.rs`, `src/cli_commands/route.rs`, request-path files, this plan. |
 
 Subagents must state their write set in their final report. If two lanes need the same shared file, the main controller either serializes those edits or creates a small integration commit after reviewing both outputs.
 
@@ -122,8 +122,11 @@ As of the latest plan review, the active baseline is:
 - M1 is complete and marked in commit `89cd0fc7` (`chore(plan): mark M1 foundation complete`);
 - M2.1-M2.4b are complete and marked through commit `81c03a57` (`chore(plan): mark M2.4b complete`);
 - M2.5 `failures tail/explain` and M2.6 `doctor` are complete and marked through commit `eee0fb1c` (`feat(cli): add read-only doctor command`);
-- M3 and M4 have not started for this roadmap;
-- the M2.5 and M2.6 draft files have been integrated and committed; the next active gate is the M2 stop card.
+- M2 stop-card closure is recorded after commits `242ecbc9` (`fix(cli): reconcile M2 report contract`) and `c1523f4d` (`fix(cli): harden keys safe argv validation`);
+- M3 is complete through the checked `keys import`, `keys probe`, `keys probe-apply`, and `models onboard-plan` tasks and the M3 stop-card evidence recorded in this document;
+- M4 is complete through the checked reload status/diff/apply, static endpoint capability, capability diagnostics/projection/display, and default-model parking tasks and the M4 stop-card evidence recorded in this document;
+- current release follow-up evidence includes the known `v0.1.6` release/gateway pin fact, but that fact is release/operations follow-up evidence rather than a substitute for, or new addition to, historical M1-M4 task evidence;
+- the remaining active gate is release/operations evidence follow-up, bounded by the release gate and existing parked/deferred boundaries.
 
 A fresh worker must first run:
 
@@ -136,24 +139,24 @@ Known current files:
 
 | File | Baseline treatment |
 | --- | --- |
-| `src/cli.rs` | Tracked CLI skeleton and M2 commands exist through M2.6. Preserve command wiring while closing the M2 stop card. |
-| `src/main.rs` | Server/CLI dispatch wiring exists. Preserve legacy server invocation and existing management route registration. |
-| `src/cli_effects.rs` | Tracked classifier exists through M2.6. Preserve M1/M2 side-effect classifications during report-contract reconciliation. |
-| `src/cli_report.rs` | Tracked report helpers exist. Reconcile completed commands against the unified report envelope before M2 closes. |
-| `src/operator_client.rs` | Tracked operator client exists. Preserve the M2 read-only allowlist and `/v1` management-URL misuse rejection. |
-| `src/cli_commands/mod.rs` | Tracked module registry includes M2.5/M2.6 modules. Do not remove integrated module declarations. |
+| `src/cli.rs` | M1-M4 command wiring is closed by the documented task evidence. Preserve it during release/operations follow-up. |
+| `src/main.rs` | Server/CLI dispatch and management route registration are closed by the documented task evidence. Preserve them during release/operations follow-up. |
+| `src/cli_effects.rs` | Side-effect classifications are closed by the documented M1-M4 evidence. Preserve report/effect semantics during release/operations follow-up. |
+| `src/cli_report.rs` | Unified report helpers are closed by the documented M1-M4 evidence. Preserve envelope and redaction semantics during release/operations follow-up. |
+| `src/operator_client.rs` | Operator client boundaries are closed by the documented M1-M4 evidence. Preserve allowlists, confirmation semantics, and `/v1` management-URL misuse rejection. |
+| `src/cli_commands/mod.rs` | Module registry is closed by the documented M1-M4 evidence. Do not reopen command scope for parked or adjacent features. |
 | `src/cli_commands/failures.rs` | M2.5 is integrated and committed. Preserve bounded windows, unified envelope, structured `safe_argv`, and redaction. |
 | `src/cli_commands/doctor.rs` | M2.6 is integrated and committed. Preserve default runtime-only projections and opt-in bounded store projections. |
-| `docs/plans/operator-ux-implementation-plan.md` | Treat this file as the active execution contract. |
+| `docs/plans/operator-ux-implementation-plan.md` | Treat this file as the active status and release/operations follow-up contract. |
 
 If the preflight finds additional modified or untracked files, the worker must inspect whether they are part of the current task before editing. Never delete, overwrite, or revert unrelated local changes. If a plan step says “Create” but the file already exists, treat the step as “Continue/modify existing” and preserve the established local pattern.
 
-The immediate execution order after M2 stop-card closure is:
+The immediate release/operations follow-up order is:
 
-1. start M3 only from the post-M2 report contract and side-effect envelope;
-2. verify the non-secret `credential_ref` resolver gate before individual credential workflows;
-3. serialize `keys import`, `keys probe`, and `keys probe-apply` unless the main controller first commits a disjoint module split;
-4. keep plan-status updates separate from feature commits.
+1. verify existing M1-M4 stop-card evidence without adding new feature scope;
+2. collect or reference release/operations evidence, including current release follow-up evidence for `v0.1.6` and the gateway pin, without recasting it as historical task evidence;
+3. keep parked, rejected, and adjacent features outside this roadmap;
+4. keep any plan-status updates separate from feature commits.
 
 ## Operator Journey Acceptance
 
@@ -1835,7 +1838,7 @@ Root issue ledger:
 | Documentation drift risk | Added a documentation contract so README and technical docs describe stable product usage rather than historical support chat, temporary keys, real domains, or a key-replacement-heavy narrative. |
 | Deferred counter hot-path exception | Recast D2 as a deferred performance decision with required budget, frozen dimensions, update points, and abort criteria before any request-path edits. |
 | Repository hygiene risk | Added local artifact constraints and staged denylist review before commits. |
-| Current baseline drift | Replaced stale M1-era, post-M2.4b, and post-M2.6 preflight text with the current post-M2 stop-card checkpoint and explicit M3 entry instructions. |
+| Current baseline drift | Replaced stale M1-era, M2-only, and M3/M4-not-started preflight text with the current M1-M4-complete baseline and release/operations evidence follow-up checkpoint. |
 | Report envelope drift | Added a common JSON/table report envelope requiring `status`, `reason_code`, `side_effect_class`, `effect_vector`, scope/window metadata, and structured `next_action`. |
 | Dynamic command injection risk | Replaced dynamic `safe_command`/`dry_run_command` strings with structured `safe_argv` and allowlisted display rendering. |
 | Management error injection risk | Added central tests requiring management JSON/HTML/error bodies and encoded promotional text to be discarded into local redacted reason codes. |
@@ -1860,7 +1863,7 @@ Propagation audit:
 - Secret-derived identifier redaction appears in non-negotiable constraints, report contract, M1/M2/M3 tests, and staged denylist.
 - Bounded management-query constraints appear in report contract, `keys stats`, `doctor`, `reload diff`, M4 capability tests, and D2 counter gate.
 - Client-token ref discoverability appears in command list, report contract, operator examples, first-run transcript, and M2.3.
-- The current progress baseline appears in Current Baseline And Preflight, M2 dependency text, the parallel execution matrix, and the stop record.
+- The current progress baseline appears in Current Baseline And Preflight, the parallel execution matrix, and the stop record.
 - The unified report envelope appears in the CLI contract, report contract, M2 stop card, M3/M4 stop cards, release smoke, and convergence record.
 - Structured `safe_argv` appears in the report contract, JSON skeleton, M2/M3/M4 next-action obligations, and release smoke expectations.
 - GitHub release and artifact verification appear in the release gate and are bounded to local Docker/Nix build output plus `gh release` publication checks.
@@ -1868,6 +1871,6 @@ Propagation audit:
 
 Stop record:
 
-Current status is internally converged and deliverable as a plan after the latest multi-agent review round. The current roadmap stops after M1-M4 are implemented, documented, locally tested, committed, released through the local Docker/Nix gate, and published through the GitHub release gate. The active implementation checkpoint is post-M2 stop-card: M1 and M2 are complete, M3 is the next implementation gate, and M4 is not started.
+Current status is internally converged after the latest plan-status review. M1-M4 are complete through the checked task sequence, documented commit/test evidence, and milestone stop-card evidence recorded in this document. The current roadmap stop remains M1-M4 plus the release gate; parked, rejected, and adjacent features are not pulled into this plan.
 
-Remaining implementation-time gates are narrow and already bounded by the milestone text: M2 must reconcile completed commands against the unified report envelope; M3 individual credential workflows depend on non-secret `credential_ref`; M3 probe-apply depends on a read-only apply plan and a mutating precondition; M4 typed reload diff proceeds only if an existing staged projection exists; M4 reload apply requires enforceable generation/plan preconditions or fails closed; D2 counters remain deferred unless the maintainer records a separate performance decision. M3 import dry-run is locked to CLI-local preview and must disclose that confirmed imports can become route-eligible immediately under current backend semantics. M3 local model-route onboarding closes as a `runtime_readonly` planning workflow, not as upstream discovery or client-visible model exposure. Default-model injection and Responses-to-Chat implementation are not authorized by this plan and require separate protocol/request-path plans.
+The active checkpoint is release/operations evidence follow-up, not continued M3/M4 expansion. Current release follow-up evidence may cite the known `v0.1.6` release/gateway pin fact, but only as current release follow-up evidence, not as historical task evidence for any M1-M4 checkbox. D2 counters remain deferred unless the maintainer records a separate performance decision. Default-model injection and Responses-to-Chat implementation remain unauthorized by this plan and require separate protocol/request-path plans.

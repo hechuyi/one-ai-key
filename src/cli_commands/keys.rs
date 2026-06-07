@@ -2290,7 +2290,6 @@ mod tests {
     use serde_json::{json, Value};
     use std::{
         fs,
-        path::Path,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, Mutex,
@@ -2298,8 +2297,8 @@ mod tests {
     };
 
     fn temp_keys_file(name: &str, content: &str) -> std::path::PathBuf {
-        let root = Path::new("target")
-            .join("test-output")
+        let root = std::env::temp_dir()
+            .join("one-ai-key-test-output")
             .join(format!("keys-import-{name}-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("replacement.keys");

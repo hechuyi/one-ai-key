@@ -241,8 +241,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        PathBuf::from("target")
-            .join("test-output")
+        PathBuf::from("tmp")
+            .join("one-ai-key-test-output")
             .join(format!("{prefix}-{suffix}"))
             .join(filename)
     }

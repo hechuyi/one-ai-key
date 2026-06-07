@@ -32930,6 +32930,161 @@ model_routes:
     }
 
     #[tokio::test]
+    async fn chat_provider_cooldown_single_route_target_is_soft_last_resort() {
+        let upstream_hits = Arc::new(AtomicU64::new(0));
+        let upstream_hits_for_handler = upstream_hits.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let upstream_hits = upstream_hits_for_handler.clone();
+                async move {
+                    let hit = upstream_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if hit == 1 {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            [(header::RETRY_AFTER, "1")],
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "upstream_unavailable",
+                                    "message": "provider unavailable"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "chat-ok"}}
+                        ]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let mut pool = openai_pool(
+            "https://chat-primary.example.invalid/v1",
+            "chat-credentials",
+        );
+        pool.account = Some("chat-account".to_string());
+
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("chat-primary".to_string()),
+                providers: HashMap::from([(
+                    "chat-provider".to_string(),
+                    ProviderConfig {
+                        provider_kind: ProviderKind::OpenAiCompatible,
+                        enabled: true,
+                    },
+                )]),
+                accounts: HashMap::from([(
+                    "chat-account".to_string(),
+                    AccountConfig {
+                        provider: "chat-provider".to_string(),
+                        api_base,
+                        auth_header: "authorization".to_string(),
+                        auth_prefix: "Bearer ".to_string(),
+                        enabled: true,
+                    },
+                )]),
+                credential_sets: credential_sets_from_files([(
+                    "chat-credentials",
+                    temp_keys_file("chat-key\n"),
+                )]),
+                model_routes: HashMap::from([priority_route("gpt-chat-cooling", ["chat-primary"])]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([("chat-primary".to_string(), pool)]),
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+
+        let first = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-chat-cooling","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.channels.channel_route_state("chat-primary"),
+            ChannelRouteState::ProviderCoolingDown
+        );
+
+        let second = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-chat-cooling","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+        let body = to_bytes(second.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"].as_str(),
+            Some("chat-ok")
+        );
+    }
+
+    #[tokio::test]
     async fn response_filter_redacts_success_json_body() {
         let upstream = Router::new().route(
             "/v1/chat/completions",

@@ -302,6 +302,8 @@ release artifact instead of compiling locally. Details are in
   management API boundaries.
 - [Response filter](docs/response-filter.md): successful-response filtering,
   pre-commit rejection actions, event boundaries, and alert semantics.
+- [Operations](docs/operations.md): deployment boundaries, persistent state,
+  safe diagnostics, and release smoke checks.
 - [Performance budget](docs/performance-budget.md): request-path and memory
   constraints.
 - [Release build](docs/release-build.md): local x86_64 Docker/Nix release
