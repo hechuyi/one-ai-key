@@ -73,6 +73,25 @@ from docs and release-smoke output:
 - Are release artifacts, build caches, runtime state, configs, keys, databases,
   logs, `AGENTS.md`, and private scripts excluded from Git staging?
 
+The release is a coherent capability package, not a stream of unrelated small
+patches. Internal tasks stay small for reviewability, but the user-facing
+milestone is one bounded package with five gates:
+
+1. **Release Artifact Confidence:** the published-form artifact can be unpacked,
+   started, and smoked without a source checkout.
+2. **Local Configuration And Model Visibility:** offline `check-config`,
+   authenticated `/v1/models`, `models explain`, and `route explain` agree on
+   the representative public model and client-token reference.
+3. **Operator Command Safety:** read-only, dry-run, upstream-touching, and
+   mutating operator reports expose side-effect class, effect vector,
+   confirmation, and structured safe next commands.
+4. **Failure Evidence Boundary:** recent failure evidence is bounded, redacted,
+   source-local, and explicitly not historical incident storage or a routing
+   input.
+5. **Release Documentation And Deployment Boundary:** docs describe stable
+   install, operation, release, and deployment-pin contracts without private
+   support-thread residue.
+
 ## Operator Decision Contract
 
 Every `v0.2` smoke, report test, and stop-card record must preserve this triad:
@@ -185,25 +204,41 @@ live upstream catalogs, failure ledgers, or operator reports.
 
 ### Config Field Admission Gate
 
-`v0.2` adds no public configuration field. Any future YAML, registry,
-CLI-default, environment, or management-stored field must have a checked
-admission record before implementation starts. Missing evidence blocks the
-task.
+`v0.2` adds no public configuration field. A user-experience gap is not evidence
+that a new YAML field is needed. YAML is accepted only when the behavior must
+persist across restarts, affects compiled runtime behavior or a stable
+management projection, and cannot be represented as a CLI flag, management query
+parameter, or init-template default.
 
-| Gate | Required answer |
-| --- | --- |
-| Owner domain | One of: offline config diagnostics, control-plane registry resolution, management projection, data-plane route policy, credential lifecycle, response filtering, release tooling. Catch-all ownership is rejected. |
-| User contract | The field's operator-visible behavior in one sentence, including whether it changes client-visible `/v1/*` behavior. |
-| Scope | Exact resource type: route target, channel, credential set, policy profile, routing profile, client-token scope, response-filter rule, or management query. Global fields are rejected unless no narrower owner exists. |
-| Resolution phase | One of: CLI flag parse, offline `check-config`, startup registry resolution, staged registry reload, management query only. Request-time parsing is rejected. |
-| Compiled projection | Name the concrete compiled runtime field or state slot the request path reads. If none exists, the field cannot affect forwarding. |
-| Hot-path access proof | State that the request path performs no YAML read, SQLite/store query, management call, upstream catalog call, filesystem read, dynamic regex compile, or unbounded map insertion for this field. |
-| Cardinality/memory bound | Maximum number of values and whether the bound is config-validated before runtime. Unbounded per-model/provider/key/user dimensions are rejected. |
-| Failure mode | Stable reason code when the field is malformed, unsupported, deprecated, or conflicts with another field. |
-| Management explanation | Which existing management/report command exposes the resolved effect. If none, explain why operator visibility is unnecessary. |
-| Redaction class | Trusted local id, operator credential ref, bounded enum, count, or hidden. Secret-derived, URL-like, token-like, upstream free-form, and promotional/injection-like values are rejected. |
-| Tests | Named tests for parse/resolve, hot-path negative proof, redaction, docs, and backward compatibility. |
-| Docs | README/configuration/technical-design location. Product docs must not present the field as catalog, billing, UI, protocol bridge, or automation-platform behavior. |
+Operator diagnostics, report shape, bounded query windows, one-time maintenance
+choices, dry-run/apply decisions, and next-action presentation belong to CLI or
+management query surfaces first. Init templates may render explicit existing
+configuration fields, but templates must not introduce hidden runtime presets.
+Any field whose primary purpose is operator report presentation, one-time
+maintenance choice, or next-action selection is rejected as YAML unless it
+changes compiled runtime behavior with a bounded projection.
+
+Any future YAML, registry, CLI-default, environment, or management-stored field
+must have a checked admission record before implementation starts. Missing
+evidence blocks the task. The record must answer exactly these seven questions:
+
+1. **Owner domain:** exact domain owner; catch-all ownership is rejected.
+2. **User contract:** one sentence describing operator-visible behavior and
+   whether client-visible `/v1/*` behavior changes.
+3. **Why YAML, not CLI/query/template:** why this must persist as runtime
+   configuration instead of being a query flag, management parameter, or
+   init-template default.
+4. **Resolution and compiled projection:** parse/validate phase, compiled
+   runtime field read by the request path, and proof that forwarding does not
+   read YAML, stores, management APIs, or upstream catalogs.
+5. **Bounds and failure mode:** cardinality/memory bounds, validation point, and
+   stable reason code for malformed, unsupported, conflicting, or deprecated
+   values.
+6. **Redaction and observability:** which management/CLI report exposes the
+   resolved effect and which values are hidden, local ids, bounded enums,
+   counts, or credential refs.
+7. **Tests and docs:** named tests for parse/resolve, hot-path negative proof,
+   report/redaction, backward compatibility, and exact documentation location.
 
 Fields that only tune operator reports belong to CLI flags or management query
 parameters before they belong in YAML. Fields that affect request forwarding
@@ -386,6 +421,9 @@ says the production deployment has already been updated.
 
 ## Stop Nodes
 
+Stop-card field status values are closed: `pass`, `fail`, `deferred`,
+`not_run_by_design`, `operator_provided`, and `blocked_separate_plan`.
+
 `v0.2_local_release_ready` is complete only when the fixed local evidence set is
 present:
 
@@ -413,46 +451,27 @@ When a stop node is complete, stop. New findings must be classified as
 release-smoke cases, docs sections, or review rounds without replacing an
 existing matrix item or writing a separate accepted plan.
 
-## Optional Hygiene Package B: Main Boundary Diet
+When all required stop-card fields are present with an allowed status, `v0.2`
+release closure is complete. Do not continue searching for additional
+release-smoke cases, documentation gaps, refactor opportunities, or request-path
+stability improvements in this plan. A failed field may be fixed by returning to
+the owning task and rerunning the same finite gate; it must not expand the gate
+unless a plan update replaces an existing item.
+
+## Post-Release Architecture Debt: Main Boundary Diet
 
 Purpose: stop `src/main.rs` from remaining the default home for every route,
 role gate, CLI dispatch, and integration test.
 
 `src/main.rs` is currently too large to be a sustainable boundary. `v0.2` still
-must avoid broad refactoring. This package is allowed only after Capability
-Package A and release stop-card evidence are complete. It is not required to
-answer whether a personal operator can use the release, why a route is
-unavailable, or what safe command comes next.
+must avoid broad refactoring. Main boundary work is therefore not part of
+`v0.2` release closure. The `v0.2` release stop card records
+`route_boundary_extraction: deferred`.
 
-If it risks delaying release smoke, changing route registration behavior, or
-touching request-path semantics, defer it to a separate refactor plan after
-`v0.2`. The `v0.2` release stop card may record
-`route_boundary_extraction: deferred` without blocking release.
-
-Preferred slice:
-
-- create `src/app_routes.rs`;
-- move management route specs, management role gate helpers, unregistered
-  management route handler, and Axum route registration into that module;
-- keep existing handler functions in existing management modules;
-- expose one small builder function consumed by `src/main.rs`;
-- add route/role equivalence tests near the new module.
-
-Fallback slice if route registration is too entangled:
-
-- create `src/server.rs`;
-- move app construction and listener startup boundary only;
-- keep route registration unchanged;
-- add a focused behavior-equivalence test.
-
-Forbidden in this package:
-
-- no extraction of multiple slices in one task;
-- no changes to `src/proxy.rs`, `src/routing.rs`, or `src/pool.rs`;
-- no new framework, plugin system, generic route registry, or diagnostics
-  platform;
-- no changes to route paths, HTTP methods, management roles, auth behavior, or
-  client-visible error shapes.
+A later refactor plan may choose one narrow slice only, such as app construction
+or route registration, and must prove route path, method, role, auth, and error
+shape equivalence before moving code. It must not move role/auth policy together
+with route registration merely to create a new catch-all module.
 
 ## Files And Ownership
 
@@ -463,12 +482,6 @@ Expected `v0.2` write set:
 - Modify: `README.md`
 - Modify: `docs/operations.md`
 - Modify: `docs/release-build.md`
-
-Optional `v0.2` hygiene write set:
-
-- Create: `src/app_routes.rs` or `src/server.rs`
-- Modify: `src/main.rs`
-- Modify focused tests colocated with the changed module
 
 Conditional write set:
 
@@ -495,6 +508,18 @@ Files that must not become catch-all homes:
 - `src/config.rs`
 - `src/state.rs`
 - `src/cli_commands/keys.rs`
+- `src/cli_commands/failures.rs`
+
+`src/cli_commands/failures.rs` is allowed to project the existing routing
+telemetry and response-filter event windows into a redacted operator report. It
+must not become the owner for new event lifecycles, long-term taxonomy,
+cross-source correlation, persistent failure ledgers, analytics summaries, or
+request-path retry behavior.
+
+`src/cli_report.rs` owns rendering and the common report envelope only. Legacy
+top-level flattening is compatibility surface; new report data must use an
+explicit slot such as `data`, `scope`, `window`, `effect_vector`, or
+`next_action`, not arbitrary promotion from command-private payloads.
 
 `src/config.rs` being too broad is a recorded architecture debt, not a `v0.2`
 release blocker. Any resolver/compiler extraction requires a separate plan with
@@ -524,6 +549,18 @@ the current resolver.
 - Read: `.dockerignore`
 - Read: `AGENTS.md`
 - Read: `docs/release-build.md`
+
+- [ ] **Step 0: Set repository-external Cargo target for this session**
+
+Run:
+
+```bash
+export CARGO_TARGET_DIR="${TMPDIR:-/tmp}/one-ai-key-operator-confidence-target"
+```
+
+Expected: all local Cargo verification in this plan writes build cache outside
+the repository. Remove that directory after the local verification batch if no
+longer needed.
 
 - [ ] **Step 1: Confirm clean worktree**
 
@@ -623,7 +660,13 @@ git commit -m "test: close release smoke matrix"
 **Files:**
 
 - Modify test modules near `src/cli_report.rs`, `src/cli_effects.rs`, and
-  existing command modules as needed.
+  existing command modules only when the command already owns that report.
+
+This task locks existing report/effect contracts. It must not reshape command
+business semantics. If a representative command lacks the unified envelope,
+safe next action, or side-effect metadata, either record a `blocking_defect` or
+make the smallest compatibility fix with an explicit owner/interface note. Do
+not batch-edit `src/cli_commands/*.rs`.
 
 - [ ] **Step 1: List existing report/effect tests**
 
@@ -650,6 +693,9 @@ Cover:
   response-filter events default to 1024 in-memory events, each rejects public
   configuration outside 1 to 4096, `failures` defaults to 50 records per source,
   caps each source at 200, and returns at most 400 combined records.
+- failure report changes stay within existing event sources and the existing
+  operator projection; new event types, persistent storage, cross-source
+  correlation, analytics, and retry behavior belong to separate plans.
 
 - [ ] **Step 3: Run narrow tests and prove filters are non-empty**
 
@@ -698,6 +744,10 @@ Cover:
 - empty visibility reports a stable reason;
 - deprecated fields/templates warn without rewriting config.
 
+Tests may call only existing config/check-config projection APIs. Do not create
+new resolver/compiler modules, helper route planners, or duplicate public-model
+visibility resolution inside diagnostics.
+
 - [ ] **Step 3: Avoid resolver semantic changes**
 
 If a test requires changing accepted YAML, defaults, route resolution, startup
@@ -725,6 +775,11 @@ Only stage files actually changed.
   inline test additions, unless a separate maintainer decision explicitly
   reclassifies the task. If the only practical test location is inside those
   files, stop and record a `v0.3_testability_blocker`.
+
+The roadmap's M3 stability contract is context, not a `v0.2` implementation
+queue. Do not implement provider/account cooldown changes, retry/fallback
+changes, streaming retry behavior, response buffering changes, or guarded body
+behavior in this task.
 
 - [ ] **Step 1: Locate existing pre-output stability tests**
 
@@ -767,79 +822,27 @@ git commit -m "test: characterize pre-output stability boundary"
 
 Do not stage production request-path files for this task.
 
-### Task 5: Optional Main Boundary Diet
+### Task 5: Record Main Boundary Debt As Deferred
 
 **Files:**
 
-- Create: `src/app_routes.rs` preferred, or `src/server.rs` fallback.
-- Modify: `src/main.rs`
+- Modify: stop-card document only if Task 7 creates one.
 
-- [ ] **Step 0: Confirm release confidence is already closed**
+- [ ] **Step 1: Do not refactor `src/main.rs` in `v0.2`**
 
-Run:
+Main boundary diet is post-release architecture debt. Do not create
+`src/app_routes.rs` or `src/server.rs`, do not move route registration, and do
+not change management role/auth ownership in this plan.
 
-```bash
-scripts/local-ci.sh
-scripts/build-release-x86_64-linux-docker.sh
-scripts/release-smoke.sh
-```
+- [ ] **Step 2: Record the status**
 
-Expected: pass. If any command fails, skip this optional hygiene package and
-return to Capability Package A.
-
-- [ ] **Step 1: Choose exactly one extraction slice**
-
-Preferred:
+Task 7 must record:
 
 ```text
-management route specs + role gate helpers + route registration -> src/app_routes.rs
+route_boundary_extraction: deferred
 ```
 
-Fallback:
-
-```text
-server app construction/listener boundary -> src/server.rs
-```
-
-Record the chosen slice in the commit message.
-
-- [ ] **Step 2: Write equivalence tests before moving behavior**
-
-Tests must prove route path/method/role equivalence and management URL behavior
-where practical.
-
-- [ ] **Step 3: Move the minimum code**
-
-Do not rename routes, handlers, roles, auth behavior, request extractors, or
-error shapes.
-
-- [ ] **Step 4: Run narrow and full checks**
-
-Run:
-
-```bash
-cargo fmt -- --check
-cargo test --locked app_routes -- --list
-cargo test --locked app_routes
-cargo test --locked
-```
-
-If the chosen module is `src/server.rs`, use the matching non-empty filter.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git status -sb --untracked-files=all
-git diff --name-only
-# Preferred slice:
-git add src/main.rs src/app_routes.rs
-# Fallback slice, only if src/server.rs was chosen instead:
-# git add src/main.rs src/server.rs
-git diff --cached --name-only
-git commit -m "refactor: extract app route boundary"
-```
-
-Do not stage both `src/app_routes.rs` and `src/server.rs`.
+This is an accepted `v0.2` completion state, not a release blocker.
 
 ### Task 6: Documentation Closure
 
@@ -887,6 +890,18 @@ git commit -m "docs: close operator confidence release docs"
 **Files:**
 
 - Read-only verification unless docs need correction.
+
+The final gate command list is closed. Do not add exploratory checks during
+Task 7. If a listed command fails, fix the owning task and rerun the same finite
+gate, or record `blocking_defect`, `v0.3_blocker`, or `post_release_debt`.
+Additional release-smoke cases, docs audits, or refactor opportunities require a
+plan update that replaces an existing item or a separate accepted plan.
+
+Steps 1-5 plus Step 8 produce `v0.2_local_release_ready`. Step 6 belongs to the
+separate `v0.2_published_release_complete` stop node and runs only after an
+upload action exists. Step 7 records deployment boundary evidence; it never
+blocks local release readiness unless the release claim says production was
+updated.
 
 - [ ] **Step 1: Run local CI**
 
@@ -966,6 +981,10 @@ filename, and release notes version match.
 Expected: uploaded assets are exactly the release tarball and checksum sidecar
 unless a separate packaging task explicitly added more artifacts.
 
+If upload is not part of the current task, record
+`published_asset_verification: not_run_by_design`. This does not block
+`v0.2_local_release_ready`.
+
 - [ ] **Step 7: Record deployment pin boundary**
 
 Do not touch production servers in this task. Record one of:
@@ -993,9 +1012,19 @@ git diff --cached --name-only
 Expected: no staged `dist/`, `target/`, `key-pool-router/`, `config/`, `data/`,
 SQLite, logs, key files, private scripts, or `AGENTS.md`.
 
-Also verify the staged diff adds no client-facing protocol compatibility, live
-catalog aggregation, billing/usage analytics, UI/multi-tenancy, background
-probing, adaptive routing, or automatic discover/apply/reload/scope behavior.
+Complete this fixed anti-platform checklist against the staged diff:
+
+- no client-facing protocol compatibility expansion;
+- no live catalog aggregation;
+- no billing or usage analytics;
+- no UI or multi-tenancy concepts;
+- no background probing;
+- no adaptive routing;
+- no automatic discover/apply/reload/scope behavior.
+
+This checklist is not a mandate for open-ended repository search. A checklist
+hit is a blocking defect for the owning task; otherwise record
+`anti_platform_gate_result: pass`.
 
 - [ ] **Step 9: Record `v0.2` stop card**
 
@@ -1065,6 +1094,29 @@ The one extra attempt is mutually exclusive: retry a different credential on
 the same channel, retry one eligible frozen route target, or retry the same
 target once as a last resort. These choices must not chain inside the same
 original client request.
+
+This is the top-level hard constraint for `v0.3`: every original client request
+has one shared extra-attempt budget, and credential retry, route-target retry,
+and same-target retry are mutually exclusive consumers of that budget.
+
+`v0.3` must distinguish route admission failures from selected-target
+pre-output transient failures. Missing scope, missing model route, disabled
+targets, empty credential pools, hard channel cooldown, unsupported endpoint
+family, and stale runtime state remain explainable local failures; retry must
+not manufacture a route candidate. Only a request that has already entered an
+eligible frozen route plan may consume the conservative retry budget.
+
+Initial `v0.3` acceptance tests are limited to:
+
+- route-admission `no_route_candidate` is not retried;
+- non-streaming `/v1/responses` 503-before-body retries once when all gates pass;
+- streaming Chat/Responses never retry, even on pre-header failure;
+- route-target retry uses only frozen candidates;
+- single-target transient failure retries the same target at most once;
+- `Retry-After` or hard cooldown blocks same-target retry;
+- credential retry, route-target retry, and same-target retry do not chain;
+- the retry path performs no YAML, SQLite, registry, credential-store,
+  client-token-store, live catalog, background-health, or persistent-ledger read.
 
 `v0.3` must not add:
 

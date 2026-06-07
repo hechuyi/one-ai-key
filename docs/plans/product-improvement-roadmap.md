@@ -118,7 +118,7 @@ failure evidence, background jobs, or automatic scope mutation.
 
 ## Roadmap
 
-### M1: Self-Explanation Contract
+### M1: Can This Client Call This Model?
 
 **Goal:** make the router answer the operator's core question:
 
@@ -157,7 +157,7 @@ Acceptance gates:
 - deprecated config diagnostics report risk but do not rewrite config or change
   route semantics.
 
-### M2: Bounded Maintenance And Failure Evidence
+### M2: Can I Maintain Keys And Understand Failures Safely?
 
 **Goal:** make daily maintenance less ad hoc without creating a control-plane
 platform.
@@ -189,24 +189,31 @@ promote it as a daily-maintenance dependency, add new action enums, add batch
 auto-apply, or let probe evidence mutate credentials without an explicit
 management action.
 
-Failure evidence is not a routing input and must not be used to absorb
-upstream jitter. The minimum failure evidence comes only from two in-memory
-rings: routing telemetry controlled by `routing.telemetry_buffer_capacity` and
-response-filter events controlled by `response_filter.event_window_capacity`.
-Both default to 1024 events and reject public configuration outside 1 to 4096.
-Management API reads are paged separately: event endpoints default to a 100-item
-page and clamp a single page to 1000 items. CLI failure summaries are narrower
-for one-screen operation: `one-ai-key failures` defaults to 50 records per
-source and caps each source at 200, so a combined routing + response-filter
-report can return at most 400 records. Overflow, dropped appends, and
-runtime-reload shrink only increment the relevant dropped counter; they must
-not block proxy requests or management reads. This roadmap does not introduce a
-persistent failure ledger.
+Failure evidence is bounded recent decision evidence, not historical incident
+storage. It is not a routing input and must not be used to absorb upstream
+jitter. `not_found_in_window` means no matching event was present in the fetched
+bounded source windows; it does not prove the event never happened.
 
-Failure evidence should be minimal: request id, time bucket, endpoint family,
-public model, channel/credential reference when safe, failure kind, retry
-decision, commit state, streaming state, duplicate-charge risk, and dropped
-event count.
+The minimum failure evidence comes only from two in-memory rings: routing
+telemetry controlled by `routing.telemetry_buffer_capacity` and response-filter
+events controlled by `response_filter.event_window_capacity`. Both default to
+1024 events and reject public configuration outside 1 to 4096. Management API
+reads are paged separately: event endpoints default to a 100-item page and clamp
+a single page to 1000 items. CLI failure summaries are narrower for one-screen
+operation: `one-ai-key failures` defaults to 50 records per source and caps each
+source at 200, so a combined routing + response-filter report can return at most
+400 records. Overflow, dropped appends, and runtime-reload shrink only increment
+the relevant dropped counter; they must not block proxy requests or management
+reads. This roadmap does not introduce a persistent failure ledger.
+
+Every failure projection should include only whitelisted bounded facts when
+known: source, event kind, created-at bucket, endpoint family, public model,
+client-token reference, selected target/channel reference, safe credential
+reference, failure source, failure kind, failure scope, reason code, retry
+directive or denial reason, duplicate-charge risk, client-visible status, and
+source-local window metadata. Response-filter projections may include sanitized
+rule id, action, content kind, reason code, outcome, and whether the body was
+already committed.
 
 Management failure-evidence output is a field whitelist, not raw telemetry
 serialization. Displayable string fields are local identifiers only: trimmed,
@@ -239,7 +246,7 @@ Hard channel cooldown from relay balance, response-filter rejection, disabled
 channels, runtime lock contention, and empty credential pools remain admission
 blockers.
 
-### M3: Conservative Pre-Output Stability
+### M3: Can One Transient Upstream Miss Be Retried Safely?
 
 **Goal:** reduce client-visible failures from small upstream jitter without
 making retry behavior opaque.
@@ -247,6 +254,16 @@ making retry behavior opaque.
 This is the only stability behavior in this roadmap. It is a small capability
 package over explicit routing/profile mechanics, not a new stability engine and
 not a runtime YAML preset.
+
+M3 distinguishes route admission failure from selected-target pre-output
+failure. Route admission failures include missing client scope, missing public
+model route, disabled target/channel, empty or unusable credential pool, hard
+channel cooldown, unsupported endpoint family, and stale runtime state. Those
+failures must be explained; retry must not manufacture a route candidate.
+Selected-target pre-output failures are failures after a request has legally
+entered an eligible frozen route plan but before any upstream response bytes are
+sent to the client. Only that second class may enter the conservative retry
+gate.
 
 Allowed conservative retry:
 
