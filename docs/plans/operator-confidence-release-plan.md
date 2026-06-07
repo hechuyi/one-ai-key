@@ -554,7 +554,7 @@ the current resolver.
 - Read: `AGENTS.md`
 - Read: `docs/release-build.md`
 
-- [ ] **Step 0: Set repository-external Cargo target for this session**
+- [x] **Step 0: Set repository-external Cargo target for this session**
 
 Run:
 
@@ -571,7 +571,7 @@ through a wrapper that enforces that constraint. Repository-local `target/` is
 tolerated only as ignored transient state during ordinary development; it is not
 acceptable release-closure evidence.
 
-- [ ] **Step 1: Confirm clean worktree**
+- [x] **Step 1: Confirm clean worktree**
 
 Run:
 
@@ -581,7 +581,7 @@ git status -sb --untracked-files=all
 
 Expected: no unstaged or untracked implementation artifacts.
 
-- [ ] **Step 2: Confirm no repository-local build caches**
+- [x] **Step 2: Confirm no repository-local build caches**
 
 Run:
 
@@ -594,7 +594,7 @@ Expected: no `target/`, no `key-pool-router/`, no `__pycache__`, no `dist/`
 before implementation begins. Release build may recreate `dist/`, but it must
 not be staged.
 
-- [ ] **Step 3: Confirm Git object garbage is not masking local bloat**
+- [x] **Step 3: Confirm Git object garbage is not masking local bloat**
 
 Run:
 
@@ -605,7 +605,7 @@ git count-objects -vH
 Expected: `garbage: 0`. If garbage exists, run `git gc --prune=now` before
 continuing.
 
-- [ ] **Step 4: Commit nothing**
+- [x] **Step 4: Commit nothing**
 
 This task is a guardrail only.
 
@@ -615,7 +615,7 @@ This task is a guardrail only.
 
 - Modify: `scripts/release-smoke.sh`
 
-- [ ] **Step 1: Inspect current smoke coverage**
+- [x] **Step 1: Inspect current smoke coverage**
 
 Run:
 
@@ -627,14 +627,14 @@ Expected: identify current artifact extraction, generated temp config, mock
 upstream, service startup, data-plane smoke, management smoke, and negative
 management-url check.
 
-- [ ] **Step 2: Add only missing fixed matrix entries**
+- [x] **Step 2: Add only missing fixed matrix entries**
 
 Update `scripts/release-smoke.sh` so it covers the artifact-smoke matrix above.
 Keep local placeholder tokens and local mock upstreams only. Do not grow smoke
 with every negative branch; put combinatorial reason-code, redaction, failure
 window, endpoint-family, and credential-state cases in contract tests.
 
-- [ ] **Step 3: Shell-check by execution parser**
+- [x] **Step 3: Shell-check by execution parser**
 
 Run:
 
@@ -644,7 +644,7 @@ bash -n scripts/release-smoke.sh
 
 Expected: pass.
 
-- [ ] **Step 4: Verify release-smoke does not depend on repository-local build
+- [x] **Step 4: Verify release-smoke does not depend on repository-local build
 output except `dist/`**
 
 Run:
@@ -655,7 +655,7 @@ rg -n "cargo run|target/|key-pool-router|real upstream|sk-|Bearer [A-Za-z0-9._-]
 
 Expected: no match except harmless comments if introduced deliberately.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git status -sb --untracked-files=all
@@ -677,7 +677,7 @@ safe next action, or side-effect metadata, either record a `blocking_defect` or
 make the smallest compatibility fix with an explicit owner/interface note. Do
 not batch-edit `src/cli_commands/*.rs`.
 
-- [ ] **Step 1: List existing report/effect tests**
+- [x] **Step 1: List existing report/effect tests**
 
 Run:
 
@@ -689,7 +689,7 @@ cargo test --locked cli_effects -- --list
 Expected: non-zero relevant tests, or a clear local note that a broader named
 filter is needed.
 
-- [ ] **Step 2: Add contract tests for existing report behavior**
+- [x] **Step 2: Add contract tests for existing report behavior**
 
 Cover:
 
@@ -706,12 +706,12 @@ Cover:
   operator projection; new event types, persistent storage, cross-source
   correlation, analytics, and retry behavior belong to separate plans.
 
-- [ ] **Step 3: Run narrow tests and prove filters are non-empty**
+- [x] **Step 3: Run narrow tests and prove filters are non-empty**
 
 Run the relevant `cargo test --locked <filter> -- --list` command first, then
 run the same filter normally.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git status -sb --untracked-files=all
@@ -733,7 +733,7 @@ Do not use `git add src/cli_commands` unless every file listed by
 - Modify: `src/config_diagnostics.rs` only if required.
 - Modify tests near existing config diagnostics.
 
-- [ ] **Step 1: Characterize current offline diagnostics**
+- [x] **Step 1: Characterize current offline diagnostics**
 
 Run:
 
@@ -743,7 +743,7 @@ rg -n "check-config|diagnostic|deprecated|visibility" src tests docs
 
 Expected: identify existing diagnostic owner and tests.
 
-- [ ] **Step 2: Add tests for current offline guarantees**
+- [x] **Step 2: Add tests for current offline guarantees**
 
 Cover:
 
@@ -757,12 +757,12 @@ Tests may call only existing config/check-config projection APIs. Do not create
 new resolver/compiler modules, helper route planners, or duplicate public-model
 visibility resolution inside diagnostics.
 
-- [ ] **Step 3: Avoid resolver semantic changes**
+- [x] **Step 3: Avoid resolver semantic changes**
 
 If a test requires changing accepted YAML, defaults, route resolution, startup
 failure semantics, or runtime state, stop and record a blocker.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git status -sb --untracked-files=all
@@ -790,7 +790,7 @@ queue. Do not implement provider/account cooldown changes, retry/fallback
 changes, streaming retry behavior, response buffering changes, or guarded body
 behavior in this task.
 
-- [ ] **Step 1: Locate existing pre-output stability tests**
+- [x] **Step 1: Locate existing pre-output stability tests**
 
 Run:
 
@@ -800,7 +800,7 @@ rg -n "retry_same_target|guarded_success|streaming_not_retryable|partial_output|
 
 Expected: identify current coverage.
 
-- [ ] **Step 2: Add characterization tests only**
+- [x] **Step 2: Add characterization tests only**
 
 Cover:
 
@@ -810,7 +810,7 @@ Cover:
 - guarded 2xx body behavior if already implemented;
 - duplicate-charge risk evidence if already emitted.
 
-- [ ] **Step 3: Treat every request-path behavior gap as a `v0.3` input**
+- [x] **Step 3: Treat every request-path behavior gap as a `v0.3` input**
 
 If characterization proves that upstream jitter is still too client-visible,
 record a `v0.3` blocker with the failing scenario, expected conservative gate,
@@ -818,7 +818,7 @@ and test name. Do not change production request-path code, retry policy,
 credential selection, route planning, streaming behavior, or response buffering
 in `v0.2`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git status -sb --untracked-files=all
@@ -837,13 +837,13 @@ Do not stage production request-path files for this task.
 
 - Modify: stop-card document only if Task 7 creates one.
 
-- [ ] **Step 1: Do not refactor `src/main.rs` in `v0.2`**
+- [x] **Step 1: Do not refactor `src/main.rs` in `v0.2`**
 
 Main boundary diet is post-release architecture debt. Do not create
 `src/app_routes.rs` or `src/server.rs`, do not move route registration, and do
 not change management role/auth ownership in this plan.
 
-- [ ] **Step 2: Record the status**
+- [x] **Step 2: Record the status**
 
 Task 7 must record:
 
@@ -861,18 +861,18 @@ This is an accepted `v0.2` completion state, not a release blocker.
 - Modify: `docs/operations.md`
 - Modify: `docs/release-build.md`
 
-- [ ] **Step 1: Cold-read README as a personal operator**
+- [x] **Step 1: Cold-read README as a personal operator**
 
 Verify first screen states the product identity: lightweight OpenAI-compatible
 key router with explicit local model routes and redacted operator tooling.
 
-- [ ] **Step 2: Remove support-thread material**
+- [x] **Step 2: Remove support-thread material**
 
 Docs must not narrate private deployments, temporary keys, one-off incidents,
 chat history, real domains, server names, or workaround transcripts.
 This plan file follows the same rule.
 
-- [ ] **Step 3: Document stable workflows only**
+- [x] **Step 3: Document stable workflows only**
 
 Cover:
 
@@ -886,7 +886,7 @@ Cover:
 - build/publish release through Docker/Nix x86_64 path;
 - keep local config/state/build artifacts out of Git.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add README.md docs/operations.md docs/release-build.md
@@ -912,7 +912,7 @@ upload action exists. Step 7 records deployment boundary evidence; it never
 blocks local release readiness unless the release claim says production was
 updated.
 
-- [ ] **Step 1: Run local CI**
+- [x] **Step 1: Run local CI**
 
 Run:
 
@@ -922,7 +922,7 @@ scripts/local-ci.sh
 
 Expected: pass.
 
-- [ ] **Step 2: Prove release-contract tests are non-empty and pass**
+- [x] **Step 2: Prove release-contract tests are non-empty and pass**
 
 Run:
 
@@ -938,7 +938,7 @@ Expected: the test target exists, lists at least one test, and passes. If a
 future task uses any other filtered Cargo command, it must use the same non-zero
 `-- --list` proof first.
 
-- [ ] **Step 3: Build release through the supported path**
+- [x] **Step 3: Build release through the supported path**
 
 Run:
 
@@ -949,7 +949,7 @@ scripts/build-release-x86_64-linux-docker.sh
 Expected: `dist/one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz` and
 matching `.sha256`.
 
-- [ ] **Step 4: Verify release artifact shape**
+- [x] **Step 4: Verify release artifact shape**
 
 Run:
 
@@ -970,7 +970,7 @@ printf '%s\n' "$PACKAGE_NAME" | diff -u - /tmp/one-ai-key-archive.list
 Expected: checksum sidecar contains only the archive basename, checksum passes,
 and the tarball contains only the release binary.
 
-- [ ] **Step 5: Run release smoke**
+- [x] **Step 5: Run release smoke**
 
 Run:
 
@@ -980,7 +980,7 @@ scripts/release-smoke.sh
 
 Expected: pass.
 
-- [ ] **Step 6: Verify GitHub release asset identity after upload**
+- [x] **Step 6: Verify GitHub release asset identity after upload**
 
 After the local release-ready gate passes and the release is uploaded, download
 the uploaded tarball and `.sha256` into a tempdir and verify the checksum from
@@ -994,7 +994,7 @@ If upload is not part of the current task, record
 `published_asset_verification: not_run_by_design`. This does not block
 `v0.2_local_release_ready`.
 
-- [ ] **Step 7: Record deployment pin boundary**
+- [x] **Step 7: Record deployment pin boundary**
 
 Do not touch production servers in this task. Record one of:
 
@@ -1008,7 +1008,7 @@ Do not touch production servers in this task. Record one of:
 The stop card must not imply production has been updated unless the evidence is
 present.
 
-- [ ] **Step 8: Verify staging denylist and anti-platform gate**
+- [x] **Step 8: Verify staging denylist and anti-platform gate**
 
 Run:
 
@@ -1043,7 +1043,7 @@ This checklist is not a mandate for open-ended repository search. A checklist
 hit is a blocking defect for the owning task; otherwise record
 `anti_platform_gate_result: pass`.
 
-- [ ] **Step 9: Record `v0.2` stop card**
+- [x] **Step 9: Record `v0.2` stop card**
 
 The release stop card must state only fixed fields:
 
@@ -1071,7 +1071,7 @@ The release stop card must state only fixed fields:
 - `v0.3_blockers`;
 - `next_version_candidates`.
 
-- [ ] **Step 10: Commit stop-card docs if needed**
+- [x] **Step 10: Commit stop-card docs if needed**
 
 ```bash
 git status -sb --untracked-files=all
