@@ -2046,7 +2046,10 @@ mod tests {
         let failures = report["data"]["failures"].as_array().unwrap();
 
         assert_eq!(report["window"]["limit"], serde_json::json!(MAX_LAST * 2));
-        assert_eq!(report["window"]["returned"], serde_json::json!(MAX_LAST * 2));
+        assert_eq!(
+            report["window"]["returned"],
+            serde_json::json!(MAX_LAST * 2)
+        );
         assert_eq!(
             report["data"]["failure_count"],
             serde_json::json!(MAX_LAST * 2)
@@ -2067,7 +2070,10 @@ mod tests {
         let evidence = report["data"]["evidence"].as_array().unwrap();
 
         assert_eq!(report["window"]["limit"], serde_json::json!(MAX_LAST * 2));
-        assert_eq!(report["window"]["returned"], serde_json::json!(MAX_LAST * 2));
+        assert_eq!(
+            report["window"]["returned"],
+            serde_json::json!(MAX_LAST * 2)
+        );
         assert_eq!(
             report["data"]["failure_count"],
             serde_json::json!(MAX_LAST * 2)
