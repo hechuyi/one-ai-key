@@ -73,7 +73,7 @@ where
                 serde_json::json!({
                     "id": id.as_ref(),
                     "object": "model",
-                    "owned_by": "key-pool-router"
+                    "owned_by": "one-ai-key"
                 })
             })
             .collect::<Vec<_>>()
@@ -190,12 +190,12 @@ mod tests {
                     {
                         "id": "gpt-4.1",
                         "object": "model",
-                        "owned_by": "key-pool-router"
+                        "owned_by": "one-ai-key"
                     },
                     {
                         "id": "claude-sonnet-4",
                         "object": "model",
-                        "owned_by": "key-pool-router"
+                        "owned_by": "one-ai-key"
                     }
                 ]
             })

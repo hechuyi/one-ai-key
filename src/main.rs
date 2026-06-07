@@ -699,7 +699,7 @@ async fn serve(config_path: String) -> anyhow::Result<()> {
     let app = app(state);
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!("key-pool-router listening on {listen}");
+    tracing::info!("one-ai-key listening on {listen}");
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

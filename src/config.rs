@@ -2083,7 +2083,7 @@ mod relay_hardening_phase_1a_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("litellm-proxy-relay-phase-1a-{suffix}.keys"));
+        let path = std::env::temp_dir().join(format!("one-ai-key-relay-phase-1a-{suffix}.keys"));
         fs::write(&path, contents).unwrap();
         path
     }

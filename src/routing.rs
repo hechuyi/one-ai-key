@@ -393,11 +393,9 @@ pub fn transition_after_failure(input: TransitionInput<'_>) -> TransitionResult 
         RetryDirective::ReturnCurrentError {
             reason: RetryDecisionReason::EffectiveDeadlineExhausted,
         }
-    } else if matches!(input.failure.primary_scope, FailureScope::ProviderAdapter) {
-        RetryDirective::ReturnCurrentError {
-            reason: RetryDecisionReason::FailureNotRetryable,
-        }
-    } else if !conservative_retry_evidence_allowed(&input) {
+    } else if matches!(input.failure.primary_scope, FailureScope::ProviderAdapter)
+        || !conservative_retry_evidence_allowed(&input)
+    {
         RetryDirective::ReturnCurrentError {
             reason: RetryDecisionReason::FailureNotRetryable,
         }
@@ -494,7 +492,7 @@ fn same_target_transient_retry_allowed(input: &TransitionInput<'_>) -> bool {
             FailureSource::UpstreamTransaction => input
                 .failure
                 .upstream_status
-                .is_some_and(|status| matches!(status, 502 | 503 | 504)),
+                .is_some_and(|status| matches!(status, 502..=504)),
             FailureSource::GuardedSuccessEnvelope | FailureSource::ResponseFilterPrecommit => false,
         }
 }
@@ -521,7 +519,7 @@ fn conservative_retry_evidence_allowed(input: &TransitionInput<'_>) -> bool {
                 return input
                     .failure
                     .upstream_status
-                    .is_some_and(|status| matches!(status, 502 | 503 | 504));
+                    .is_some_and(|status| matches!(status, 502..=504));
             }
             credential_retry_evidence_allowed(&input.failure)
         }
