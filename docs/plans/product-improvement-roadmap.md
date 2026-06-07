@@ -177,13 +177,20 @@ Acceptance gates:
   capped at 4096 events when explicitly configured;
 - status output is one-screen operational context, not an analytics product.
 
-Known follow-up to investigate after this milestone: production traffic through
-`one-ai-key` has shown `503 no route candidate` on `/v1/responses` materially
-more often than direct upstream-key use. Treat this as a router availability
-bug until disproven. The next investigation should compare client token/model
-scope, endpoint-family route visibility, credential/channel lifecycle state,
-frozen fallback candidates, and Responses endpoint handling before blaming the
-upstream.
+Absorbed availability follow-up: production traffic through `one-ai-key` showed
+`503 no route candidate` on `/v1/responses` materially more often than direct
+upstream-key use. The local fix treats provider/account transient cooldown as a
+soft route state: normal and degraded candidates still win, but if every
+otherwise valid route target is provider-cooling, the router may use it as a
+last resort instead of failing at admission. Within a frozen fallback chain,
+provider-cooling targets are skipped while later targets remain, so a
+Retry-After on one shared account does not immediately retry a sibling channel
+before external fallback. Hard channel cooldown from relay balance,
+response-filter rejection, disabled channels, runtime lock contention, and empty
+credential pools remain admission blockers. Production telemetry should still
+compare client token/model scope, endpoint-family route visibility,
+credential/channel lifecycle state, frozen fallback candidates, and Responses
+endpoint handling after release.
 
 ### M3: Conservative Pre-Output Stability
 

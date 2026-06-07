@@ -6,14 +6,41 @@ fn read_repo_file(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("failed to read {path}: {error}"))
 }
 
-fn parse_cargo_pkgid(package_id: &str) -> (&str, &str) {
+fn parse_cargo_pkgid_version(package_id: &str) -> &str {
     let package_fragment = package_id
         .trim()
         .rsplit_once('#')
         .map_or(package_id.trim(), |(_, package_fragment)| package_fragment);
     package_fragment
         .rsplit_once('@')
-        .unwrap_or_else(|| panic!("cargo pkgid output must end with @version: {package_id}"))
+        .map_or(package_fragment, |(_, version)| version)
+}
+
+fn cargo_workspace_root_package(metadata: &str) -> (String, String) {
+    let value: serde_json::Value = serde_json::from_str(metadata)
+        .unwrap_or_else(|error| panic!("cargo metadata output must be JSON: {error}"));
+    let root = value["workspace_members"]
+        .as_array()
+        .and_then(|members| members.first())
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("cargo metadata must report a workspace root member"));
+    let package = value["packages"]
+        .as_array()
+        .and_then(|packages| {
+            packages
+                .iter()
+                .find(|package| package["id"].as_str() == Some(root))
+        })
+        .unwrap_or_else(|| panic!("cargo metadata must include the workspace root package"));
+    let name = package["name"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace root package must have a name"))
+        .to_string();
+    let version = package["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace root package must have a version"))
+        .to_string();
+    (name, version)
 }
 
 #[cfg(unix)]
@@ -85,6 +112,10 @@ fn release_script_is_local_x86_64_linux_nix_command_gnu_packaging_contract() {
     assert!(
         script.contains("rustc --version"),
         "{path} must require rustc to be available in the active toolchain"
+    );
+    assert!(
+        script.contains("jq --version"),
+        "{path} must require jq for structured cargo metadata parsing"
     );
     assert!(
         script.contains("gzip --version"),
@@ -197,7 +228,7 @@ fn docker_release_wrapper_runs_local_amd64_nix_container_with_cached_nix_store()
         script.contains("nix-command flakes"),
         "{path} must enable nix-command and flakes"
     );
-    for package in ["cargo", "rustc", "gcc", "pkg-config", "openssl"] {
+    for package in ["cargo", "rustc", "jq", "gcc", "pkg-config", "openssl"] {
         assert!(
             script.contains(package),
             "{path} must make `{package}` available in the Nix shell"
@@ -220,43 +251,72 @@ fn docker_release_wrapper_runs_local_amd64_nix_container_with_cached_nix_store()
 }
 
 #[test]
-fn release_script_uses_cargo_pkgid_instead_of_greedy_metadata_json_sed_for_package_metadata() {
-    let path = "scripts/build-release-x86_64-linux.sh";
-    let script = read_repo_file(path);
+fn release_scripts_use_structured_cargo_metadata_without_greedy_json_sed() {
+    for path in [
+        "scripts/build-release-x86_64-linux.sh",
+        "scripts/release-smoke.sh",
+    ] {
+        let script = read_repo_file(path);
 
-    assert!(
-        script.contains("cargo pkgid --locked"),
-        "{path} must derive package metadata from cargo pkgid, not arbitrary cargo metadata JSON"
-    );
-    for key in ["name", "version"] {
-        let greedy_metadata_pattern = format!(r#"s/.*\"{key}\":"#);
         assert!(
-            !script.contains(&greedy_metadata_pattern),
-            "{path} must not use greedy sed extraction over cargo metadata JSON for `{key}`"
+            script.contains("cargo pkgid --locked"),
+            "{path} must keep cargo pkgid as the release version source"
         );
+        assert!(
+            script.contains("cargo metadata --locked --no-deps --format-version 1"),
+            "{path} must derive the package name from structured cargo metadata"
+        );
+        assert!(
+            script.contains(".workspace_members[0] as $root")
+                && script.contains("select(.id == $root)"),
+            "{path} must select the workspace root package, not an arbitrary package"
+        );
+        for key in ["name", "version"] {
+            let greedy_metadata_pattern = format!(r#"s/.*\"{key}\":"#);
+            assert!(
+                !script.contains(&greedy_metadata_pattern),
+                "{path} must not use greedy sed extraction over cargo metadata JSON for `{key}`"
+            );
+        }
     }
 }
 
 #[test]
-fn cargo_pkgid_package_name_source_resolves_to_one_ai_key_without_running_release_script() {
-    let output = Command::new("cargo")
+fn cargo_release_identity_sources_resolve_to_one_ai_key_without_running_release_script() {
+    let pkgid_output = Command::new("cargo")
         .args(["pkgid", "--locked"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .unwrap_or_else(|error| panic!("failed to run cargo pkgid --locked: {error}"));
     assert!(
-        output.status.success(),
+        pkgid_output.status.success(),
         "cargo pkgid --locked failed with status {:?}: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
+        pkgid_output.status.code(),
+        String::from_utf8_lossy(&pkgid_output.stderr)
     );
 
-    let package_id = String::from_utf8(output.stdout)
+    let package_id = String::from_utf8(pkgid_output.stdout)
         .unwrap_or_else(|error| panic!("cargo pkgid output must be UTF-8: {error}"));
-    let (package_name, package_version) = parse_cargo_pkgid(&package_id);
+    let pkgid_version = parse_cargo_pkgid_version(&package_id);
+
+    let metadata_output = Command::new("cargo")
+        .args(["metadata", "--locked", "--no-deps", "--format-version", "1"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run cargo metadata --locked: {error}"));
+    assert!(
+        metadata_output.status.success(),
+        "cargo metadata --locked failed with status {:?}: {}",
+        metadata_output.status.code(),
+        String::from_utf8_lossy(&metadata_output.stderr)
+    );
+    let metadata = String::from_utf8(metadata_output.stdout)
+        .unwrap_or_else(|error| panic!("cargo metadata output must be UTF-8: {error}"));
+    let (package_name, metadata_version) = cargo_workspace_root_package(&metadata);
 
     assert_eq!(package_name, "one-ai-key");
-    assert_eq!(package_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(metadata_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(pkgid_version, metadata_version);
 }
 
 #[test]

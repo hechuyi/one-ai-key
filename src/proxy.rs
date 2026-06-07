@@ -614,7 +614,9 @@ fn route_state_unavailable_response(
         return Some(no_route_candidate_response(&["channel_cooling_down"]));
     }
     let (status, code, message) = match state {
-        ChannelRouteState::Available | ChannelRouteState::Degraded => return None,
+        ChannelRouteState::Available
+        | ChannelRouteState::Degraded
+        | ChannelRouteState::ProviderCoolingDown => return None,
         ChannelRouteState::CoolingDown => unreachable!("cooling down handled above"),
         ChannelRouteState::Disabled => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -638,6 +640,17 @@ fn route_state_unavailable_response(
         ),
     };
     Some(json_error_with_code(status, code, message))
+}
+
+fn route_state_unavailable_response_for_attempt(
+    channel_id: &str,
+    state: ChannelRouteState,
+    route_target_available: bool,
+) -> Option<Response> {
+    if matches!(state, ChannelRouteState::ProviderCoolingDown) && route_target_available {
+        return Some(no_route_candidate_response(&["provider_cooling_down"]));
+    }
+    route_state_unavailable_response(channel_id, state)
 }
 
 fn credential_pool_exhausted_response(message: impl Into<String>) -> Response {
@@ -1170,11 +1183,13 @@ async fn forward_with_pool(
         let send_guard = pool_state.send_gate.read().await;
         let (selected, auth_header, auth_prefix, snapshot) = {
             let _mutation_guard = pool_state.mutation_gate.lock().await;
-            if let Some(response) = route_state_unavailable_response(
+            let route_state = target
+                .route_state
+                .most_restrictive(pool_state.route_state());
+            if let Some(response) = route_state_unavailable_response_for_attempt(
                 &pool_name,
-                target
-                    .route_state
-                    .most_restrictive(pool_state.route_state()),
+                route_state,
+                route_target_available,
             ) {
                 return PoolForwardResult::RouteFallback(response);
             }

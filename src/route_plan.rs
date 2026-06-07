@@ -85,10 +85,12 @@ pub enum RoutePreviewReason {
     ClientChannelScope,
     ChannelDisabled,
     ChannelCoolingDown,
+    ProviderCoolingDown,
     NoAvailableCredentials,
     RuntimeUnavailable,
     ChannelDegraded,
     DegradedLastResort,
+    ProviderCoolingDownLastResort,
     UnknownChannel,
     CandidateLimit,
 }
@@ -100,10 +102,14 @@ impl RoutePreviewReason {
             RoutePreviewReason::ClientChannelScope => "client_channel_scope",
             RoutePreviewReason::ChannelDisabled => "channel_disabled",
             RoutePreviewReason::ChannelCoolingDown => "channel_cooling_down",
+            RoutePreviewReason::ProviderCoolingDown => "provider_cooling_down",
             RoutePreviewReason::NoAvailableCredentials => "no_available_credentials",
             RoutePreviewReason::RuntimeUnavailable => "runtime_unavailable",
             RoutePreviewReason::ChannelDegraded => "channel_degraded",
             RoutePreviewReason::DegradedLastResort => "degraded_last_resort",
+            RoutePreviewReason::ProviderCoolingDownLastResort => {
+                "provider_cooling_down_last_resort"
+            }
             RoutePreviewReason::UnknownChannel => "unknown_channel",
             RoutePreviewReason::CandidateLimit => "candidate_limit",
         }
@@ -113,6 +119,7 @@ impl RoutePreviewReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelRouteState {
     Available,
+    ProviderCoolingDown,
     CoolingDown,
     Degraded,
     Disabled,
@@ -135,11 +142,12 @@ fn route_state_severity(state: ChannelRouteState) -> u8 {
     match state {
         ChannelRouteState::Available => 0,
         ChannelRouteState::Degraded => 1,
-        ChannelRouteState::RuntimeUnavailable => 2,
-        ChannelRouteState::CoolingDown => 3,
-        ChannelRouteState::NoAvailableCredentials => 4,
-        ChannelRouteState::Disabled => 5,
-        ChannelRouteState::UnknownChannel => 6,
+        ChannelRouteState::ProviderCoolingDown => 2,
+        ChannelRouteState::RuntimeUnavailable => 3,
+        ChannelRouteState::CoolingDown => 4,
+        ChannelRouteState::NoAvailableCredentials => 5,
+        ChannelRouteState::Disabled => 6,
+        ChannelRouteState::UnknownChannel => 7,
     }
 }
 
@@ -302,38 +310,47 @@ pub fn preview_route(input: RoutePreviewInput<'_>) -> RoutePreview {
         .collect();
     eligible.sort_by_key(|(index, target)| (target.priority, *index));
 
-    let has_available_eligible = eligible.iter().any(|(_, target)| {
-        !matches!(
-            input.channel_states.get(&target.channel_id),
-            Some(ChannelRouteState::Degraded)
-        )
-    });
-    if has_available_eligible {
+    if let Some(preferred_tier) = eligible
+        .iter()
+        .map(|(_, target)| route_state_candidate_tier(input.channel_states.get(&target.channel_id)))
+        .min()
+    {
         let mut retained = Vec::with_capacity(eligible.len());
         for (index, target) in eligible {
-            if matches!(
-                input.channel_states.get(&target.channel_id),
-                Some(ChannelRouteState::Degraded)
-            ) {
-                candidates[index]
-                    .reasons
-                    .push(RoutePreviewReason::ChannelDegraded);
-            } else {
-                retained.push((index, target));
+            let route_state = input.channel_states.get(&target.channel_id);
+            let tier = route_state_candidate_tier(route_state);
+            if tier > preferred_tier {
+                match route_state {
+                    Some(ChannelRouteState::Degraded) => {
+                        candidates[index]
+                            .reasons
+                            .push(RoutePreviewReason::ChannelDegraded);
+                    }
+                    Some(ChannelRouteState::ProviderCoolingDown) => {
+                        candidates[index]
+                            .reasons
+                            .push(RoutePreviewReason::ProviderCoolingDown);
+                    }
+                    _ => {}
+                }
+                continue;
             }
+            match input.channel_states.get(&target.channel_id) {
+                Some(ChannelRouteState::Degraded) => {
+                    candidates[index]
+                        .reasons
+                        .push(RoutePreviewReason::DegradedLastResort);
+                }
+                Some(ChannelRouteState::ProviderCoolingDown) => {
+                    candidates[index]
+                        .reasons
+                        .push(RoutePreviewReason::ProviderCoolingDownLastResort);
+                }
+                _ => {}
+            }
+            retained.push((index, target));
         }
         eligible = retained;
-    } else {
-        for (index, target) in &eligible {
-            if matches!(
-                input.channel_states.get(&target.channel_id),
-                Some(ChannelRouteState::Degraded)
-            ) {
-                candidates[*index]
-                    .reasons
-                    .push(RoutePreviewReason::DegradedLastResort);
-            }
-        }
     }
 
     if route.strategy == RouteStrategy::PriorityWeightedSticky {
@@ -370,6 +387,14 @@ pub fn preview_route(input: RoutePreviewInput<'_>) -> RoutePreview {
         candidate_limit: input.candidate_limit,
         selected_target_index,
         candidates,
+    }
+}
+
+fn route_state_candidate_tier(state: Option<&ChannelRouteState>) -> u8 {
+    match state {
+        Some(ChannelRouteState::Degraded) => 1,
+        Some(ChannelRouteState::ProviderCoolingDown) => 2,
+        _ => 0,
     }
 }
 
@@ -548,6 +573,32 @@ mod tests {
         assert_eq!(
             preview.candidates[0].reasons,
             vec![RoutePreviewReason::DegradedLastResort]
+        );
+    }
+
+    #[test]
+    fn provider_cooling_down_target_remains_last_resort_when_no_available_target_exists() {
+        let route = route_with_targets(vec![("provider-cooling", 0, 1)]);
+        let states = HashMap::from([(
+            ChannelId("provider-cooling".to_string()),
+            ChannelRouteState::ProviderCoolingDown,
+        )]);
+
+        let preview = preview_route(RoutePreviewInput {
+            request_id: "req-provider-cooling".to_string(),
+            registry_generation: 1,
+            public_model: Some("gpt-x".to_string()),
+            route: Some(&route),
+            channel_states: &states,
+            allowed_channels: &[],
+            candidate_limit: 16,
+        });
+
+        assert_eq!(preview.selected_target_index, Some(0));
+        assert!(preview.candidates[0].included);
+        assert_eq!(
+            preview.candidates[0].reasons,
+            vec![RoutePreviewReason::ProviderCoolingDownLastResort]
         );
     }
 
@@ -806,6 +857,100 @@ mod tests {
             plan.targets[0].channel_id,
             ChannelId("fallback".to_string())
         );
+    }
+
+    #[test]
+    fn route_plan_prefers_available_targets_over_provider_cooling_targets() {
+        let route = ModelRoute {
+            public_model: "gpt-x".to_string(),
+            strategy: RouteStrategy::Priority,
+            targets: vec![
+                RouteTarget {
+                    channel_id: ChannelId("primary".to_string()),
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    upstream_model: None,
+                    priority: 10,
+                    weight: 1,
+                    enabled: true,
+                },
+                RouteTarget {
+                    channel_id: ChannelId("fallback".to_string()),
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    upstream_model: None,
+                    priority: 20,
+                    weight: 1,
+                    enabled: true,
+                },
+            ],
+        };
+        let channel_states = HashMap::from([
+            (
+                ChannelId("primary".to_string()),
+                ChannelRouteState::ProviderCoolingDown,
+            ),
+            (
+                ChannelId("fallback".to_string()),
+                ChannelRouteState::Available,
+            ),
+        ]);
+
+        let preview = preview_route(RoutePreviewInput {
+            request_id: "req_test".to_string(),
+            registry_generation: 7,
+            public_model: Some("gpt-x".to_string()),
+            route: Some(&route),
+            channel_states: &channel_states,
+            allowed_channels: &[],
+            candidate_limit: 16,
+        });
+
+        assert!(!preview.candidates[0].included);
+        assert_eq!(
+            preview.candidates[0].reasons,
+            vec![RoutePreviewReason::ProviderCoolingDown]
+        );
+        assert!(preview.candidates[1].included);
+        assert_eq!(preview.selected_target_index, Some(1));
+    }
+
+    #[test]
+    fn route_plan_prefers_degraded_targets_over_provider_cooling_targets() {
+        let route = route_with_targets(vec![
+            ("provider-cooling", 0, 1),
+            ("degraded-fallback", 1, 1),
+        ]);
+        let channel_states = HashMap::from([
+            (
+                ChannelId("provider-cooling".to_string()),
+                ChannelRouteState::ProviderCoolingDown,
+            ),
+            (
+                ChannelId("degraded-fallback".to_string()),
+                ChannelRouteState::Degraded,
+            ),
+        ]);
+
+        let preview = preview_route(RoutePreviewInput {
+            request_id: "req_test".to_string(),
+            registry_generation: 7,
+            public_model: Some("gpt-x".to_string()),
+            route: Some(&route),
+            channel_states: &channel_states,
+            allowed_channels: &[],
+            candidate_limit: 16,
+        });
+
+        assert!(!preview.candidates[0].included);
+        assert_eq!(
+            preview.candidates[0].reasons,
+            vec![RoutePreviewReason::ProviderCoolingDown]
+        );
+        assert!(preview.candidates[1].included);
+        assert_eq!(
+            preview.candidates[1].reasons,
+            vec![RoutePreviewReason::DegradedLastResort]
+        );
+        assert_eq!(preview.selected_target_index, Some(1));
     }
 
     #[test]

@@ -1082,6 +1082,7 @@ mod tests {
         provider::{EndpointKind, ProviderKind},
         registry::{RegistryDocument, RegistryRepository, YamlRegistryRepository},
         registry_store::{RegistryStore, RegistryStoreHandle, SqliteRegistryStore},
+        route_plan::ChannelRouteState,
         routing::{
             DuplicateChargeRisk, FailureSource, RequestSelectionSnapshot, RetryDecisionReason,
             RetryDirective, RoutingPolicy, SelectionReason, TransitionInput,
@@ -32791,6 +32792,141 @@ model_routes:
         assert_eq!(transition["channel_id"], "test");
         assert_eq!(transition["state"], "degraded");
         assert_eq!(transition["reason"], "upstream_provider_unavailable");
+    }
+
+    #[tokio::test]
+    async fn responses_route_uses_provider_cooldown_target_as_last_resort() {
+        let upstream_hits = Arc::new(AtomicU64::new(0));
+        let upstream_hits_for_handler = upstream_hits.clone();
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let upstream_hits = upstream_hits_for_handler.clone();
+                async move {
+                    let hit = upstream_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if hit == 1 {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [(header::RETRY_AFTER, "1")],
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "upstream_unavailable",
+                                    "message": "provider unavailable"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "id": "resp-fixture",
+                        "object": "response",
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [
+                                    {"type": "output_text", "text": "responses-ok"}
+                                ]
+                            }
+                        ]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("responses".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets: credential_sets_from_files([(
+                    "responses-credentials",
+                    temp_keys_file("responses-key\n"),
+                )]),
+                model_routes: HashMap::from([priority_route("gpt-responses", ["responses"])]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([(
+                    "responses".to_string(),
+                    openai_pool(api_base, "responses-credentials"),
+                )]),
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+
+        let first = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"gpt-responses","input":"ok"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.channels.channel_route_state("responses"),
+            ChannelRouteState::ProviderCoolingDown
+        );
+
+        let second = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"gpt-responses","input":"ok"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+        let body = to_bytes(second.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["output"][0]["content"][0]["text"], "responses-ok");
     }
 
     #[tokio::test]

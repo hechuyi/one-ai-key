@@ -44,8 +44,18 @@ unset KEY_POOL_ROUTER_SQLITE_REGISTRY_STORE
 
 PACKAGE_ID=$(cargo pkgid --locked)
 PACKAGE_SPEC=${PACKAGE_ID##*#}
-PACKAGE_NAME=${PACKAGE_SPEC%@*}
-VERSION=${PACKAGE_SPEC##*@}
+if [[ "${PACKAGE_SPEC}" == *@* ]]; then
+  VERSION=${PACKAGE_SPEC##*@}
+else
+  VERSION=${PACKAGE_SPEC}
+fi
+PACKAGE_METADATA=$(cargo metadata --locked --no-deps --format-version 1)
+PACKAGE_NAME=$(jq -r '.workspace_members[0] as $root | .packages[] | select(.id == $root) | .name' <<<"${PACKAGE_METADATA}")
+METADATA_VERSION=$(jq -r '.workspace_members[0] as $root | .packages[] | select(.id == $root) | .version' <<<"${PACKAGE_METADATA}")
+if [[ -z "${PACKAGE_NAME}" || "${PACKAGE_NAME}" == "null" || "${METADATA_VERSION}" != "${VERSION}" ]]; then
+  printf 'error: could not derive release package metadata from cargo\n' >&2
+  exit 1
+fi
 TARGET=${TARGET:-x86_64-unknown-linux-gnu}
 ARCHIVE_NAME="${PACKAGE_NAME}-${VERSION}-${TARGET}.tar.gz"
 ARCHIVE_PATH="${REPO_ROOT}/dist/${ARCHIVE_NAME}"

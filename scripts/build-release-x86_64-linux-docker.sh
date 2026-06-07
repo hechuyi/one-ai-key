@@ -22,6 +22,7 @@ docker run --rm \
   nix --extra-experimental-features "nix-command flakes" shell \
     nixpkgs#cargo \
     nixpkgs#rustc \
+    nixpkgs#jq \
     nixpkgs#gcc \
     nixpkgs#pkg-config \
     nixpkgs#openssl \

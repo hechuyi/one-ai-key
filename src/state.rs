@@ -477,7 +477,7 @@ impl FailureDomainRegistry {
                 .expect("account failure domain lock poisoned")
                 .get(account_id),
         ) {
-            return Some(ChannelRouteState::CoolingDown);
+            return Some(ChannelRouteState::ProviderCoolingDown);
         }
         if failure_domain_state_is_open(
             self.providers
@@ -485,7 +485,7 @@ impl FailureDomainRegistry {
                 .expect("provider failure domain lock poisoned")
                 .get(provider_id),
         ) {
-            return Some(ChannelRouteState::CoolingDown);
+            return Some(ChannelRouteState::ProviderCoolingDown);
         }
         None
     }

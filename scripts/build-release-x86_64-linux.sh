@@ -32,6 +32,11 @@ if ! command -v rustc >/dev/null 2>&1 || ! rustc --version >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1 || ! jq --version >/dev/null 2>&1; then
+  printf 'error: release builds require jq for structured cargo metadata parsing\n' >&2
+  exit 1
+fi
+
 if ! command -v gzip >/dev/null 2>&1 || ! gzip --version >/dev/null 2>&1; then
   printf 'error: release builds require gzip for deterministic archive compression\n' >&2
   exit 1
@@ -41,14 +46,25 @@ cd "${REPO_ROOT}"
 
 PACKAGE_ID=$(cargo pkgid --locked)
 PACKAGE_SPEC=${PACKAGE_ID##*#}
-if [[ "${PACKAGE_SPEC}" != *@* ]]; then
-  printf 'error: could not parse cargo package id: %s\n' "${PACKAGE_ID}" >&2
+if [[ "${PACKAGE_SPEC}" == *@* ]]; then
+  VERSION=${PACKAGE_SPEC##*@}
+else
+  VERSION=${PACKAGE_SPEC}
+fi
+if [[ -z "${VERSION}" || "${VERSION}" == "${PACKAGE_ID}" ]]; then
+  printf 'error: could not parse package version from cargo package id: %s\n' "${PACKAGE_ID}" >&2
   exit 1
 fi
-PACKAGE_NAME=${PACKAGE_SPEC%@*}
-VERSION=${PACKAGE_SPEC##*@}
-if [[ -z "${PACKAGE_NAME}" || -z "${VERSION}" ]]; then
-  printf 'error: could not parse package name/version from cargo package id: %s\n' "${PACKAGE_ID}" >&2
+
+PACKAGE_METADATA=$(cargo metadata --locked --no-deps --format-version 1)
+PACKAGE_NAME=$(jq -r '.workspace_members[0] as $root | .packages[] | select(.id == $root) | .name' <<<"${PACKAGE_METADATA}")
+METADATA_VERSION=$(jq -r '.workspace_members[0] as $root | .packages[] | select(.id == $root) | .version' <<<"${PACKAGE_METADATA}")
+if [[ -z "${PACKAGE_NAME}" || "${PACKAGE_NAME}" == "null" ]]; then
+  printf 'error: could not parse package name from cargo metadata\n' >&2
+  exit 1
+fi
+if [[ "${METADATA_VERSION}" != "${VERSION}" ]]; then
+  printf 'error: cargo metadata version %s does not match cargo pkgid version %s\n' "${METADATA_VERSION}" "${VERSION}" >&2
   exit 1
 fi
 TARGET=${TARGET:-x86_64-unknown-linux-gnu}
