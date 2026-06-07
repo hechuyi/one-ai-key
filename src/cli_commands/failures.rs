@@ -274,7 +274,7 @@ fn tail_report(
     window: FailureWindow,
     filters: &FailureFilters,
 ) -> Value {
-    let failures = filtered_failures(routing, response_filter, filters);
+    let failures = filtered_failures(routing, response_filter, window, filters);
     let status = if failures.is_empty() {
         "ok"
     } else {
@@ -302,7 +302,7 @@ fn explain_report(
     window: FailureWindow,
     filters: &FailureFilters,
 ) -> Value {
-    let failures = filtered_failures(routing, response_filter, filters);
+    let failures = filtered_failures(routing, response_filter, window, filters);
     let status = if failures.is_empty() {
         "not_found"
     } else {
@@ -491,6 +491,7 @@ fn taxonomy_string(value: &Value, field: &str, fallback: &'static str) -> Value 
 fn filtered_failures(
     routing: &Value,
     response_filter: &Value,
+    window: FailureWindow,
     filters: &FailureFilters,
 ) -> Vec<Value> {
     routing
@@ -499,15 +500,18 @@ fn filtered_failures(
         .into_iter()
         .flatten()
         .filter_map(classify_routing_event)
+        .filter(|failure| matches_filters(failure, filters))
+        .take(window.routing_limit)
         .chain(
             response_filter
                 .get("events")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(classify_response_filter_event),
+                .filter_map(classify_response_filter_event)
+                .filter(|failure| matches_filters(failure, filters))
+                .take(window.response_filter_limit),
         )
-        .filter(|failure| matches_filters(failure, filters))
         .collect::<Vec<_>>()
 }
 
@@ -1426,6 +1430,56 @@ mod tests {
         })
     }
 
+    fn oversized_routing_fixture(count: usize, request_id: &str) -> Value {
+        let events = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "kind": "upstream_failure_observed",
+                    "request_id": request_id,
+                    "channel_id": "relay-a",
+                    "failure": {
+                        "failure_kind": "provider_unavailable",
+                        "failure_source": "upstream_transport",
+                        "status": 503,
+                        "directive": "return_error",
+                        "public_model": format!("gpt-example-{index}")
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "buffered_events": count,
+            "capacity": 1024,
+            "dropped_events": 0,
+            "offset": 0,
+            "limit": MAX_LAST,
+            "events": events,
+        })
+    }
+
+    fn oversized_response_filter_fixture(count: usize, request_id: &str) -> Value {
+        let events = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "outcome": "rejected",
+                    "request_id": request_id,
+                    "public_model": format!("gpt-example-{index}"),
+                    "channel_id": "relay-a",
+                    "reason_code": "response_filter_rejected",
+                    "body_committed": false,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "buffered_events": count,
+            "capacity": 1024,
+            "dropped_events": 0,
+            "offset": 0,
+            "limit": MAX_LAST,
+            "events": events,
+        })
+    }
+
     #[test]
     fn failures_tail_classifies_scope_route_credential_upstream_filter_and_post_output() {
         let rendered = render_tail_report(
@@ -1978,6 +2032,47 @@ mod tests {
             report["window"]["sources"]["response_filter_events"]["dropped_events"],
             3
         );
+    }
+
+    #[test]
+    fn failures_tail_never_returns_more_than_the_bounded_source_windows() {
+        let rendered = render_tail_report(
+            &oversized_routing_fixture(MAX_LAST + 50, "req_many"),
+            &oversized_response_filter_fixture(MAX_LAST + 50, "req_many"),
+            &FailureFilters::default(),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        let failures = report["data"]["failures"].as_array().unwrap();
+
+        assert_eq!(report["window"]["limit"], serde_json::json!(MAX_LAST * 2));
+        assert_eq!(report["window"]["returned"], serde_json::json!(MAX_LAST * 2));
+        assert_eq!(
+            report["data"]["failure_count"],
+            serde_json::json!(MAX_LAST * 2)
+        );
+        assert_eq!(failures.len(), MAX_LAST * 2);
+    }
+
+    #[test]
+    fn failures_explain_never_returns_more_than_the_bounded_source_windows() {
+        let rendered = render_explain_report(
+            &oversized_routing_fixture(MAX_LAST + 50, "req_many"),
+            &oversized_response_filter_fixture(MAX_LAST + 50, "req_many"),
+            "req_many",
+            &FailureFilters::default(),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        let evidence = report["data"]["evidence"].as_array().unwrap();
+
+        assert_eq!(report["window"]["limit"], serde_json::json!(MAX_LAST * 2));
+        assert_eq!(report["window"]["returned"], serde_json::json!(MAX_LAST * 2));
+        assert_eq!(
+            report["data"]["failure_count"],
+            serde_json::json!(MAX_LAST * 2)
+        );
+        assert_eq!(evidence.len(), MAX_LAST * 2);
     }
 
     #[test]

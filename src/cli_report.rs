@@ -266,4 +266,83 @@ mod tests {
             "endpoint_capabilities.chat_completions=supported endpoint_capabilities.responses=unknown endpoint_capabilities.embeddings=unsupported endpoint_capabilities.models=local_projection endpoint_capabilities.diagnostic_labels=relay,line\\nlabel"
         );
     }
+
+    #[test]
+    fn report_envelope_with_legacy_fields_preserves_contract_and_does_not_allow_data_override() {
+        let report = report_envelope_with_legacy_fields(ReportEnvelope {
+            status: "ok",
+            reason: "operator report is available",
+            reason_code: "report_available",
+            effect: crate::cli_effects::runtime_readonly_effect(),
+            scope: serde_json::json!({"model": "gpt-example"}),
+            window: serde_json::json!({"kind": "bounded_recent_events", "limit": 50}),
+            next_action: serde_json::json!({
+                "summary": "No action required.",
+                "template_id": "no_action_required",
+                "safe_argv": [],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false,
+            }),
+            data: serde_json::json!({
+                "status": "forged",
+                "reason": "forged",
+                "reason_code": "forged_reason",
+                "side_effect_class": "management_write",
+                "next_action": {"safe_argv": ["unsafe"]},
+                "legacy_count": 3,
+            }),
+        });
+
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["reason"], "operator report is available");
+        assert_eq!(report["reason_code"], "report_available");
+        assert_eq!(report["side_effect_class"], "runtime_readonly");
+        assert_eq!(report["next_action"]["template_id"], "no_action_required");
+        assert_eq!(report["legacy_count"], 3);
+        assert_eq!(report["data"]["status"], "forged");
+    }
+
+    #[test]
+    fn append_report_envelope_table_fields_renders_effect_window_and_safe_argv() {
+        let report = report_envelope_with_legacy_fields(ReportEnvelope {
+            status: "degraded",
+            reason: "bounded evidence was inspected",
+            reason_code: "failures_found_in_window",
+            effect: crate::cli_effects::runtime_readonly_store_reads_effect(),
+            scope: serde_json::json!({
+                "model": "gpt-example",
+                "client_token_ref": "local-client",
+            }),
+            window: serde_json::json!({
+                "kind": "bounded_recent_events",
+                "limit": 100,
+                "returned": 2,
+                "truncated": false,
+                "bounded_reason": "latest_window",
+            }),
+            next_action: serde_json::json!({
+                "summary": "Inspect route state.",
+                "template_id": "route_explain",
+                "safe_argv": ["one-ai-key", "route", "explain", "gpt-example"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false,
+            }),
+            data: serde_json::json!({"command": "failures tail"}),
+        });
+        let mut rendered = String::new();
+
+        append_report_envelope_table_fields(&mut rendered, &report);
+
+        assert!(rendered.contains("status: degraded"));
+        assert!(rendered.contains("reason_code: failures_found_in_window"));
+        assert!(rendered.contains("side_effect_class: runtime_readonly"));
+        assert!(rendered.contains("effect.reads_management_runtime: true"));
+        assert!(rendered.contains("effect.reads_management_store: true"));
+        assert!(rendered.contains("scope.client_token_ref: local-client"));
+        assert!(rendered.contains("window.kind: bounded_recent_events"));
+        assert!(rendered.contains("window.limit: 100"));
+        assert!(rendered.contains("window.returned: 2"));
+        assert!(rendered.contains("next_action.safe_argv[0]: one-ai-key"));
+        assert!(rendered.contains("next_action.safe_argv[3]: gpt-example"));
+    }
 }
