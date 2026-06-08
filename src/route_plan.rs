@@ -119,6 +119,8 @@ impl RoutePreviewReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelRouteState {
     Available,
+    /// Provider/account failure-domain soft cooldowns are normalized to this
+    /// state before route planning.
     ProviderCoolingDown,
     CoolingDown,
     Degraded,
@@ -312,13 +314,13 @@ pub fn preview_route(input: RoutePreviewInput<'_>) -> RoutePreview {
 
     if let Some(preferred_tier) = eligible
         .iter()
-        .map(|(_, target)| route_state_candidate_tier(input.channel_states.get(&target.channel_id)))
+        .map(|(_, target)| route_state_admission_tier(input.channel_states.get(&target.channel_id)))
         .min()
     {
         let mut retained = Vec::with_capacity(eligible.len());
         for (index, target) in eligible {
             let route_state = input.channel_states.get(&target.channel_id);
-            let tier = route_state_candidate_tier(route_state);
+            let tier = route_state_admission_tier(route_state);
             if tier > preferred_tier {
                 match route_state {
                     Some(ChannelRouteState::Degraded) => {
@@ -390,11 +392,18 @@ pub fn preview_route(input: RoutePreviewInput<'_>) -> RoutePreview {
     }
 }
 
-fn route_state_candidate_tier(state: Option<&ChannelRouteState>) -> u8 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RouteAdmissionTier {
+    Available,
+    Degraded,
+    ProviderAccountCooling,
+}
+
+fn route_state_admission_tier(state: Option<&ChannelRouteState>) -> RouteAdmissionTier {
     match state {
-        Some(ChannelRouteState::Degraded) => 1,
-        Some(ChannelRouteState::ProviderCoolingDown) => 2,
-        _ => 0,
+        Some(ChannelRouteState::Degraded) => RouteAdmissionTier::Degraded,
+        Some(ChannelRouteState::ProviderCoolingDown) => RouteAdmissionTier::ProviderAccountCooling,
+        _ => RouteAdmissionTier::Available,
     }
 }
 
@@ -453,22 +462,319 @@ mod tests {
     use crate::{provider::ProviderKind, state::ChannelId};
     use std::collections::HashMap;
 
+    fn route_target(channel: &str, priority: u16, weight: u16, enabled: bool) -> RouteTarget {
+        RouteTarget {
+            channel_id: ChannelId(channel.to_string()),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            upstream_model: None,
+            priority,
+            weight,
+            enabled,
+        }
+    }
+
     fn route_with_targets(channels: Vec<(&str, u16, u16)>) -> ModelRoute {
         ModelRoute {
             public_model: "gpt-x".to_string(),
             strategy: RouteStrategy::Priority,
             targets: channels
                 .into_iter()
-                .map(|(channel, priority, weight)| RouteTarget {
-                    channel_id: ChannelId(channel.to_string()),
-                    provider_kind: ProviderKind::OpenAiCompatible,
-                    upstream_model: None,
-                    priority,
-                    weight,
-                    enabled: true,
-                })
+                .map(|(channel, priority, weight)| route_target(channel, priority, weight, true))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn route_admission_taxonomy_prefers_available_over_degraded_and_provider_account_cooling() {
+        let route = route_with_targets(vec![
+            ("provider-account-cooling", 0, 1),
+            ("degraded", 1, 1),
+            ("available", 2, 1),
+        ]);
+        let states = HashMap::from([
+            (
+                ChannelId("provider-account-cooling".to_string()),
+                // Provider and account failure-domain cooldowns are both
+                // lowered to ProviderCoolingDown before route planning.
+                ChannelRouteState::ProviderCoolingDown,
+            ),
+            (
+                ChannelId("degraded".to_string()),
+                ChannelRouteState::Degraded,
+            ),
+            (
+                ChannelId("available".to_string()),
+                ChannelRouteState::Available,
+            ),
+        ]);
+
+        let preview = preview_route(RoutePreviewInput {
+            request_id: "req-taxonomy".to_string(),
+            registry_generation: 1,
+            public_model: Some("gpt-x".to_string()),
+            route: Some(&route),
+            channel_states: &states,
+            allowed_channels: &[],
+            candidate_limit: 16,
+        });
+
+        assert_eq!(preview.selected_target_index, Some(2));
+        assert_eq!(
+            preview.candidates[0].reasons,
+            vec![RoutePreviewReason::ProviderCoolingDown]
+        );
+        assert_eq!(
+            preview.candidates[1].reasons,
+            vec![RoutePreviewReason::ChannelDegraded]
+        );
+        assert!(preview.candidates[2].included);
+        assert!(preview.candidates[2].selected);
+        assert!(preview.candidates[2].reasons.is_empty());
+    }
+
+    #[test]
+    fn degraded_soft_state_is_last_resort_after_hard_blockers_fail_closed() {
+        let route = route_with_targets(vec![
+            ("hard-cooling", 0, 1),
+            ("runtime-unavailable", 1, 1),
+            ("degraded", 2, 1),
+        ]);
+        let states = HashMap::from([
+            (
+                ChannelId("hard-cooling".to_string()),
+                ChannelRouteState::CoolingDown,
+            ),
+            (
+                ChannelId("runtime-unavailable".to_string()),
+                ChannelRouteState::RuntimeUnavailable,
+            ),
+            (
+                ChannelId("degraded".to_string()),
+                ChannelRouteState::Degraded,
+            ),
+        ]);
+
+        let preview = preview_route(RoutePreviewInput {
+            request_id: "req-degraded-hard-blockers".to_string(),
+            registry_generation: 1,
+            public_model: Some("gpt-x".to_string()),
+            route: Some(&route),
+            channel_states: &states,
+            allowed_channels: &[],
+            candidate_limit: 1,
+        });
+
+        assert_eq!(preview.selected_target_index, Some(2));
+        assert!(!preview.candidates[0].included);
+        assert_eq!(
+            preview.candidates[0].reasons,
+            vec![RoutePreviewReason::ChannelCoolingDown]
+        );
+        assert!(!preview.candidates[1].included);
+        assert_eq!(
+            preview.candidates[1].reasons,
+            vec![RoutePreviewReason::RuntimeUnavailable]
+        );
+        assert!(preview.candidates[2].included);
+        assert_eq!(
+            preview.candidates[2].reasons,
+            vec![RoutePreviewReason::DegradedLastResort]
+        );
+    }
+
+    #[test]
+    fn provider_account_soft_cooling_is_last_resort_when_no_better_soft_tier_exists() {
+        let route = route_with_targets(vec![
+            ("provider-cooling", 0, 1),
+            ("account-cooling", 1, 1),
+            ("unknown", 2, 1),
+        ]);
+        let states = HashMap::from([
+            (
+                ChannelId("provider-cooling".to_string()),
+                ChannelRouteState::ProviderCoolingDown,
+            ),
+            (
+                ChannelId("account-cooling".to_string()),
+                ChannelRouteState::ProviderCoolingDown,
+            ),
+            (
+                ChannelId("unknown".to_string()),
+                ChannelRouteState::UnknownChannel,
+            ),
+        ]);
+
+        let preview = preview_route(RoutePreviewInput {
+            request_id: "req-provider-account-last-resort".to_string(),
+            registry_generation: 1,
+            public_model: Some("gpt-x".to_string()),
+            route: Some(&route),
+            channel_states: &states,
+            allowed_channels: &[],
+            candidate_limit: 16,
+        });
+
+        assert_eq!(preview.selected_target_index, Some(0));
+        assert!(preview.candidates[0].included);
+        assert_eq!(
+            preview.candidates[0].reasons,
+            vec![RoutePreviewReason::ProviderCoolingDownLastResort]
+        );
+        assert!(preview.candidates[1].included);
+        assert_eq!(
+            preview.candidates[1].reasons,
+            vec![RoutePreviewReason::ProviderCoolingDownLastResort]
+        );
+        assert!(!preview.candidates[2].included);
+        assert_eq!(
+            preview.candidates[2].reasons,
+            vec![RoutePreviewReason::UnknownChannel]
+        );
+    }
+
+    #[test]
+    fn hard_blockers_fail_closed_and_never_become_last_resort() {
+        let route = ModelRoute {
+            public_model: "gpt-x".to_string(),
+            strategy: RouteStrategy::Priority,
+            targets: vec![
+                route_target("target-disabled", 0, 1, false),
+                route_target("scope-denied", 1, 1, true),
+                route_target("channel-disabled", 2, 1, true),
+                route_target("hard-cooling", 3, 1, true),
+                route_target("no-credentials", 4, 1, true),
+                route_target("runtime-unavailable", 5, 1, true),
+                route_target("unknown", 6, 1, true),
+            ],
+        };
+        let allowed_channels = vec![
+            "target-disabled".to_string(),
+            "channel-disabled".to_string(),
+            "hard-cooling".to_string(),
+            "no-credentials".to_string(),
+            "runtime-unavailable".to_string(),
+            "unknown".to_string(),
+        ];
+        let states = HashMap::from([
+            (
+                ChannelId("channel-disabled".to_string()),
+                ChannelRouteState::Disabled,
+            ),
+            (
+                ChannelId("hard-cooling".to_string()),
+                ChannelRouteState::CoolingDown,
+            ),
+            (
+                ChannelId("no-credentials".to_string()),
+                ChannelRouteState::NoAvailableCredentials,
+            ),
+            (
+                ChannelId("runtime-unavailable".to_string()),
+                ChannelRouteState::RuntimeUnavailable,
+            ),
+            (
+                ChannelId("unknown".to_string()),
+                ChannelRouteState::UnknownChannel,
+            ),
+        ]);
+
+        let preview = preview_route(RoutePreviewInput {
+            request_id: "req-hard-blockers".to_string(),
+            registry_generation: 1,
+            public_model: Some("gpt-x".to_string()),
+            route: Some(&route),
+            channel_states: &states,
+            allowed_channels: &allowed_channels,
+            candidate_limit: 16,
+        });
+
+        assert_eq!(preview.selected_target_index, None);
+        assert!(preview
+            .candidates
+            .iter()
+            .all(|candidate| !candidate.included));
+        assert_eq!(
+            preview.candidates[0].reasons,
+            vec![RoutePreviewReason::TargetDisabled]
+        );
+        assert_eq!(
+            preview.candidates[1].reasons,
+            vec![RoutePreviewReason::ClientChannelScope]
+        );
+        assert_eq!(
+            preview.candidates[2].reasons,
+            vec![RoutePreviewReason::ChannelDisabled]
+        );
+        assert_eq!(
+            preview.candidates[3].reasons,
+            vec![RoutePreviewReason::ChannelCoolingDown]
+        );
+        assert_eq!(
+            preview.candidates[4].reasons,
+            vec![RoutePreviewReason::NoAvailableCredentials]
+        );
+        assert_eq!(
+            preview.candidates[5].reasons,
+            vec![RoutePreviewReason::RuntimeUnavailable]
+        );
+        assert_eq!(
+            preview.candidates[6].reasons,
+            vec![RoutePreviewReason::UnknownChannel]
+        );
+    }
+
+    #[test]
+    fn candidate_limit_applies_only_after_hard_blockers_and_lower_soft_tiers_are_removed() {
+        let route = route_with_targets(vec![
+            ("hard-blocked", 0, 1),
+            ("provider-account-cooling", 1, 1),
+            ("available", 2, 1),
+            ("available-over-limit", 3, 1),
+        ]);
+        let states = HashMap::from([
+            (
+                ChannelId("hard-blocked".to_string()),
+                ChannelRouteState::CoolingDown,
+            ),
+            (
+                ChannelId("provider-account-cooling".to_string()),
+                ChannelRouteState::ProviderCoolingDown,
+            ),
+            (
+                ChannelId("available".to_string()),
+                ChannelRouteState::Available,
+            ),
+            (
+                ChannelId("available-over-limit".to_string()),
+                ChannelRouteState::Available,
+            ),
+        ]);
+
+        let preview = preview_route(RoutePreviewInput {
+            request_id: "req-limit-final-eligible".to_string(),
+            registry_generation: 1,
+            public_model: Some("gpt-x".to_string()),
+            route: Some(&route),
+            channel_states: &states,
+            allowed_channels: &[],
+            candidate_limit: 1,
+        });
+
+        assert_eq!(preview.selected_target_index, Some(2));
+        assert_eq!(
+            preview.candidates[0].reasons,
+            vec![RoutePreviewReason::ChannelCoolingDown]
+        );
+        assert_eq!(
+            preview.candidates[1].reasons,
+            vec![RoutePreviewReason::ProviderCoolingDown]
+        );
+        assert!(preview.candidates[2].included);
+        assert_eq!(preview.candidates[2].plan_position, Some(0));
+        assert_eq!(
+            preview.candidates[3].reasons,
+            vec![RoutePreviewReason::CandidateLimit]
+        );
     }
 
     #[test]
