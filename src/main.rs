@@ -9076,6 +9076,28 @@ pools:
         serde_json::from_slice::<Value>(&body).unwrap()
     }
 
+    async fn v1_model_ids(app: &Router, authorization: String) -> Vec<String> {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header(header::AUTHORIZATION, authorization)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
     async fn latest_probe_result_ref(
         app: &Router,
         credential_set_id: &str,
@@ -9143,18 +9165,32 @@ pools:
         event_log_path: Option<PathBuf>,
         model_routes: HashMap<String, crate::config::ModelRouteConfig>,
     ) -> (Router, PathBuf) {
-        let keys_file = temp_keys_file("upstream-key\n");
-        let credential_store_path = temp_sqlite_path("registry-provider-credentials");
-        let registry_store_path = temp_sqlite_path("registry-provider");
-        let registry: RegistryDocument = AppConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
-            client_tokens: vec![ClientTokenConfig {
+        registry_provider_fixture_with_client_tokens(
+            channel_enabled,
+            event_log_path,
+            model_routes,
+            vec![ClientTokenConfig {
                 name: "test-client".to_string(),
                 token: fixture_client_token(),
                 enabled: true,
                 allowed_model_groups: Vec::new(),
                 allowed_channels: Vec::new(),
             }],
+        )
+    }
+
+    fn registry_provider_fixture_with_client_tokens(
+        channel_enabled: bool,
+        event_log_path: Option<PathBuf>,
+        model_routes: HashMap<String, crate::config::ModelRouteConfig>,
+        client_tokens: Vec<ClientTokenConfig>,
+    ) -> (Router, PathBuf) {
+        let keys_file = temp_keys_file("upstream-key\n");
+        let credential_store_path = temp_sqlite_path("registry-provider-credentials");
+        let registry_store_path = temp_sqlite_path("registry-provider");
+        let registry: RegistryDocument = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens,
             management: Some(ManagementConfig {
                 admin_token: fixture_admin_token(),
                 ip_allowlist: None,
@@ -10432,6 +10468,146 @@ pools:
 
         let runtime_routes = management_response_json(&app, "/management/model-routes").await;
         assert!(runtime_routes["routes"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn management_model_route_publication_is_invisible_until_reload_then_visible() {
+        let (app, _registry_store_path) = registry_provider_fixture_with_client_tokens(
+            true,
+            None,
+            HashMap::new(),
+            vec![
+                ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                },
+                ClientTokenConfig {
+                    name: "restricted-client".to_string(),
+                    token: fixture_restricted_client_token(),
+                    enabled: true,
+                    allowed_model_groups: vec!["gpt-other-visible".to_string()],
+                    allowed_channels: Vec::new(),
+                },
+            ],
+        );
+
+        let upsert = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(
+                        "/management/registry/model-routes/gpt-stage-visible?expected_staged_registry_version=1",
+                    )
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "strategy":"priority",
+                            "targets":[
+                                {
+                                    "channel":"test",
+                                    "upstream_model":"gpt-stage-upstream",
+                                    "priority":10,
+                                    "weight":1,
+                                    "enabled":true
+                                }
+                            ]
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upsert.status(), StatusCode::OK);
+        let upserted = response_json(upsert).await;
+        assert_eq!(upserted["registry_version"], 2);
+        assert_eq!(upserted["staged_registry_version"], 2);
+        assert_eq!(upserted["runtime_reload_required"], true);
+
+        let staged_runtime = management_response_json(&app, "/management/runtime").await;
+        assert_eq!(staged_runtime["active_registry_version"], 1);
+        assert_eq!(staged_runtime["staged_registry_version"], 2);
+        assert_eq!(staged_runtime["runtime_reload_required"], true);
+
+        let staged_runtime_routes = management_response_json(&app, "/management/model-routes").await;
+        assert!(!staged_runtime_routes["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|route| route["model"] == "gpt-stage-visible"));
+
+        let before_models = v1_model_ids(&app, client_bearer()).await;
+        assert!(!before_models.iter().any(|id| id == "gpt-stage-visible"));
+
+        let reload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/management/runtime/reload?expected_staged_registry_version=2")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reload.status(), StatusCode::OK);
+
+        let active_runtime = management_response_json(&app, "/management/runtime").await;
+        assert_eq!(active_runtime["active_registry_version"], 2);
+        assert_eq!(active_runtime["staged_registry_version"], 2);
+        assert_eq!(active_runtime["runtime_reload_required"], false);
+
+        let active_runtime_routes = management_response_json(&app, "/management/model-routes").await;
+        assert!(active_runtime_routes["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|route| route["model"] == "gpt-stage-visible"));
+
+        let availability = management_response_json(
+            &app,
+            "/management/model-availability?model=gpt-stage-visible&endpoint_family=chat_completions&client_token_ref=test-client",
+        )
+        .await;
+        assert_eq!(availability["can_use"], true);
+        assert_eq!(availability["blocking_domain"], "none");
+        assert_eq!(availability["reason_code"], "available");
+
+        let after_models = v1_model_ids(&app, client_bearer()).await;
+        assert!(after_models.iter().any(|id| id == "gpt-stage-visible"));
+
+        let restricted_models =
+            v1_model_ids(&app, bearer_for(fixture_restricted_client_token().as_str())).await;
+        assert!(!restricted_models
+            .iter()
+            .any(|id| id == "gpt-stage-visible"));
+
+        let restricted_availability = management_response_json(
+            &app,
+            "/management/model-availability?model=gpt-stage-visible&endpoint_family=chat_completions&client_token_ref=restricted-client",
+        )
+        .await;
+        assert_eq!(restricted_availability["can_use"], false);
+        assert_eq!(restricted_availability["reason_code"], "model_missing");
+        assert_eq!(restricted_availability["evidence"]["model_allowed"], false);
+        assert_eq!(restricted_availability["evidence"]["route_present"], true);
+
+        let client_tokens = management_response_json(&app, "/management/client-tokens").await;
+        let restricted = client_tokens["client_tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|token| token["name"] == "restricted-client")
+            .unwrap();
+        assert_eq!(
+            restricted["allowed_model_groups"],
+            serde_json::json!(["gpt-other-visible"])
+        );
     }
 
     #[tokio::test]
