@@ -315,6 +315,10 @@ the registry store has a staged projection to compare against the active
 runtime. When no staged projection exists, it reports an unavailable state rather
 than inventing a local diff.
 
+Diagnosis surfaces stop at these read-only reload commands: they may recommend
+`reload status` or `reload diff`, but not `reload apply` or `reload apply
+--dry-run`.
+
 `one-ai-key reload apply --dry-run` reads runtime status and reload diff data and
 prints the expected staged registry version that a later mutation must use. A
 confirmed runtime reload is explicit:

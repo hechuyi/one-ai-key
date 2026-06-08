@@ -109,9 +109,9 @@ pub async fn runtime_reload_diff_response_for_state(
         mutating_reload_sent: false,
         reload_apply_status: "dry_run_available",
         next_action: RuntimeReloadDiffNextAction {
-            summary: "Reload diff is read-only. Run reload apply --dry-run before any confirmed runtime mutation.",
-            template_id: "reload_apply_dry_run",
-            safe_argv: vec!["one-ai-key", "reload", "apply", "--dry-run"],
+            summary: "Reload diff is read-only. Recheck reload status before any explicit reload planning.",
+            template_id: "reload_diff",
+            safe_argv: vec!["one-ai-key", "reload", "diff"],
             side_effect_class: "runtime_readonly",
             requires_confirmation: false,
         },

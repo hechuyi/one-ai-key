@@ -130,6 +130,10 @@ management state: `doctor`, `models list`, `models explain`, `route explain`,
 `client-tokens list`, `keys list`, `keys stats`, `failures tail`, `failures
 explain`, `reload status`, and `reload diff`.
 
+Diagnosis reports may recommend read-only reload investigation only:
+`reload status` or `reload diff`. `reload apply --dry-run` is an explicit
+operator reload-planning command, not a diagnosis next action.
+
 Dry-run commands preview the intended effect and must leave write/upstream bits
 off: `init local --dry-run`, `keys import --credential-set <id> --source <path>
 --dry-run`, `keys probe --credential-set <id> --credential-ref <ref> --model

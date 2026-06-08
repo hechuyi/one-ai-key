@@ -291,10 +291,15 @@ fn summarize_reload_required(runtime: Option<&Value>, explain_runtime: Option<&V
                 .and_then(|reload| reload.get("required"))
         }),
     ]);
+    let reload_diff_status = match required {
+        Some(true) => "available",
+        Some(false) => "not_required",
+        None => "unknown",
+    };
     serde_json::json!({
         "status": if required.is_some() { "available" } else { "unknown_until_reload_projection" },
         "required": required,
-        "reload_diff_status": "unavailable_until_m4",
+        "reload_diff_status": reload_diff_status,
     })
 }
 
@@ -894,6 +899,48 @@ mod tests {
         assert!(!rendered.contains("secret-derived-id"));
         assert!(!rendered.contains("secret-fingerprint"));
         assert!(!rendered.contains("provider body should not appear"));
+    }
+
+    #[test]
+    fn doctor_cli_reload_required_summary_does_not_suggest_apply() {
+        let options = options();
+        let results = vec![
+            super::ProjectionResult {
+                name: "explain_runtime",
+                value: Ok(json!({
+                    "runtime_generation": 9,
+                    "reload_required": true
+                })),
+            },
+            super::ProjectionResult {
+                name: "runtime",
+                value: Ok(json!({
+                    "generation": 9,
+                    "reload_required": true
+                })),
+            },
+            super::ProjectionResult {
+                name: "serving_health",
+                value: Ok(json!({"status": "ok", "reason_code": "serving"})),
+            },
+            super::ProjectionResult {
+                name: "resilience_health",
+                value: Ok(json!({"status": "ok", "reason_code": "healthy"})),
+            },
+        ];
+
+        let rendered = super::render_doctor_report(&results, &options);
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["data"]["reload_required"]["required"], true);
+        assert_ne!(
+            report["data"]["reload_required"]["reload_diff_status"],
+            "unavailable_until_m4"
+        );
+        assert!(!rendered.contains("reload apply"));
+        assert!(!rendered.contains("\"apply\""));
+        assert!(!rendered.contains("--yes"));
+        assert!(!rendered.contains("unavailable_until_m4"));
     }
 
     #[test]

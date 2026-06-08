@@ -524,9 +524,9 @@ fn reload_status_reason(reason_code: &str) -> &'static str {
 fn reload_status_next_action(_status: &str) -> Value {
     if _status == "pending_reload" {
         serde_json::json!({
-            "summary": "Reload status is read-only. Inspect the typed diff or run reload apply --dry-run before any confirmed runtime mutation.",
-            "template_id": "reload_apply_dry_run",
-            "safe_argv": ["one-ai-key", "reload", "apply", "--dry-run"],
+            "summary": "Reload status is read-only. Inspect the typed reload diff before any explicit reload planning.",
+            "template_id": "reload_diff",
+            "safe_argv": ["one-ai-key", "reload", "diff"],
             "side_effect_class": "runtime_readonly",
             "requires_confirmation": false,
             "reload_diff_status": "available",
@@ -558,9 +558,9 @@ fn reload_diff_next_action(reason_code: &str) -> Value {
     match reason_code {
         "reload_diff_available" | "reload_diff_truncated" | "reload_diff_empty" => {
             serde_json::json!({
-                "summary": "Reload diff is read-only. Run reload apply --dry-run before any confirmed runtime mutation.",
-                "template_id": "reload_apply_dry_run",
-                "safe_argv": ["one-ai-key", "reload", "apply", "--dry-run"],
+                "summary": "Reload diff is read-only. Recheck reload status before any explicit reload planning.",
+                "template_id": "reload_diff",
+                "safe_argv": ["one-ai-key", "reload", "diff"],
                 "side_effect_class": "runtime_readonly",
                 "requires_confirmation": false,
             })
@@ -1071,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_status_cli_suggests_only_available_reload_commands_without_mutating() {
+    fn reload_status_cli_suggests_only_readonly_reload_investigation_without_mutating() {
         let rendered = super::render_reload_status_report(
             Some(&json!({
                 "active_registry_generation": 11,
@@ -1084,7 +1084,11 @@ mod tests {
         );
         let report: Value = serde_json::from_str(&rendered).unwrap();
 
-        assert_eq!(report["next_action"]["template_id"], "reload_apply_dry_run");
+        assert_eq!(report["next_action"]["template_id"], "reload_diff");
+        assert_eq!(
+            report["next_action"]["safe_argv"],
+            json!(["one-ai-key", "reload", "diff"])
+        );
         assert_eq!(
             report["next_action"]["side_effect_class"],
             "runtime_readonly"
@@ -1093,6 +1097,15 @@ mod tests {
         assert_eq!(report["reload_diff_status"], "available");
         assert_eq!(report["reload_apply_status"], "dry_run_available");
         assert_eq!(report["data"]["mutating_reload_sent"], false);
+        let argv = report["next_action"]["safe_argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(!argv.contains(&"apply"));
+        assert!(!argv.contains(&"--yes"));
+        assert_ne!(argv, ["one-ai-key", "reload", "apply", "--dry-run"]);
     }
 
     #[tokio::test]
@@ -1289,13 +1302,22 @@ mod tests {
 
         assert_eq!(report["status"], "ok");
         assert_eq!(report["reason_code"], "reload_diff_available");
-        assert_eq!(report["next_action"]["template_id"], "reload_apply_dry_run");
+        assert_eq!(report["next_action"]["template_id"], "reload_diff");
         assert_eq!(
             report["next_action"]["safe_argv"],
-            json!(["one-ai-key", "reload", "apply", "--dry-run"])
+            json!(["one-ai-key", "reload", "diff"])
         );
         assert_eq!(report["reload_apply_status"], "dry_run_available");
         assert_eq!(report["mutating_reload_sent"], false);
+        let argv = report["next_action"]["safe_argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(!argv.contains(&"apply"));
+        assert!(!argv.contains(&"--yes"));
+        assert_ne!(argv, ["one-ai-key", "reload", "apply", "--dry-run"]);
         assert_eq!(report["budget"]["max_resource_changes"], 64);
         assert_eq!(report["budget"]["total_resource_changes"], 3);
         assert_eq!(report["budget"]["omitted_resource_changes"], 0);
