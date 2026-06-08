@@ -410,7 +410,6 @@ fn project_response_filter_failure_event(event: &ResponseFilterEvent) -> Value {
         "request_id": safe_management_id(&event.request_id),
         "stage": if body_committed { "post_output" } else { "response_filter" },
         "public_model": safe_management_code(&event.public_model),
-        "client_token_ref": Value::Null,
         "selected_target": selected_target(Some(&event.channel_id)),
         "channel_id": safe_management_id(&event.channel_id),
         "failure_class": if body_committed { "stream_committed_failure" } else { "response_filter_rejected" },
@@ -1742,6 +1741,8 @@ mod tests {
         assert_eq!(failures[0]["retry_eligibility"], "eligible_before_output");
         assert_eq!(failures[0]["client_visible_status"], "local_502");
         assert_eq!(failures[0]["reason_code"], "response_filter_rejected");
+        assert!(failures[0].get("client_token_ref").is_none());
+        assert!(!body.contains("client_token"));
         assert!(!body.contains("matched_text"));
         assert!(!body.contains("response_body"));
     }
