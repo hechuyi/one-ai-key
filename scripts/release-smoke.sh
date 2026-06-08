@@ -261,7 +261,7 @@ COMMON=(--management-url "${MANAGEMENT_URL}" --management-token-env ONE_AI_KEY_M
 "${BIN}" "${COMMON[@]}" models explain --model gpt-example --client-token-ref local-client --output json \
   | jq -e '.status == "ok" and .reason_code == "model_visible_to_client" and .side_effect_class == "runtime_readonly" and (.next_action.safe_argv | type == "array")' >/dev/null
 "${BIN}" "${COMMON[@]}" route explain gpt-example --client-token-ref local-client --output json \
-  | jq -e '.status == "ok" and .reason_code == "route_candidate_selected" and .side_effect_class == "runtime_readonly" and (.next_action.safe_argv | type == "array")' >/dev/null
+  | jq -e '.status == "available" and .reason_code == "available" and .admission_summary.status == "available" and .admission_summary.reason_code == "available" and (.selected_target.channel_id | type == "string") and (.admission_summary.selected_target.channel_id == .selected_target.channel_id) and (.candidates | type == "array" and length > 0) and .side_effect_class == "runtime_readonly" and (.next_action.safe_argv | type == "array")' >/dev/null
 "${BIN}" "${COMMON[@]}" keys stats --credential-set relay_credentials --output json \
   | jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
 "${BIN}" "${COMMON[@]}" failures tail --last 20 --output json \
