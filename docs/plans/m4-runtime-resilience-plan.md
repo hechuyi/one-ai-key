@@ -1,18 +1,22 @@
-# M4 Route Admission Resilience Implementation Plan
+# M4 Runtime Resilience Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** make route admission resilient to provider/account soft cooldown
-without hiding hard local blockers or expanding retry behavior.
+**Goal:** make the runtime less fragile than direct upstream use by closing the
+local route-admission gap, auditing hard/soft state transitions, and giving
+operators bounded evidence for every local `no_route_candidate`.
 
-**Architecture:** M4 formalizes the existing provider-cooling last-resort
-route-planning semantics as a product contract, aligns proxy admission checks
-with that contract, and exposes one shared redacted admission summary to
-management and CLI explain surfaces. It is not a new retry engine, health-check
-system, model catalog, or adaptive router.
+**Architecture:** M4 is a runtime resilience package with four coupled slices:
+route admission semantics, state-transition hard/soft classification, shared
+redacted admission evidence, and release/operator smoke. It formalizes the
+existing provider-cooling last-resort route-planning semantics, aligns proxy
+admission checks with that contract, audits state mutations that create hard
+versus soft route states, and exposes one shared admission summary to management
+and CLI explain surfaces. It is not a new retry engine, health-check system,
+model catalog, or adaptive router.
 
 **Tech Stack:** Rust, Axum, existing in-memory route state, existing management
 projections, clap CLI reports, local mock upstream tests, Docker/Nix x86_64
@@ -32,7 +36,8 @@ This plan is the result of three review rounds across five angles:
 
 The reviewers converged on these decisions:
 
-- M4 is a coherent phase only if it is scoped to route admission resilience,
+- M4 is a coherent phase only if it is scoped to runtime resilience around
+  admission, state classification, bounded evidence, and smoke verification,
   not bundled with unrelated diagnostics or deployment work.
 - `ProviderCoolingDownLastResort` already exists in the route planner and
   should become a stable contract, not a broad new fallback system.
@@ -45,6 +50,38 @@ The reviewers converged on these decisions:
   separate admission record.
 - CLI must render management projections and must not duplicate route
   admission logic.
+
+## Capability Package
+
+M4 is intentionally larger than a single `no_route_candidate` bugfix, but it
+still has one product thesis:
+
+```text
+If the upstream would be reachable through an otherwise-valid configured route,
+one-ai-key should not fail locally just because its own soft runtime state is too
+conservative; if it does fail locally, the operator must see the exact hard
+reason.
+```
+
+The phase closes four surfaces together:
+
+1. **Admission behavior:** provider/account soft cooldown can be selected as a
+   last-resort first attempt when every otherwise-valid candidate is soft
+   suppressed.
+2. **State-transition classification:** the failures that create hard channel
+   cooldown, provider/account soft cooldown, degraded state, credential
+   cooldown, quota exhaustion, and no-op transitions are audited and locked by
+   tests.
+3. **Operator evidence:** `route explain`, `models explain`, and bounded failure
+   evidence share one admission taxonomy instead of each inventing its own
+   explanation.
+4. **Release/operator proof:** local release smoke proves the extracted artifact
+   handles one soft last-resort path and one hard fail-closed path; production
+   smoke is an opt-in operator harness, not a CI dependency.
+
+This is enough for a stage release because it changes runtime behavior, locks
+state semantics, adds explainability, and verifies the published artifact
+without expanding the project into a platform.
 
 ## User Contract
 
@@ -113,6 +150,45 @@ without contradicting the route planner:
   may be skipped to that later target;
 - hard states still fail closed or fall through only to another frozen target;
 - the proxy must not re-plan the route, read stores, or synthesize a target.
+
+## State Transition Contract
+
+M4 must audit the state mutations that feed route admission. The admission layer
+can only be correct if hard and soft route states are assigned consistently.
+
+Hard route states:
+
+- manual/config channel disabled;
+- response-filter channel rejection that explicitly cools or disables a channel;
+- relay-balance or account-balance exhaustion when configured as channel scope;
+- no available credentials after credential lifecycle filtering;
+- runtime unavailable or lock contention.
+
+Soft route states:
+
+- provider/account unavailable from transient upstream evidence;
+- provider/account retry-after suppression when a later or last-resort route may
+  still be valid;
+- degraded provider/account state after transport or pre-output provider
+  instability that did not prove channel balance exhaustion.
+
+Credential-scoped states:
+
+- credential cooldown;
+- credential expired/auth failure;
+- credential quota exhausted when balance scope is credential.
+
+Request-scoped states:
+
+- schema errors;
+- endpoint-family mismatch;
+- model/scope/config errors;
+- upstream 4xx that does not prove credential or channel lifecycle failure.
+
+M4 must not add automatic repair. It must ensure existing transitions are
+classified, tested, and projected consistently. If tests reveal a relay error is
+being mapped to an overly hard state, the fix belongs in the classifier or
+state-transition mapping, not in a broad fallback rule.
 
 ## Configuration Admission
 
@@ -208,6 +284,30 @@ The projection must not include raw keys, tokens, token hashes, request or
 response bodies, full URLs, local key paths, upstream free-form error text, or
 private deployment values.
 
+## Failure Evidence Contract
+
+M4 may add or refine bounded admission evidence, but it must remain an
+explanation surface and never become a routing input.
+
+Allowed fields are stable and small:
+
+- request id;
+- endpoint family;
+- public model label after existing safe-label redaction;
+- route kind;
+- registry generation;
+- admission status;
+- primary reason;
+- hard reason codes;
+- soft suppression reason codes;
+- selected last-resort marker when present;
+- candidate count and included count;
+- client-visible status for local denial.
+
+Do not record raw request bodies, response bodies, upstream messages, key
+material, token hashes, complete URLs, file paths, or private deployment values.
+Overflow behavior remains bounded in-memory telemetry with dropped counters.
+
 ## CLI Scope
 
 P0:
@@ -258,11 +358,12 @@ dependency.
 
 ## Implementation Tasks
 
-### Task 1: Characterize Current Admission Behavior
+### Task 1: Characterize Current Admission And State Behavior
 
 **Files:**
 
 - Test: `src/route_plan.rs`
+- Test: `src/routing.rs`
 - Test: `src/main.rs`
 - Modify only if needed for test helpers.
 
@@ -274,6 +375,11 @@ dependency.
 - [ ] Add runtime tests for proxy secondary gate behavior:
   provider-cooling last resort is attempted when selected by the route plan,
   but skipped when a better frozen target remains.
+- [ ] Add state-transition characterization tests for hard channel cooldown,
+  provider/account soft cooldown, degraded state, credential cooldown,
+  credential quota exhaustion, and request-scoped no-op failures.
+- [ ] Prove every characterization filter matches non-zero tests before using
+  it as evidence.
 - [ ] Run the targeted tests and confirm each filter matches non-zero tests.
 - [ ] Commit characterization tests.
 
@@ -312,11 +418,35 @@ dependency.
 - [ ] Prove M3 attempt budget does not increase.
 - [ ] Commit proxy alignment.
 
-### Task 4: Management Projection
+### Task 4: State Transition Hard/Soft Audit
+
+**Files:**
+
+- Modify: `src/routing.rs`
+- Modify only if needed: classifier or policy-profile code that maps upstream
+  evidence to `FailureKind` / `FailureScope`.
+- Test: `src/routing.rs`
+- Test: `src/main.rs`
+
+- [ ] Review every mutation that can produce channel hard cooldown, provider
+  soft cooldown, degraded state, credential cooldown, credential expiration,
+  quota exhaustion, or no-op.
+- [ ] Add a compact transition table in tests: input failure kind/scope/source
+  plus profile context -> expected mutation class and admission hardness.
+- [ ] Fix only proven misclassifications. Do not add a new fallback path to
+  compensate for an incorrect hard classification.
+- [ ] Prove relay balance/channel-scope contamination remains hard, provider
+  transient failures remain soft/degraded, credential failures remain scoped to
+  the credential unless config says otherwise, and request errors do not mutate
+  route availability.
+- [ ] Commit state-transition audit changes.
+
+### Task 5: Management Projection And Failure Evidence
 
 **Files:**
 
 - Modify: `src/management_routing.rs`
+- Modify if needed: management routing telemetry / failures projection modules.
 - Test: `src/main.rs`
 
 - [ ] Add `route_admission_summary` to routing preview responses.
@@ -325,9 +455,13 @@ dependency.
   upstream text are redacted or absent.
 - [ ] Add tests for admitted, provider-cooling last-resort, hard-blocked, and
   mixed candidate summaries.
+- [ ] Add or refine bounded admission-denial evidence only if route/models
+  explain cannot otherwise connect a recent client-visible local 503 to the
+  shared admission taxonomy.
+- [ ] Prove admission evidence is not a routing input and remains bounded.
 - [ ] Commit management projection changes.
 
-### Task 5: CLI Rendering
+### Task 6: CLI Rendering
 
 **Files:**
 
@@ -346,7 +480,7 @@ dependency.
   locally.
 - [ ] Commit CLI rendering changes.
 
-### Task 6: Release Smoke And Operator Smoke Boundary
+### Task 7: Release Smoke And Operator Smoke Boundary
 
 **Files:**
 
@@ -370,7 +504,7 @@ dependency.
   denylist expectations.
 - [ ] Commit release and operator smoke changes.
 
-### Task 7: Documentation And Stop Card
+### Task 8: Documentation And Stop Card
 
 **Files:**
 
@@ -384,6 +518,8 @@ dependency.
   provider/account soft cooldown last resort.
 - [ ] Document that M4 does not expand retry, streaming behavior, endpoint
   fallback, or model discovery.
+- [ ] Document hard state, soft state, credential state, and request-scoped
+  failure categories in operator terms.
 - [ ] Record the configuration admission decision: no new YAML in M4.
 - [ ] Create the stop card with the fields below.
 - [ ] Commit documentation.
@@ -393,6 +529,7 @@ dependency.
 Required targeted tests:
 
 - route admission taxonomy table;
+- state-transition hard/soft taxonomy table;
 - hard blockers excluded with stable reasons;
 - hard blocker zero-upstream runtime behavior;
 - available/degraded/provider-cooling ordering;
@@ -402,6 +539,7 @@ Required targeted tests:
 - M3 retry non-expansion for streaming, partial output, embeddings,
   `/v1/models`, named pool, unknown endpoint, and deadline exhaustion;
 - management projection schema and redaction;
+- bounded admission/failure evidence schema and redaction;
 - CLI rendering redaction and no local admission recomputation;
 - release smoke extracted-artifact soft last-resort and one hard blocker sanity.
 
@@ -434,11 +572,13 @@ The M4 stop card must include:
 - `deferred_scope`;
 - `parked_or_rejected_items`;
 - `route_admission_taxonomy_result`;
+- `state_transition_taxonomy_result`;
 - `soft_cooling_last_resort_result`;
 - `hard_blocker_zero_upstream_result`;
 - `proxy_secondary_gate_result`;
 - `m3_retry_non_expansion_result`;
 - `management_projection_result`;
+- `admission_evidence_result`;
 - `cli_rendering_result`;
 - `operator_contract_evidence`;
 - `test_evidence`;
