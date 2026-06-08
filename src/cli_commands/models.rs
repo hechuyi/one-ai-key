@@ -803,8 +803,14 @@ fn sanitize_preview_client_token(client_token: Option<&Value>) -> Value {
         return Value::Null;
     };
     serde_json::json!({
-        "id": client_token.get("id").and_then(Value::as_str),
-        "name": client_token.get("name").and_then(Value::as_str),
+        "id": client_token
+            .get("id")
+            .and_then(Value::as_str)
+            .map(safe_client_token_id_label),
+        "name": client_token
+            .get("name")
+            .and_then(Value::as_str)
+            .map(safe_client_token_name_label),
         "unrestricted_model_groups": client_token
             .get("unrestricted_model_groups")
             .and_then(Value::as_bool),
@@ -1364,7 +1370,12 @@ mod tests {
             "model": "gpt-public",
             "route_kind": "explicit_model_route",
             "registry_generation": 5,
-            "client_token": {"name": "local-client"},
+            "client_token": {
+                "id": "https://preview.example/v1?secret=sk-PREVIEW_SHOULD_NOT_RENDER",
+                "name": "\t/tmp/preview/sk-PREVIEW_SHOULD_NOT_RENDER",
+                "unrestricted_model_groups": true,
+                "unrestricted_channels": true
+            },
             "selected_target": null,
             "candidates": [
                 {
@@ -1435,6 +1446,11 @@ mod tests {
         assert_eq!(report["next_action"]["safe_argv"], serde_json::json!([]));
         assert_eq!(report["availability"]["can_use"], true);
         assert_eq!(report["availability"]["blocking_domain"], "none");
+        assert_eq!(report["client_token"]["id"], "<redacted-client-token-id>");
+        assert_eq!(
+            report["client_token"]["name"],
+            "<redacted-client-token-name>"
+        );
         assert_eq!(
             report["availability"]["client_token"]["id"],
             "<redacted-client-token-id>"
@@ -1453,6 +1469,10 @@ mod tests {
         assert!(!rendered.contains("/tmp/private"));
         assert!(!rendered.contains("sk-SHOULD_NOT_RENDER"));
         assert!(!rendered.contains("control-client-id"));
+        assert!(!rendered.contains("https://preview.example"));
+        assert!(!rendered.contains("/tmp/preview"));
+        assert!(!rendered.contains("sk-PREVIEW_SHOULD_NOT_RENDER"));
+        assert!(!rendered.contains("PREVIEW_SHOULD_NOT_RENDER"));
         assert!(!rendered.contains("join-now"));
         assert!(!rendered.contains("/tmp/"));
         assert!(!rendered.contains("raw_secret"));
