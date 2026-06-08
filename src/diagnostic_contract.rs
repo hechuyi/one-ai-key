@@ -336,7 +336,8 @@ fn action_spec(action: SafeAction) -> ActionSpec {
             ],
         },
         SafeAction::ModelsExplainWithClientTokenRef => ActionSpec {
-            summary: "Inspect the runtime model projection with an explicit client-token reference.",
+            summary:
+                "Inspect the runtime model projection with an explicit client-token reference.",
             template_id: "models_explain_visibility",
             safe_argv: &[
                 "one-ai-key",

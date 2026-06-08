@@ -876,12 +876,12 @@ fn safe_reload_diff_identifier(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use axum::{
-        Json, Router,
         extract::Query,
         http::StatusCode,
         routing::{get, post},
+        Json, Router,
     };
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
