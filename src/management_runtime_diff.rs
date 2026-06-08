@@ -109,7 +109,7 @@ pub async fn runtime_reload_diff_response_for_state(
         mutating_reload_sent: false,
         reload_apply_status: "dry_run_available",
         next_action: RuntimeReloadDiffNextAction {
-            summary: "Reload diff is read-only and complete for this request. Enter reload apply explicitly to plan a runtime mutation.",
+            summary: "Reload diff is read-only and complete for this request. No further diagnostic action is required.",
             template_id: "no_action_required",
             safe_argv: vec![],
             side_effect_class: "runtime_readonly",

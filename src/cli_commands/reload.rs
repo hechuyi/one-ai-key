@@ -558,7 +558,7 @@ fn reload_diff_next_action(reason_code: &str) -> Value {
     match reason_code {
         "reload_diff_available" | "reload_diff_truncated" | "reload_diff_empty" => {
             serde_json::json!({
-                "summary": "Reload diff is read-only and complete for this request. Enter reload apply explicitly to plan a runtime mutation.",
+                "summary": "Reload diff is read-only and complete for this request. No further diagnostic action is required.",
                 "template_id": "no_action_required",
                 "safe_argv": [],
                 "side_effect_class": "runtime_readonly",
@@ -1304,6 +1304,23 @@ mod tests {
         assert_eq!(report["reason_code"], "reload_diff_available");
         assert_eq!(report["next_action"]["template_id"], "no_action_required");
         assert_eq!(report["next_action"]["safe_argv"], json!([]));
+        let next_action_summary = report["next_action"]["summary"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        for forbidden in [
+            "reload apply",
+            "apply --dry-run",
+            "--yes",
+            "mutation",
+            "confirmed apply",
+            "apply",
+        ] {
+            assert!(
+                !next_action_summary.contains(forbidden),
+                "reload diff next_action summary contains forbidden text {forbidden}"
+            );
+        }
         assert_eq!(report["reload_apply_status"], "dry_run_available");
         assert_eq!(report["mutating_reload_sent"], false);
         let argv = report["next_action"]["safe_argv"]
@@ -1362,6 +1379,18 @@ mod tests {
         assert!(rendered_table.contains("reason_code: reload_diff_available"));
         assert!(rendered_table.contains("resource_changes.model_routes.changed"));
         assert!(rendered_table.contains("model_route:0"));
+        for forbidden in [
+            "reload apply",
+            "apply --dry-run",
+            "--yes",
+            "mutation",
+            "confirmed apply",
+        ] {
+            assert!(
+                !rendered_table.to_ascii_lowercase().contains(forbidden),
+                "reload diff table next_action contains forbidden text {forbidden}"
+            );
+        }
         for forbidden in [
             "available_now",
             "reload_apply_now",

@@ -21369,6 +21369,35 @@ pools:
         assert_eq!(diff["budget"]["truncated"], false);
         assert_eq!(diff["next_action"]["template_id"], "no_action_required");
         assert_eq!(diff["next_action"]["safe_argv"], serde_json::json!([]));
+        let next_action_summary = diff["next_action"]["summary"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        for forbidden in [
+            "reload apply",
+            "apply --dry-run",
+            "--yes",
+            "mutation",
+            "confirmed apply",
+            "apply",
+        ] {
+            assert!(
+                !next_action_summary.contains(forbidden),
+                "reload diff next_action summary contains forbidden text {forbidden}"
+            );
+        }
+        for forbidden in [
+            "reload apply",
+            "apply --dry-run",
+            "--yes",
+            "mutation",
+            "confirmed apply",
+        ] {
+            assert!(
+                !body_text.to_ascii_lowercase().contains(forbidden),
+                "reload diff response contains forbidden next-action text {forbidden}"
+            );
+        }
         let next_action_argv = diff["next_action"]["safe_argv"]
             .as_array()
             .unwrap()
