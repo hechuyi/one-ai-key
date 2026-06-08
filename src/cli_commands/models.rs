@@ -379,7 +379,7 @@ fn sanitized_models_explain_report(
         .or_else(|| client_token.get("name").and_then(Value::as_str));
     let next_action = availability
         .as_ref()
-        .and_then(|_| availability_contract.as_ref())
+        .and(availability_contract.as_ref())
         .map(|contract| contract.next_action.clone())
         .unwrap_or_else(|| {
             models_explain_next_action(status, preview, client_scope_status, reason_code)

@@ -822,11 +822,13 @@ pub fn endpoint_family_availability_explain_from_parts(
         return endpoint_family_availability_explain_result(
             input,
             None,
-            "unavailable",
-            false,
-            "client_token",
-            "token_missing",
-            "provide_client_token_ref",
+            EndpointFamilyAvailabilityOutcome {
+                status: "unavailable",
+                can_use: false,
+                blocking_domain: "client_token",
+                reason_code: "token_missing",
+                next_action: "provide_client_token_ref",
+            },
             evidence,
         );
     };
@@ -839,11 +841,13 @@ pub fn endpoint_family_availability_explain_from_parts(
         return endpoint_family_availability_explain_result(
             input,
             None,
-            "unavailable",
-            false,
-            "client_token",
-            "token_unknown",
-            "check_client_token_ref",
+            EndpointFamilyAvailabilityOutcome {
+                status: "unavailable",
+                can_use: false,
+                blocking_domain: "client_token",
+                reason_code: "token_unknown",
+                next_action: "check_client_token_ref",
+            },
             evidence,
         );
     };
@@ -857,11 +861,13 @@ pub fn endpoint_family_availability_explain_from_parts(
         return endpoint_family_availability_explain_result(
             input,
             Some(client_status),
-            "unavailable",
-            false,
-            "client_token",
-            "token_disabled",
-            "enable_client_token",
+            EndpointFamilyAvailabilityOutcome {
+                status: "unavailable",
+                can_use: false,
+                blocking_domain: "client_token",
+                reason_code: "token_disabled",
+                next_action: "enable_client_token",
+            },
             evidence,
         );
     }
@@ -871,11 +877,13 @@ pub fn endpoint_family_availability_explain_from_parts(
         return endpoint_family_availability_explain_result(
             input,
             Some(client_status),
-            "unavailable",
-            false,
-            "endpoint_family",
-            "unsupported_endpoint_family",
-            "use_supported_endpoint_family",
+            EndpointFamilyAvailabilityOutcome {
+                status: "unavailable",
+                can_use: false,
+                blocking_domain: "endpoint_family",
+                reason_code: "unsupported_endpoint_family",
+                next_action: "use_supported_endpoint_family",
+            },
             evidence,
         );
     };
@@ -884,11 +892,13 @@ pub fn endpoint_family_availability_explain_from_parts(
         return endpoint_family_availability_explain_result(
             input,
             Some(client_status),
-            "unavailable",
-            false,
-            "model",
-            "model_missing",
-            "publish_or_route_model",
+            EndpointFamilyAvailabilityOutcome {
+                status: "unavailable",
+                can_use: false,
+                blocking_domain: "model",
+                reason_code: "model_missing",
+                next_action: "publish_or_route_model",
+            },
             evidence,
         );
     }
@@ -897,11 +907,13 @@ pub fn endpoint_family_availability_explain_from_parts(
         return endpoint_family_availability_explain_result(
             input,
             Some(client_status),
-            "unavailable",
-            false,
-            "route",
-            "no_route",
-            "configure_route_or_default_channel",
+            EndpointFamilyAvailabilityOutcome {
+                status: "unavailable",
+                can_use: false,
+                blocking_domain: "route",
+                reason_code: "no_route",
+                next_action: "configure_route_or_default_channel",
+            },
             evidence,
         );
     };
@@ -923,11 +935,13 @@ pub fn endpoint_family_availability_explain_from_parts(
         return endpoint_family_availability_explain_result(
             input,
             Some(client_status),
-            "unavailable",
-            false,
-            "endpoint_family",
-            reason_code,
-            "configure_endpoint_capabilities_or_route",
+            EndpointFamilyAvailabilityOutcome {
+                status: "unavailable",
+                can_use: false,
+                blocking_domain: "endpoint_family",
+                reason_code,
+                next_action: "configure_endpoint_capabilities_or_route",
+            },
             evidence,
         );
     };
@@ -954,11 +968,13 @@ pub fn endpoint_family_availability_explain_from_parts(
         return endpoint_family_availability_explain_result(
             input,
             Some(client_status),
-            "unavailable",
-            false,
-            "target",
-            "no_usable_key_or_target",
-            "enable_target_or_key",
+            EndpointFamilyAvailabilityOutcome {
+                status: "unavailable",
+                can_use: false,
+                blocking_domain: "target",
+                reason_code: "no_usable_key_or_target",
+                next_action: "enable_target_or_key",
+            },
             evidence,
         );
     }
@@ -972,11 +988,13 @@ pub fn endpoint_family_availability_explain_from_parts(
     endpoint_family_availability_explain_result(
         input,
         Some(client_status),
-        "available",
-        true,
-        "none",
-        "available",
-        "none",
+        EndpointFamilyAvailabilityOutcome {
+            status: "available",
+            can_use: true,
+            blocking_domain: "none",
+            reason_code: "available",
+            next_action: "none",
+        },
         evidence,
     )
 }
@@ -996,23 +1014,27 @@ fn route_context_channel_states(
     }
 }
 
-fn endpoint_family_availability_explain_result(
-    input: EndpointFamilyAvailabilityExplainInput<'_>,
-    client_token: Option<EndpointFamilyAvailabilityClient>,
+struct EndpointFamilyAvailabilityOutcome {
     status: &'static str,
     can_use: bool,
     blocking_domain: &'static str,
     reason_code: &'static str,
     next_action: &'static str,
+}
+
+fn endpoint_family_availability_explain_result(
+    input: EndpointFamilyAvailabilityExplainInput<'_>,
+    client_token: Option<EndpointFamilyAvailabilityClient>,
+    outcome: EndpointFamilyAvailabilityOutcome,
     evidence: EndpointFamilyAvailabilityEvidence,
 ) -> EndpointFamilyAvailabilityExplain {
     let model = safe_public_model_label(input.public_model);
     EndpointFamilyAvailabilityExplain {
-        status,
-        can_use,
-        blocking_domain,
-        reason_code,
-        next_action,
+        status: outcome.status,
+        can_use: outcome.can_use,
+        blocking_domain: outcome.blocking_domain,
+        reason_code: outcome.reason_code,
+        next_action: outcome.next_action,
         endpoint_family: input.endpoint_family.to_string(),
         model: model.clone(),
         public_model: model,
@@ -1020,7 +1042,7 @@ fn endpoint_family_availability_explain_result(
         route_kind: input.route_kind,
         registry_generation: input.registry_generation,
         evidence,
-        next_step: endpoint_family_next_step(reason_code),
+        next_step: endpoint_family_next_step(outcome.reason_code),
         client_token,
     }
 }
