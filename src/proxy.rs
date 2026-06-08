@@ -645,9 +645,13 @@ fn route_state_unavailable_response(
 fn route_state_unavailable_response_for_attempt(
     channel_id: &str,
     state: ChannelRouteState,
+    frozen_state: ChannelRouteState,
     route_target_available: bool,
 ) -> Option<Response> {
-    if matches!(state, ChannelRouteState::ProviderCoolingDown) && route_target_available {
+    if matches!(state, ChannelRouteState::ProviderCoolingDown)
+        && !matches!(frozen_state, ChannelRouteState::ProviderCoolingDown)
+        && route_target_available
+    {
         return Some(no_route_candidate_response(&["provider_cooling_down"]));
     }
     route_state_unavailable_response(channel_id, state)
@@ -1189,6 +1193,7 @@ async fn forward_with_pool(
             if let Some(response) = route_state_unavailable_response_for_attempt(
                 &pool_name,
                 route_state,
+                target.route_state,
                 route_target_available,
             ) {
                 return PoolForwardResult::RouteFallback(response);

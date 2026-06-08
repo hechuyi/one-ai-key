@@ -29388,6 +29388,213 @@ model_routes:
     }
 
     #[tokio::test]
+    async fn provider_cooling_down_selected_target_is_not_rejected_when_fallback_exists() {
+        let primary_hits = Arc::new(AtomicU64::new(0));
+        let primary_hits_for_handler = primary_hits.clone();
+        let primary = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let primary_hits = primary_hits_for_handler.clone();
+                async move {
+                    primary_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "primary-soft-ok"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let primary_base = spawn_upstream(primary).await;
+
+        let fallback_hits = Arc::new(AtomicU64::new(0));
+        let fallback_hits_for_handler = fallback_hits.clone();
+        let fallback = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "fallback-soft-ok"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let fallback_base = spawn_upstream(fallback).await;
+
+        let mut primary_pool = openai_pool(primary_base.clone(), "primary-soft-credentials");
+        primary_pool.account = Some("primary-soft-account".to_string());
+        let mut fallback_pool = openai_pool(fallback_base.clone(), "fallback-soft-credentials");
+        fallback_pool.account = Some("fallback-soft-account".to_string());
+
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("primary-soft".to_string()),
+                providers: HashMap::from([
+                    (
+                        "primary-soft-provider".to_string(),
+                        ProviderConfig {
+                            provider_kind: ProviderKind::OpenAiCompatible,
+                            enabled: true,
+                        },
+                    ),
+                    (
+                        "fallback-soft-provider".to_string(),
+                        ProviderConfig {
+                            provider_kind: ProviderKind::OpenAiCompatible,
+                            enabled: true,
+                        },
+                    ),
+                ]),
+                accounts: HashMap::from([
+                    (
+                        "primary-soft-account".to_string(),
+                        AccountConfig {
+                            provider: "primary-soft-provider".to_string(),
+                            api_base: primary_base,
+                            auth_header: "authorization".to_string(),
+                            auth_prefix: "Bearer ".to_string(),
+                            enabled: true,
+                        },
+                    ),
+                    (
+                        "fallback-soft-account".to_string(),
+                        AccountConfig {
+                            provider: "fallback-soft-provider".to_string(),
+                            api_base: fallback_base,
+                            auth_header: "authorization".to_string(),
+                            auth_prefix: "Bearer ".to_string(),
+                            enabled: true,
+                        },
+                    ),
+                ]),
+                credential_sets: credential_sets_from_files([
+                    (
+                        "primary-soft-credentials",
+                        temp_keys_file("primary-soft-key\n"),
+                    ),
+                    (
+                        "fallback-soft-credentials",
+                        temp_keys_file("fallback-soft-key\n"),
+                    ),
+                ]),
+                model_routes: HashMap::from([priority_route(
+                    "gpt-soft-fallback",
+                    ["primary-soft", "fallback-soft"],
+                )]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([
+                    ("primary-soft".to_string(), primary_pool),
+                    ("fallback-soft".to_string(), fallback_pool),
+                ]),
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+
+        state.channels.apply_failure_domain_transition(
+            "provider:primary-soft-provider",
+            "account:primary-soft-account",
+            Some(Instant::now() + Duration::from_secs(30)),
+            "provider unavailable",
+        );
+        state.channels.apply_failure_domain_transition(
+            "provider:fallback-soft-provider",
+            "account:fallback-soft-account",
+            Some(Instant::now() + Duration::from_secs(30)),
+            "provider unavailable",
+        );
+
+        let preview = management_response_json(
+            &app(state.clone()),
+            "/management/routing/preview?model=gpt-soft-fallback&client_token=test-client",
+        )
+        .await;
+        assert_eq!(preview["selected_target"]["channel_id"], "primary-soft");
+        assert_eq!(preview["candidates"][0]["included"], true);
+        assert_eq!(preview["candidates"][1]["included"], true);
+        assert_eq!(
+            preview["candidates"][0]["reasons"][0],
+            "provider_cooling_down_last_resort"
+        );
+        assert_eq!(
+            preview["candidates"][1]["reasons"][0],
+            "provider_cooling_down_last_resort"
+        );
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-soft-fallback","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"].as_str(),
+            Some("primary-soft-ok")
+        );
+        let body_text = value.to_string();
+        assert!(!body_text.contains("primary-soft-key"));
+        assert!(!body_text.contains("fallback-soft-key"));
+    }
+
+    #[tokio::test]
     async fn explicit_model_route_mixed_cooling_and_no_credentials_reports_mixed_reasons() {
         let upstream_hits = Arc::new(Mutex::new(0usize));
         let upstream_hits_for_handler = upstream_hits.clone();
