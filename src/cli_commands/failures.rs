@@ -816,10 +816,11 @@ fn render_failure_table(report: &Value) -> String {
         .unwrap_or_default();
     for failure in failures {
         output.push_str(&format!(
-            "- request_id={} stage={} failure_class={} router_action={} retry_eligibility={} retry_blocked_reason={} client_visible_status={} reason_code={} model={} channel={} directive={}\n",
+            "- request_id={} stage={} failure_class={} blocking_domain={} router_action={} retry_eligibility={} retry_blocked_reason={} client_visible_status={} reason_code={} model={} channel={} directive={}\n",
             table_str(failure.get("request_id")),
             table_str(failure.get("stage")),
             table_str(failure.get("failure_class")),
+            table_str(failure.get("blocking_domain")),
             table_str(failure.get("router_action")),
             table_str(failure.get("retry_eligibility")),
             table_str(failure.get("retry_blocked_reason")),
@@ -1172,6 +1173,7 @@ mod tests {
 
         assert!(rendered.contains("availability_source: bounded_evidence"));
         assert!(rendered.contains("current_availability: false"));
+        assert!(rendered.contains("blocking_domain=upstream"));
     }
 
     #[test]
@@ -1220,6 +1222,7 @@ mod tests {
 
         assert!(rendered.contains("availability_source: bounded_evidence"));
         assert!(rendered.contains("current_availability: false"));
+        assert!(rendered.contains("blocking_domain=upstream"));
     }
 
     #[test]
