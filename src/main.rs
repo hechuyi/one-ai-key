@@ -10404,6 +10404,7 @@ pools:
         let (app, registry_store_path) = registry_provider_fixture();
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("PUT")
@@ -10428,6 +10429,9 @@ pools:
             .load_registry_for_validation()
             .unwrap();
         assert!(stored.model_routes.is_empty());
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert!(events["events"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -15604,7 +15608,9 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/management/registry/model-routes/staged-model")
+                    .uri(
+                        "/management/registry/model-routes/staged-model?expected_staged_registry_version=1",
+                    )
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
@@ -21702,7 +21708,9 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/management/registry/model-routes/sensitive-public-model")
+                    .uri(
+                        "/management/registry/model-routes/sensitive-public-model?expected_staged_registry_version=1",
+                    )
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
@@ -21774,7 +21782,9 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/management/registry/model-routes/sensitive-public-model")
+                    .uri(
+                        "/management/registry/model-routes/sensitive-public-model?expected_staged_registry_version=1",
+                    )
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
@@ -21853,7 +21863,9 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/management/registry/model-routes/staged-sensitive-model")
+                    .uri(
+                        "/management/registry/model-routes/staged-sensitive-model?expected_staged_registry_version=1",
+                    )
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(

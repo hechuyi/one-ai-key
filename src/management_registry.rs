@@ -225,24 +225,10 @@ pub async fn apply_audited_staged_model_route_batch_for_state(
     routes: Vec<(String, ModelRouteConfig)>,
     audit: RegistryMutationAudit,
 ) -> Result<RegistryStoreCommit, ManagementServiceError> {
-    let current_registry_version = state
-        .registry_store
-        .current_version()
-        .await
-        .map_err(registry_store_error)?
-        .ok_or_else(|| {
-            ManagementServiceError::Conflict(
-                "registry persistence requires a writable registry store".to_string(),
-            )
-        })?;
-    if expected_registry_version != current_registry_version {
-        return Err(ManagementServiceError::Conflict(
-            "registry version changed during model route apply".to_string(),
-        ));
-    }
-    let audit_generation = expected_registry_version.saturating_add(1);
-    record_registry_mutation_audit_event(state, actor, &audit, audit_generation).await?;
-    apply_staged_model_route_batch_for_state(state, expected_registry_version, routes).await
+    let commit =
+        apply_staged_model_route_batch_for_state(state, expected_registry_version, routes).await?;
+    record_registry_mutation_audit_event(state, actor, &audit, commit.registry_version).await?;
+    Ok(commit)
 }
 
 pub async fn registry_provider_enabled_response_for_state(
