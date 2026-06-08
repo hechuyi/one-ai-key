@@ -344,24 +344,14 @@ fn sanitized_models_explain_report(
         .and_then(Value::as_str)
         .unwrap_or_else(|| models_explain_reason_code(has_selected_target, client_scope_status));
     let diagnostic_contract = crate::diagnostic_contract::contract_for_reason(reason_code);
-    let availability_contract = availability.as_ref().map(|_| {
-        diagnostic_contract
-            .clone()
-            .unwrap_or_else(crate::diagnostic_contract::fallback_contract)
-    });
-    let blocking_domain = diagnostic_contract
+    let blocking_domain = availability
         .as_ref()
-        .map(|contract| contract.blocking_domain)
+        .and_then(|value| value.get("blocking_domain"))
+        .and_then(Value::as_str)
         .or_else(|| {
-            availability_contract
+            diagnostic_contract
                 .as_ref()
                 .map(|contract| contract.blocking_domain)
-        })
-        .or_else(|| {
-            availability
-                .as_ref()
-                .and_then(|value| value.get("blocking_domain"))
-                .and_then(Value::as_str)
         });
     let report_model = availability
         .as_ref()
@@ -379,8 +369,9 @@ fn sanitized_models_explain_report(
         .or_else(|| client_token.get("name").and_then(Value::as_str));
     let next_action = availability
         .as_ref()
-        .and(availability_contract.as_ref())
-        .map(|contract| contract.next_action.clone())
+        .and_then(|value| value.get("next_step"))
+        .filter(|value| !value.is_null())
+        .cloned()
         .unwrap_or_else(|| {
             models_explain_next_action(status, preview, client_scope_status, reason_code)
         });
@@ -433,15 +424,12 @@ fn sanitize_model_availability(value: &Value) -> Value {
         .get("reason_code")
         .and_then(Value::as_str)
         .filter(|value| is_safe_reason_code(value));
-    let diagnostic_contract = reason_code.and_then(crate::diagnostic_contract::contract_for_reason);
-    let availability_contract = diagnostic_contract
-        .clone()
-        .unwrap_or_else(crate::diagnostic_contract::fallback_contract);
-    let blocking_domain = diagnostic_contract
-        .as_ref()
-        .map(|contract| contract.blocking_domain)
-        .or(Some(availability_contract.blocking_domain));
-    let next_step = availability_contract.next_action.clone();
+    let blocking_domain = value
+        .get("blocking_domain")
+        .and_then(Value::as_str)
+        .filter(|value| is_safe_reason_code(value));
+    let next_step =
+        sanitize_management_next_step(value.get("next_step")).unwrap_or(serde_json::Value::Null);
     let client_token = value
         .get("client_token")
         .and_then(Value::as_object)
@@ -491,6 +479,178 @@ fn sanitize_model_availability(value: &Value) -> Value {
         "evidence": sanitize_availability_evidence(value.get("evidence")),
         "next_step": next_step,
         "client_token": client_token,
+    })
+}
+
+fn sanitize_management_next_step(value: Option<&Value>) -> Option<Value> {
+    let action = value?.as_object()?;
+    if action.get("side_effect_class").and_then(Value::as_str) != Some("runtime_readonly") {
+        return None;
+    }
+    if action.get("requires_confirmation").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let template_id = action
+        .get("template_id")
+        .and_then(Value::as_str)
+        .filter(|value| is_safe_reason_code(value))?;
+    let summary = action
+        .get("summary")
+        .and_then(Value::as_str)
+        .and_then(safe_next_step_summary)?;
+    let safe_argv = action
+        .get("safe_argv")
+        .and_then(Value::as_array)?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    if !is_allowed_management_next_step_argv(&safe_argv)
+        || !safe_argv.iter().copied().all(is_safe_next_step_argv_arg)
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "summary": summary,
+        "template_id": template_id,
+        "safe_argv": safe_argv,
+        "side_effect_class": "runtime_readonly",
+        "requires_confirmation": false,
+    }))
+}
+
+fn safe_next_step_summary(summary: &str) -> Option<String> {
+    let trimmed = summary.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 240
+        || trimmed.chars().any(char::is_control)
+        || trimmed.contains("://")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || looks_like_windows_absolute_path(trimmed)
+    {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("sk-")
+        || lower.contains("sk_")
+        || lower.contains("secret")
+        || lower.contains("authorization")
+        || lower.contains("bearer")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("/tmp/")
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn is_allowed_management_next_step_argv(argv: &[&str]) -> bool {
+    if argv.is_empty() {
+        return true;
+    }
+    matches!(
+        argv,
+        [
+            "one-ai-key",
+            "models",
+            "explain",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "--model",
+            "<public-model>"
+        ] | [
+            "one-ai-key",
+            "models",
+            "explain",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "--model",
+            "<public-model>",
+            "--client-token-ref",
+            "<client-token-ref>"
+        ] | [
+            "one-ai-key",
+            "models",
+            "explain",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "--model",
+            "<public-model>",
+            "--endpoint-family",
+            "chat_completions"
+        ] | [
+            "one-ai-key",
+            "models",
+            "list",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>"
+        ] | [
+            "one-ai-key",
+            "client-tokens",
+            "list",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>"
+        ] | [
+            "one-ai-key",
+            "route",
+            "explain",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "<public-model>"
+        ]
+    )
+}
+
+fn is_safe_next_step_argv_arg(arg: &str) -> bool {
+    if arg.is_empty()
+        || arg.len() > 128
+        || arg.starts_with('/')
+        || arg.starts_with("~/")
+        || arg.starts_with("./")
+        || arg.starts_with("../")
+        || arg.contains("://")
+        || arg.contains('\\')
+        || arg.chars().any(char::is_control)
+        || looks_like_windows_absolute_path(arg)
+    {
+        return false;
+    }
+    if arg.bytes().any(|byte| {
+        matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'|' | b'&' | b'$' | b'`' | b'\'' | b'"'
+        )
+    }) {
+        return false;
+    }
+    let lower = arg.to_ascii_lowercase();
+    if lower.contains("sk-")
+        || lower.contains("sk_")
+        || lower.contains("secret")
+        || lower.contains("authorization")
+        || lower.contains("bearer")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+    {
+        return false;
+    }
+    arg.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'<' | b'>')
     })
 }
 
@@ -1486,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn models_explain_endpoint_family_next_action_is_rebuilt_from_diagnostic_contract() {
+    fn models_explain_management_availability_projection_is_canonical() {
         let preview = serde_json::json!({
             "model": "gpt-public",
             "route_kind": "explicit_model_route",
@@ -1498,7 +1658,7 @@ mod tests {
         let availability = serde_json::json!({
             "status": "unavailable",
             "can_use": false,
-            "blocking_domain": "wrong_domain",
+            "blocking_domain": "route",
             "reason_code": "no_route",
             "endpoint_family": "chat_completions",
             "model": "gpt-public",
@@ -1512,13 +1672,13 @@ mod tests {
                 "candidate_reason_codes": ["no_route"]
             },
             "next_step": {
-                "summary": "unsafe backend suggestion must not be copied",
-                "template_id": "keys_import",
-                "safe_argv": ["one-ai-key", "keys", "import", "--file", "/tmp/key.txt", "--yes"],
+                "summary": "Inspect the management-projected route state.",
+                "template_id": "management_route_projection",
+                "safe_argv": ["one-ai-key", "route", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "<public-model>"],
                 "side_effect_class": "runtime_readonly",
                 "requires_confirmation": false
             },
-            "next_action": "unsafe_backend_next_action"
+            "next_action": "inspect_management_route_projection"
         });
 
         let rendered = super::render_models_explain_report_with_management_projection(
@@ -1528,16 +1688,29 @@ mod tests {
             crate::cli_report::OutputFormat::Json,
         );
         let report: Value = serde_json::from_str(&rendered).unwrap();
-        let contract = crate::diagnostic_contract::contract_for_reason("no_route")
-            .expect("stage 2 availability reason should have a diagnostic contract");
-
-        assert_eq!(report["blocking_domain"], contract.blocking_domain);
-        assert_eq!(report["next_action"], contract.next_action);
-        assert_eq!(report["availability"]["next_step"], contract.next_action);
-        assert!(!rendered.contains("keys"));
-        assert!(!rendered.contains("/tmp/key.txt"));
-        assert!(!rendered.contains("--yes"));
-        assert!(!rendered.contains("unsafe backend suggestion"));
+        assert_eq!(report["blocking_domain"], "route");
+        assert_eq!(
+            report["availability"]["next_action"],
+            "inspect_management_route_projection"
+        );
+        assert_eq!(
+            report["availability"]["next_step"]["template_id"],
+            "management_route_projection"
+        );
+        assert_eq!(
+            report["availability"]["next_step"]["safe_argv"],
+            serde_json::json!([
+                "one-ai-key",
+                "route",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "<public-model>"
+            ])
+        );
+        assert_eq!(report["next_action"], report["availability"]["next_step"]);
     }
 
     #[test]
