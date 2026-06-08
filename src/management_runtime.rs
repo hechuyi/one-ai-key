@@ -93,6 +93,32 @@ pub struct RoutingTelemetryResponse {
     pub offset: usize,
     pub limit: usize,
     pub events: Vec<Value>,
+    pub failure_transition_summaries: Vec<FailureTransitionSummary>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct FailureTransitionSummary {
+    pub request_id: Option<String>,
+    pub channel_id: Option<String>,
+    pub public_model: Option<String>,
+    pub client_token_ref: Option<String>,
+    pub selected_credential_id_hash: Option<String>,
+    pub attempt: usize,
+    pub failure_source: String,
+    pub failure_kind: String,
+    pub failure_scope: String,
+    pub retryable: bool,
+    pub status: Option<u16>,
+    pub mutation_kind: String,
+    pub transition_action: String,
+    pub affected_resource_kind: String,
+    pub affected_credential_id_hash: Option<String>,
+    pub resulting_state: String,
+    pub reason: Option<String>,
+    pub directive: Option<String>,
+    pub denial_reason: Option<String>,
+    pub retry_decision: Option<String>,
+    pub retry_decision_reason: Option<String>,
 }
 
 pub fn routing_telemetry_response(
@@ -103,6 +129,7 @@ pub fn routing_telemetry_response(
     limit: usize,
 ) -> RoutingTelemetryResponse {
     let buffered_events = snapshot.len();
+    let failure_transition_summaries = failure_transition_summaries(&snapshot);
     let events = snapshot
         .into_iter()
         .skip(offset)
@@ -116,6 +143,7 @@ pub fn routing_telemetry_response(
         offset,
         limit,
         events,
+        failure_transition_summaries,
     }
 }
 
@@ -139,6 +167,165 @@ pub fn routing_telemetry_snapshot_response(
         )
     };
     routing_telemetry_response(snapshot, capacity, dropped_events, offset, limit)
+}
+
+struct FailureTransitionSummaryBuilder {
+    request_id: String,
+    channel_id: String,
+    summary: FailureTransitionSummary,
+}
+
+fn failure_transition_summaries(snapshot: &[RoutingTelemetry]) -> Vec<FailureTransitionSummary> {
+    let mut summaries: Vec<FailureTransitionSummaryBuilder> =
+        Vec::with_capacity(snapshot.len().min(128));
+    for event in snapshot {
+        match event {
+            RoutingTelemetry::UpstreamFailureObserved {
+                request_id,
+                channel_id,
+                failure,
+            } => summaries.push(FailureTransitionSummaryBuilder {
+                request_id: request_id.clone(),
+                channel_id: channel_id.clone(),
+                summary: failure_transition_summary_from_failure(request_id, channel_id, failure),
+            }),
+            RoutingTelemetry::CredentialTransitionApplied {
+                request_id,
+                channel_id,
+                credential_id,
+                state,
+                reason,
+            } => {
+                if let Some(builder) =
+                    pending_failure_transition_summary(&mut summaries, request_id, channel_id)
+                {
+                    apply_credential_transition_summary(
+                        &mut builder.summary,
+                        credential_id,
+                        state,
+                        reason,
+                    );
+                }
+            }
+            RoutingTelemetry::ChannelHealthTransitionApplied {
+                request_id,
+                channel_id,
+                state,
+                reason,
+            } => {
+                if let Some(builder) =
+                    pending_failure_transition_summary(&mut summaries, request_id, channel_id)
+                {
+                    apply_channel_transition_summary(&mut builder.summary, state, reason);
+                }
+            }
+            RoutingTelemetry::RouteSelected { .. }
+            | RoutingTelemetry::TransitionApplied { .. }
+            | RoutingTelemetry::CredentialLifecyclePersistenceDropped { .. } => {}
+        }
+    }
+    summaries
+        .into_iter()
+        .map(|builder| builder.summary)
+        .collect()
+}
+
+fn pending_failure_transition_summary<'a>(
+    summaries: &'a mut [FailureTransitionSummaryBuilder],
+    request_id: &str,
+    channel_id: &str,
+) -> Option<&'a mut FailureTransitionSummaryBuilder> {
+    summaries.iter_mut().rev().find(|builder| {
+        builder.request_id == request_id
+            && builder.channel_id == channel_id
+            && builder.summary.mutation_kind == "noop"
+    })
+}
+
+fn failure_transition_summary_from_failure(
+    request_id: &str,
+    channel_id: &str,
+    failure: &UpstreamFailureTelemetry,
+) -> FailureTransitionSummary {
+    FailureTransitionSummary {
+        request_id: safe_management_id(request_id),
+        channel_id: safe_management_id(channel_id),
+        public_model: failure.public_model.as_deref().and_then(safe_management_id),
+        client_token_ref: None,
+        selected_credential_id_hash: safe_management_id(&failure.credential_id_hash),
+        attempt: failure.attempt,
+        failure_source: safe_management_code(&failure.failure_source),
+        failure_kind: safe_management_code(&failure.failure_kind),
+        failure_scope: safe_management_code(&failure.failure_scope),
+        retryable: failure.retryable,
+        status: failure.status,
+        mutation_kind: "noop".to_string(),
+        transition_action: "noop".to_string(),
+        affected_resource_kind: "none".to_string(),
+        affected_credential_id_hash: None,
+        resulting_state: "noop".to_string(),
+        reason: None,
+        directive: safe_management_id(&failure.directive),
+        denial_reason: failure
+            .denial_reason
+            .as_deref()
+            .and_then(safe_management_id),
+        retry_decision: safe_management_id(&failure.retry_decision),
+        retry_decision_reason: failure
+            .retry_decision_reason
+            .as_deref()
+            .and_then(safe_management_id),
+    }
+}
+
+fn apply_credential_transition_summary(
+    summary: &mut FailureTransitionSummary,
+    credential_id: &str,
+    state: &str,
+    reason: &str,
+) {
+    summary.mutation_kind = "credential_transition".to_string();
+    summary.transition_action = credential_transition_action(state);
+    summary.affected_resource_kind = "credential".to_string();
+    summary.affected_credential_id_hash = Some(short_hash(credential_id));
+    summary.resulting_state = safe_management_code(state);
+    summary.reason = safe_management_id(reason);
+}
+
+fn apply_channel_transition_summary(
+    summary: &mut FailureTransitionSummary,
+    state: &str,
+    reason: &str,
+) {
+    summary.mutation_kind = "channel_health_transition".to_string();
+    summary.transition_action = channel_transition_action(state, reason);
+    summary.affected_resource_kind = "channel".to_string();
+    summary.resulting_state = safe_management_code(state);
+    summary.reason = safe_management_id(reason);
+}
+
+fn credential_transition_action(state: &str) -> String {
+    match state {
+        "expired" => "expire_credential",
+        "cooling_down" => "mark_credential_cooling_down",
+        "quota_exhausted" => "mark_credential_quota_exhausted",
+        _ => "credential_transition",
+    }
+    .to_string()
+}
+
+fn channel_transition_action(state: &str, reason: &str) -> String {
+    match (state, reason) {
+        ("cooling_down", "relay_balance_unavailable") => "mark_relay_balance_channel_cooling_down",
+        ("cooling_down", "upstream_provider_unavailable") => {
+            "mark_provider_account_channel_cooling_down"
+        }
+        ("degraded", "upstream_provider_unavailable") => "mark_provider_account_channel_degraded",
+        ("cooling_down", _) => "mark_channel_cooling_down",
+        ("degraded", _) => "mark_channel_degraded",
+        _ => "channel_health_transition",
+    }
+    .to_string()
 }
 
 fn total_dropped_events(buffer_dropped_events: u64, lock_contention_drops: &AtomicU64) -> u64 {
@@ -284,6 +471,10 @@ fn safe_management_id(value: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+fn safe_management_code(value: &str) -> String {
+    safe_management_id(value).unwrap_or_else(|| "unknown".to_string())
 }
 
 #[derive(Debug, Serialize)]
@@ -1234,6 +1425,302 @@ mod tests {
         assert_eq!(response.dropped_events, 3);
         assert_eq!(response.offset, 0);
         assert_eq!(response.limit, 50);
+    }
+
+    #[test]
+    fn failure_transition_summary_projects_credential_expiration_without_raw_ids() {
+        let response = routing_telemetry_response(
+            vec![
+                upstream_failure_event(
+                    "req_expire",
+                    "test",
+                    failure_telemetry("auth_invalid", "credential", "upstream_transaction"),
+                ),
+                RoutingTelemetry::CredentialTransitionApplied {
+                    request_id: "req_expire".to_string(),
+                    channel_id: "test".to_string(),
+                    credential_id: "internal/credential/id".to_string(),
+                    state: "expired".to_string(),
+                    reason: "upstream_auth_invalid".to_string(),
+                },
+                RoutingTelemetry::TransitionApplied {
+                    request_id: "req_expire".to_string(),
+                    channel_id: "test".to_string(),
+                },
+            ],
+            64,
+            0,
+            0,
+            50,
+        );
+        let value = serde_json::to_value(response).unwrap();
+        let body = value.to_string();
+
+        assert!(!body.contains("internal/credential/id"));
+        assert_eq!(value["events"].as_array().unwrap().len(), 3);
+        let summaries = value["failure_transition_summaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary["failure_kind"], "auth_invalid");
+        assert_eq!(summary["failure_scope"], "credential");
+        assert_eq!(summary["failure_source"], "upstream_transaction");
+        assert_eq!(summary["transition_action"], "expire_credential");
+        assert_eq!(summary["mutation_kind"], "credential_transition");
+        assert_eq!(summary["affected_resource_kind"], "credential");
+        assert_eq!(summary["resulting_state"], "expired");
+        assert_eq!(
+            summary["affected_credential_id_hash"],
+            crate::credentials::short_hash("internal/credential/id")
+        );
+        assert_eq!(summary["request_id"], "req_expire");
+        assert_eq!(summary["channel_id"], "test");
+        assert_eq!(summary["public_model"], "gpt-test");
+        assert_eq!(summary["retry_decision"], "return_current_error");
+        assert_eq!(summary["retry_decision_reason"], "failure_not_retryable");
+    }
+
+    #[test]
+    fn failure_transition_summary_projects_credential_cooldown_and_quota() {
+        let response = routing_telemetry_response(
+            vec![
+                upstream_failure_event(
+                    "req_cooldown",
+                    "test",
+                    failure_telemetry("rate_limited", "credential", "upstream_transaction"),
+                ),
+                RoutingTelemetry::CredentialTransitionApplied {
+                    request_id: "req_cooldown".to_string(),
+                    channel_id: "test".to_string(),
+                    credential_id: "credential-a".to_string(),
+                    state: "cooling_down".to_string(),
+                    reason: "upstream_rate_limited".to_string(),
+                },
+                upstream_failure_event(
+                    "req_quota",
+                    "test",
+                    failure_telemetry("quota_exhausted", "credential", "upstream_transaction"),
+                ),
+                RoutingTelemetry::CredentialTransitionApplied {
+                    request_id: "req_quota".to_string(),
+                    channel_id: "test".to_string(),
+                    credential_id: "credential-b".to_string(),
+                    state: "quota_exhausted".to_string(),
+                    reason: "upstream_quota_exhausted".to_string(),
+                },
+            ],
+            64,
+            0,
+            0,
+            50,
+        );
+        let value = serde_json::to_value(response).unwrap();
+        let summaries = value["failure_transition_summaries"].as_array().unwrap();
+
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(
+            summaries[0]["transition_action"],
+            "mark_credential_cooling_down"
+        );
+        assert_eq!(summaries[0]["resulting_state"], "cooling_down");
+        assert_eq!(
+            summaries[1]["transition_action"],
+            "mark_credential_quota_exhausted"
+        );
+        assert_eq!(summaries[1]["resulting_state"], "quota_exhausted");
+    }
+
+    #[test]
+    fn failure_transition_summary_projects_channel_cooldown_and_degraded() {
+        let response = routing_telemetry_response(
+            vec![
+                upstream_failure_event(
+                    "req_channel_cooldown",
+                    "test",
+                    failure_telemetry(
+                        "relay_balance_unavailable",
+                        "channel",
+                        "upstream_transaction",
+                    ),
+                ),
+                RoutingTelemetry::ChannelHealthTransitionApplied {
+                    request_id: "req_channel_cooldown".to_string(),
+                    channel_id: "test".to_string(),
+                    state: "cooling_down".to_string(),
+                    reason: "relay_balance_unavailable".to_string(),
+                },
+                upstream_failure_event(
+                    "req_degraded",
+                    "test",
+                    failure_telemetry("provider_unavailable", "channel", "upstream_transaction"),
+                ),
+                RoutingTelemetry::ChannelHealthTransitionApplied {
+                    request_id: "req_degraded".to_string(),
+                    channel_id: "test".to_string(),
+                    state: "degraded".to_string(),
+                    reason: "upstream_provider_unavailable".to_string(),
+                },
+            ],
+            64,
+            0,
+            0,
+            50,
+        );
+        let value = serde_json::to_value(response).unwrap();
+        let summaries = value["failure_transition_summaries"].as_array().unwrap();
+
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(
+            summaries[0]["transition_action"],
+            "mark_relay_balance_channel_cooling_down"
+        );
+        assert_eq!(summaries[0]["affected_resource_kind"], "channel");
+        assert_eq!(summaries[0]["resulting_state"], "cooling_down");
+        assert_eq!(
+            summaries[1]["transition_action"],
+            "mark_provider_account_channel_degraded"
+        );
+        assert_eq!(summaries[1]["resulting_state"], "degraded");
+    }
+
+    #[test]
+    fn failure_transition_summary_projects_noop_for_request_only_failures() {
+        let response = routing_telemetry_response(
+            vec![upstream_failure_event(
+                "req_noop",
+                "test",
+                failure_telemetry("client_error", "request_only", "upstream_transaction"),
+            )],
+            64,
+            0,
+            0,
+            50,
+        );
+        let value = serde_json::to_value(response).unwrap();
+        let summary = &value["failure_transition_summaries"].as_array().unwrap()[0];
+
+        assert_eq!(summary["failure_kind"], "client_error");
+        assert_eq!(summary["failure_scope"], "request_only");
+        assert_eq!(summary["transition_action"], "noop");
+        assert_eq!(summary["mutation_kind"], "noop");
+        assert_eq!(summary["affected_resource_kind"], "none");
+        assert_eq!(summary["resulting_state"], "noop");
+    }
+
+    #[test]
+    fn failure_transition_summary_projects_response_filter_precommit_actions_without_raw_upstream_text(
+    ) {
+        let response = routing_telemetry_response(
+            vec![
+                upstream_failure_event(
+                    "req_filter_credential",
+                    "test",
+                    failure_telemetry(
+                        "response_filter_rejected",
+                        "credential",
+                        "response_filter_precommit",
+                    ),
+                ),
+                RoutingTelemetry::CredentialTransitionApplied {
+                    request_id: "req_filter_credential".to_string(),
+                    channel_id: "test".to_string(),
+                    credential_id: "credential-filter".to_string(),
+                    state: "expired".to_string(),
+                    reason: "response_filter_rejected".to_string(),
+                },
+                upstream_failure_event(
+                    "req_filter_channel",
+                    "test",
+                    failure_telemetry(
+                        "response_filter_rejected",
+                        "channel",
+                        "response_filter_precommit",
+                    ),
+                ),
+                RoutingTelemetry::ChannelHealthTransitionApplied {
+                    request_id: "req_filter_channel".to_string(),
+                    channel_id: "test".to_string(),
+                    state: "cooling_down".to_string(),
+                    reason: "response_filter_rejected".to_string(),
+                },
+            ],
+            64,
+            0,
+            0,
+            50,
+        );
+        let value = serde_json::to_value(response).unwrap();
+        let body = value.to_string();
+
+        assert!(!body.contains("raw upstream text"));
+        assert!(!body.contains("request_body"));
+        assert!(!body.contains("response_body"));
+        let summaries = value["failure_transition_summaries"].as_array().unwrap();
+        assert_eq!(summaries[0]["transition_action"], "expire_credential");
+        assert_eq!(summaries[0]["failure_source"], "response_filter_precommit");
+        assert_eq!(
+            summaries[1]["transition_action"],
+            "mark_channel_cooling_down"
+        );
+        assert_eq!(summaries[1]["failure_source"], "response_filter_precommit");
+    }
+
+    #[test]
+    fn failure_transition_summary_is_management_projection_only_and_not_routing_input() {
+        let source = include_str!("management_runtime.rs");
+        assert!(source.contains("failure_transition_summaries"));
+
+        for hot_path in [
+            include_str!("routing.rs"),
+            include_str!("failure_state_executor.rs"),
+            include_str!("proxy.rs"),
+        ] {
+            assert!(
+                !hot_path.contains("failure_transition_summaries"),
+                "failure transition summary must remain outside routing inputs and mutation execution"
+            );
+        }
+    }
+
+    fn upstream_failure_event(
+        request_id: &str,
+        channel_id: &str,
+        failure: UpstreamFailureTelemetry,
+    ) -> RoutingTelemetry {
+        RoutingTelemetry::UpstreamFailureObserved {
+            request_id: request_id.to_string(),
+            channel_id: channel_id.to_string(),
+            failure: Box::new(failure),
+        }
+    }
+
+    fn failure_telemetry(
+        failure_kind: &str,
+        failure_scope: &str,
+        failure_source: &str,
+    ) -> UpstreamFailureTelemetry {
+        UpstreamFailureTelemetry {
+            public_model: Some("gpt-test".to_string()),
+            credential_id_hash: "safe-credential-hash".to_string(),
+            attempt: 0,
+            failure_source: failure_source.to_string(),
+            failure_kind: failure_kind.to_string(),
+            failure_scope: failure_scope.to_string(),
+            retryable: false,
+            confidence: "high".to_string(),
+            status: Some(401),
+            classifier_id: "test-classifier".to_string(),
+            classifier_version: "1".to_string(),
+            adaptation_rule_id: None,
+            retry_after_source: None,
+            cooldown_seconds: None,
+            directive: "return_error".to_string(),
+            denial_reason: Some("failure_not_retryable".to_string()),
+            duplicate_charge_risk: "none".to_string(),
+            effective_deadline_remaining_ms: Some(500),
+            retry_pressure_accounted: true,
+            retry_decision: "return_current_error".to_string(),
+            retry_decision_reason: Some("failure_not_retryable".to_string()),
+        }
     }
 
     #[test]
