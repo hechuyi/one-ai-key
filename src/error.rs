@@ -177,21 +177,17 @@ impl ErrorClassifier {
             FailureScope::ProviderAdapter,
             FailureScope::ClientToken,
         );
-        let (kind, primary_scope, retryable, confidence) =
-            if evidence.code.is_none() && evidence.has_top_level_error_object {
-                (
-                    FailureKind::ClientError,
-                    FailureScope::RequestOnly,
-                    false,
-                    FailureConfidence::Medium,
-                )
-            } else {
-                evidence
-                    .code
-                    .as_deref()
-                    .and_then(|code| self.classify_code(code))
-                    .unwrap_or_else(|| self.classify_status(status))
-            };
+        let (kind, primary_scope, retryable, confidence) = evidence
+            .code
+            .as_deref()
+            .and_then(|code| self.classify_code(code))
+            .unwrap_or_else(|| {
+                if evidence.code.is_none() && evidence.has_top_level_error_object {
+                    self.classify_code_less_top_level_error_status(status)
+                } else {
+                    self.classify_status(status)
+                }
+            });
         let (cooldown, retry_after_source) = retry_after(headers);
         let mut failure = ClassifiedFailure {
             kind,
@@ -410,6 +406,37 @@ impl ErrorClassifier {
             FailureScope::RequestOnly,
             false,
             FailureConfidence::Low,
+        )
+    }
+
+    fn classify_code_less_top_level_error_status(
+        &self,
+        status: u16,
+    ) -> (FailureKind, FailureScope, bool, FailureConfidence) {
+        let status_classification = self.classify_status(status);
+        if matches!(
+            status_classification,
+            (
+                FailureKind::ProviderUnavailable,
+                FailureScope::Channel,
+                true,
+                _
+            ) | (FailureKind::RateLimited, FailureScope::Credential, _, _)
+                | (
+                    FailureKind::ClientError,
+                    FailureScope::RequestOnly,
+                    false,
+                    _
+                )
+        ) {
+            return status_classification;
+        }
+
+        (
+            FailureKind::ClientError,
+            FailureScope::RequestOnly,
+            false,
+            FailureConfidence::Medium,
         )
     }
 }
@@ -1117,16 +1144,140 @@ mod tests {
     }
 
     #[test]
-    fn phase_1a_code_less_top_level_error_object_is_request_only() {
-        let failure = classifier_for_relay_profile(RelayProfile::OfficialOpenAi).classify_failure(
-            401,
+    fn phase_1_task3_code_less_top_level_502_falls_back_to_transient_status() {
+        let failure = classifier_for_relay_profile(RelayProfile::GenericRelay).classify_failure(
+            502,
             &[],
-            br#"{"error":{"message":"synthetic client error"}}"#,
+            br#"{"error":{"message":"upstream temporarily unavailable"}}"#,
         );
 
-        assert_eq!(failure.kind, FailureKind::ClientError);
-        assert_eq!(failure.primary_scope, FailureScope::RequestOnly);
-        assert!(!failure.retryable);
+        assert_eq!(failure.kind, FailureKind::ProviderUnavailable);
+        assert_eq!(failure.primary_scope, FailureScope::Channel);
+        assert!(failure.retryable);
         assert_eq!(failure.upstream_code, None);
+    }
+
+    #[test]
+    fn phase_1_task3_code_less_top_level_503_falls_back_to_transient_status() {
+        let failure = classifier_for_relay_profile(RelayProfile::UntrustedRelay).classify_failure(
+            503,
+            &[],
+            br#"{"error":{"message":"relay overloaded"}}"#,
+        );
+
+        assert_eq!(failure.kind, FailureKind::ProviderUnavailable);
+        assert_eq!(failure.primary_scope, FailureScope::Channel);
+        assert!(failure.retryable);
+        assert_eq!(failure.upstream_code, None);
+    }
+
+    #[test]
+    fn phase_1_task3_code_less_top_level_429_remains_credential_rate_limited_non_retryable() {
+        let failure = classifier_for_relay_profile(RelayProfile::GenericRelay).classify_failure(
+            429,
+            &[],
+            br#"{"error":{"message":"rate limited; retry after 120 seconds"}}"#,
+        );
+
+        assert_eq!(failure.kind, FailureKind::RateLimited);
+        assert_eq!(failure.primary_scope, FailureScope::Credential);
+        assert!(!failure.retryable);
+        assert_eq!(failure.cooldown, None);
+        assert_eq!(failure.retry_after_source, None);
+        assert_eq!(failure.upstream_code, None);
+    }
+
+    #[test]
+    fn phase_1_task3_profile_matrix_bare_401_403_is_explicit() {
+        for (relay_profile, status, kind, scope, bodies) in [
+            (
+                RelayProfile::OfficialOpenAi,
+                401,
+                FailureKind::AuthInvalid,
+                FailureScope::Credential,
+                vec![b"{}".as_slice()],
+            ),
+            (
+                RelayProfile::OfficialOpenAi,
+                403,
+                FailureKind::AuthInvalid,
+                FailureScope::Credential,
+                vec![b"{}".as_slice()],
+            ),
+            (
+                RelayProfile::GenericRelay,
+                401,
+                FailureKind::ClientError,
+                FailureScope::RequestOnly,
+                vec![
+                    b"{}".as_slice(),
+                    br#"{"error":{"message":"auth failed"}}"#.as_slice(),
+                ],
+            ),
+            (
+                RelayProfile::GenericRelay,
+                403,
+                FailureKind::ClientError,
+                FailureScope::RequestOnly,
+                vec![
+                    b"{}".as_slice(),
+                    br#"{"error":{"message":"auth failed"}}"#.as_slice(),
+                ],
+            ),
+            (
+                RelayProfile::UntrustedRelay,
+                401,
+                FailureKind::ClientError,
+                FailureScope::RequestOnly,
+                vec![
+                    b"{}".as_slice(),
+                    br#"{"error":{"message":"auth failed"}}"#.as_slice(),
+                ],
+            ),
+            (
+                RelayProfile::UntrustedRelay,
+                403,
+                FailureKind::ClientError,
+                FailureScope::RequestOnly,
+                vec![
+                    b"{}".as_slice(),
+                    br#"{"error":{"message":"auth failed"}}"#.as_slice(),
+                ],
+            ),
+        ] {
+            for body in bodies {
+                let failure =
+                    classifier_for_relay_profile(relay_profile).classify_failure(status, &[], body);
+
+                assert_eq!(failure.kind, kind);
+                assert_eq!(failure.primary_scope, scope);
+                assert!(!failure.retryable);
+                assert_eq!(failure.upstream_code, None);
+            }
+        }
+    }
+
+    #[test]
+    fn phase_1_task3_structured_quota_codes_ignore_message_and_use_balance_scope() {
+        let failure = ErrorClassifierSpec {
+            relay_profile: RelayProfile::GenericRelay,
+            balance_scope: BalanceScope::Channel,
+            ..Default::default()
+        }
+        .build()
+        .unwrap()
+        .classify_failure(
+            401,
+            &[],
+            br#"{"error":{"code":"insufficient_quota","message":"invalid_api_key rate_limit_exceeded retry-after: 999","limit_type":"balance"}}"#,
+        );
+
+        assert_eq!(failure.kind, FailureKind::RelayBalanceUnavailable);
+        assert_eq!(failure.primary_scope, FailureScope::Channel);
+        assert!(failure.retryable);
+        assert_eq!(failure.cooldown, None);
+        assert_eq!(failure.retry_after_source, None);
+        assert_eq!(failure.upstream_code.as_deref(), Some("insufficient_quota"));
+        assert_eq!(failure.upstream_limit_type.as_deref(), Some("balance"));
     }
 }
