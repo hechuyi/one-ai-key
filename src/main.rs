@@ -21367,17 +21367,15 @@ pools:
         assert_eq!(diff["mutating_reload_sent"], false);
         assert_eq!(diff["reload_apply_status"], "dry_run_available");
         assert_eq!(diff["budget"]["truncated"], false);
-        assert_eq!(diff["next_action"]["template_id"], "reload_diff");
-        assert_eq!(
-            diff["next_action"]["safe_argv"],
-            serde_json::json!(["one-ai-key", "reload", "diff"])
-        );
+        assert_eq!(diff["next_action"]["template_id"], "no_action_required");
+        assert_eq!(diff["next_action"]["safe_argv"], serde_json::json!([]));
         let next_action_argv = diff["next_action"]["safe_argv"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
+        assert!(!next_action_argv.contains(&"diff"));
         assert!(!next_action_argv.contains(&"apply"));
         assert!(!next_action_argv.contains(&"--yes"));
         assert_ne!(

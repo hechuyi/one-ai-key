@@ -558,9 +558,9 @@ fn reload_diff_next_action(reason_code: &str) -> Value {
     match reason_code {
         "reload_diff_available" | "reload_diff_truncated" | "reload_diff_empty" => {
             serde_json::json!({
-                "summary": "Reload diff is read-only. Recheck reload status before any explicit reload planning.",
-                "template_id": "reload_diff",
-                "safe_argv": ["one-ai-key", "reload", "diff"],
+                "summary": "Reload diff is read-only and complete for this request. Enter reload apply explicitly to plan a runtime mutation.",
+                "template_id": "no_action_required",
+                "safe_argv": [],
                 "side_effect_class": "runtime_readonly",
                 "requires_confirmation": false,
             })
@@ -1302,11 +1302,8 @@ mod tests {
 
         assert_eq!(report["status"], "ok");
         assert_eq!(report["reason_code"], "reload_diff_available");
-        assert_eq!(report["next_action"]["template_id"], "reload_diff");
-        assert_eq!(
-            report["next_action"]["safe_argv"],
-            json!(["one-ai-key", "reload", "diff"])
-        );
+        assert_eq!(report["next_action"]["template_id"], "no_action_required");
+        assert_eq!(report["next_action"]["safe_argv"], json!([]));
         assert_eq!(report["reload_apply_status"], "dry_run_available");
         assert_eq!(report["mutating_reload_sent"], false);
         let argv = report["next_action"]["safe_argv"]
@@ -1315,6 +1312,7 @@ mod tests {
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
+        assert!(!argv.contains(&"diff"));
         assert!(!argv.contains(&"apply"));
         assert!(!argv.contains(&"--yes"));
         assert_ne!(argv, ["one-ai-key", "reload", "apply", "--dry-run"]);
