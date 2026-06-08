@@ -637,32 +637,68 @@ fn apply_confirmation_gate(action: &mut cli::CliAction) -> anyhow::Result<()> {
         }
         cli_effects::ConfirmationOutcome::PromptRequired { reason_code } => {
             if prompt_for_confirmation(reason_code)? {
-                match action {
-                    cli::CliAction::InitLocal(options) => {
-                        options.mode = operator_templates::InitLocalMode::Write;
-                    }
-                    cli::CliAction::Keys(cli_commands::keys::KeysCommand::Import(options)) => {
-                        options.mode = cli_commands::keys::KeysImportMode::Apply;
-                    }
-                    cli::CliAction::Keys(cli_commands::keys::KeysCommand::Probe(options)) => {
-                        options.mode = cli_commands::keys::KeysProbeMode::Apply;
-                    }
-                    cli::CliAction::Keys(cli_commands::keys::KeysCommand::ProbeApply(
-                        cli_commands::keys::KeysProbeApplyCommand::Apply(options),
-                    )) => {
-                        options.mode = cli_commands::keys::KeysProbeApplyMode::Apply;
-                    }
-                    cli::CliAction::ReloadApply(options) => {
-                        options.mode = cli_commands::reload::ReloadApplyMode::Apply;
-                    }
-                    _ => {}
-                }
+                apply_confirmed_confirmation_transition(action);
                 Ok(())
             } else {
                 eprintln!("Reason code: {reason_code}");
                 std::process::exit(3);
             }
         }
+    }
+}
+
+fn apply_confirmed_confirmation_transition(action: &mut cli::CliAction) {
+    match action {
+        cli::CliAction::InitLocal(options)
+            if matches!(
+                options.mode,
+                operator_templates::InitLocalMode::NeedsConfirmation
+            ) =>
+        {
+            options.mode = operator_templates::InitLocalMode::Write;
+        }
+        cli::CliAction::ModelsOnboardPlan(options)
+            if matches!(
+                options.mode,
+                cli_commands::models_onboard::ModelsOnboardPlanMode::NeedsConfirmation
+            ) =>
+        {
+            options.mode = cli_commands::models_onboard::ModelsOnboardPlanMode::Apply;
+        }
+        cli::CliAction::Keys(cli_commands::keys::KeysCommand::Import(options))
+            if matches!(
+                options.mode,
+                cli_commands::keys::KeysImportMode::NeedsConfirmation
+            ) =>
+        {
+            options.mode = cli_commands::keys::KeysImportMode::Apply;
+        }
+        cli::CliAction::Keys(cli_commands::keys::KeysCommand::Probe(options))
+            if matches!(
+                options.mode,
+                cli_commands::keys::KeysProbeMode::NeedsConfirmation
+            ) =>
+        {
+            options.mode = cli_commands::keys::KeysProbeMode::Apply;
+        }
+        cli::CliAction::Keys(cli_commands::keys::KeysCommand::ProbeApply(
+            cli_commands::keys::KeysProbeApplyCommand::Apply(options),
+        )) if matches!(
+            options.mode,
+            cli_commands::keys::KeysProbeApplyMode::NeedsConfirmation
+        ) =>
+        {
+            options.mode = cli_commands::keys::KeysProbeApplyMode::Apply;
+        }
+        cli::CliAction::ReloadApply(options)
+            if matches!(
+                options.mode,
+                cli_commands::reload::ReloadApplyMode::NeedsConfirmation
+            ) =>
+        {
+            options.mode = cli_commands::reload::ReloadApplyMode::Apply;
+        }
+        _ => {}
     }
 }
 
@@ -1135,6 +1171,80 @@ mod tests {
         }
 
         assert!(!help.contains("secret-config-value"));
+    }
+
+    fn models_onboard_plan_action(
+        mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode,
+    ) -> crate::cli::CliAction {
+        crate::cli::CliAction::ModelsOnboardPlan(
+            crate::cli_commands::models_onboard::ModelsOnboardPlanOptions {
+                connection: crate::cli::OperatorConnectionOptions {
+                    management_url: Some("https://router.example".to_string()),
+                    deprecated_base_url: None,
+                    management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                    management_token_stdin: false,
+                    timeout_seconds: 10,
+                },
+                channel_id: "relay-a".to_string(),
+                public_model: "coding".to_string(),
+                upstream_model: Some("vendor/coding".to_string()),
+                client_token_ref: None,
+                endpoint_family: None,
+                mode,
+                expected_staged_registry_version: Some(12),
+                output: crate::cli_report::OutputFormat::Json,
+            },
+        )
+    }
+
+    #[test]
+    fn confirmation_gate_models_onboard_positive_prompt_transitions_to_apply() {
+        let mut action = models_onboard_plan_action(
+            crate::cli_commands::models_onboard::ModelsOnboardPlanMode::NeedsConfirmation,
+        );
+
+        apply_confirmed_confirmation_transition(&mut action);
+
+        let crate::cli::CliAction::ModelsOnboardPlan(options) = action else {
+            panic!("expected models onboard-plan action");
+        };
+        assert_eq!(
+            options.mode,
+            crate::cli_commands::models_onboard::ModelsOnboardPlanMode::Apply
+        );
+    }
+
+    #[test]
+    fn confirmation_gate_models_onboard_non_tty_denies_before_http() {
+        let action = models_onboard_plan_action(
+            crate::cli_commands::models_onboard::ModelsOnboardPlanMode::NeedsConfirmation,
+        );
+
+        assert_eq!(
+            crate::cli_effects::confirmation_outcome(&action, false),
+            crate::cli_effects::ConfirmationOutcome::Denied {
+                exit_code: 3,
+                reason_code: "confirmation_required",
+            }
+        );
+    }
+
+    #[test]
+    fn confirmation_gate_models_onboard_preserves_dry_run_and_apply_modes() {
+        for mode in [
+            crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DryRun,
+            crate::cli_commands::models_onboard::ModelsOnboardPlanMode::ApplyDryRun,
+            crate::cli_commands::models_onboard::ModelsOnboardPlanMode::Apply,
+        ] {
+            let mut action = models_onboard_plan_action(mode);
+
+            apply_confirmed_confirmation_transition(&mut action);
+
+            let crate::cli::CliAction::ModelsOnboardPlan(options) = action else {
+                panic!("expected models onboard-plan action");
+            };
+            assert_eq!(options.mode, mode);
+        }
     }
 
     fn fixture_client_token() -> String {
