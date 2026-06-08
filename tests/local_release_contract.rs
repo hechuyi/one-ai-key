@@ -360,7 +360,7 @@ fn gitignore_and_dockerignore_cover_sensitive_runtime_and_release_patterns() {
             .collect::<Vec<_>>();
         for pattern in required_patterns {
             assert!(
-                normalized.iter().any(|line| *line == pattern),
+                normalized.contains(&pattern),
                 "{path} must exclude sensitive runtime/release pattern `{pattern}`"
             );
         }

@@ -876,12 +876,12 @@ fn safe_reload_diff_identifier(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use axum::{
+        Json, Router,
         extract::Query,
         http::StatusCode,
         routing::{get, post},
-        Json, Router,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -1714,9 +1714,9 @@ mod tests {
             effect.side_effect_class,
             crate::cli_effects::SideEffectClass::ManagementWrite
         );
-        assert_eq!(effect.effect_vector.reads_management_runtime, true);
-        assert_eq!(effect.effect_vector.writes_management_store, true);
-        assert_eq!(effect.effect_vector.mutates_runtime, true);
+        assert!(effect.effect_vector.reads_management_runtime);
+        assert!(effect.effect_vector.writes_management_store);
+        assert!(effect.effect_vector.mutates_runtime);
     }
 
     #[tokio::test]

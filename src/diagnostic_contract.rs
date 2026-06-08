@@ -336,8 +336,7 @@ fn action_spec(action: SafeAction) -> ActionSpec {
             ],
         },
         SafeAction::ModelsExplainWithClientTokenRef => ActionSpec {
-            summary:
-                "Inspect the runtime model projection with an explicit client-token reference.",
+            summary: "Inspect the runtime model projection with an explicit client-token reference.",
             template_id: "models_explain_visibility",
             safe_argv: &[
                 "one-ai-key",
@@ -431,36 +430,97 @@ fn is_allowed_safe_argv(argv: &[&str]) -> bool {
     if argv.is_empty() {
         return true;
     }
-    match argv {
-        ["one-ai-key", "models", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "--model", "<public-model>"] => {
-            true
-        }
-        ["one-ai-key", "models", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "--model", "<public-model>", "--client-token-ref", "<client-token-ref>"] => {
-            true
-        }
-        ["one-ai-key", "models", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "--model", "<public-model>", "--endpoint-family", "chat_completions"] => {
-            true
-        }
-        ["one-ai-key", "route", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "<public-model>"] => {
-            true
-        }
-        ["one-ai-key", "failures", "tail", "--management-url", "<url>", "--management-token-env", "<env>", "--last", "50"] => {
-            true
-        }
-        ["one-ai-key", "failures", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "<request-id>", "--last", "50"] => {
-            true
-        }
-        ["one-ai-key", "doctor", "--management-url", "<url>", "--management-token-env", "<env>"] => {
-            true
-        }
-        ["one-ai-key", "reload", "status", "--management-url", "<url>", "--management-token-env", "<env>"] => {
-            true
-        }
-        ["one-ai-key", "reload", "diff", "--management-url", "<url>", "--management-token-env", "<env>"] => {
-            true
-        }
-        _ => false,
-    }
+    matches!(
+        argv,
+        [
+            "one-ai-key",
+            "models",
+            "explain",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "--model",
+            "<public-model>"
+        ] | [
+            "one-ai-key",
+            "models",
+            "explain",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "--model",
+            "<public-model>",
+            "--client-token-ref",
+            "<client-token-ref>"
+        ] | [
+            "one-ai-key",
+            "models",
+            "explain",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "--model",
+            "<public-model>",
+            "--endpoint-family",
+            "chat_completions"
+        ] | [
+            "one-ai-key",
+            "route",
+            "explain",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "<public-model>"
+        ] | [
+            "one-ai-key",
+            "failures",
+            "tail",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "--last",
+            "50"
+        ] | [
+            "one-ai-key",
+            "failures",
+            "explain",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "<request-id>",
+            "--last",
+            "50"
+        ] | [
+            "one-ai-key",
+            "doctor",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>"
+        ] | [
+            "one-ai-key",
+            "reload",
+            "status",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>"
+        ] | [
+            "one-ai-key",
+            "reload",
+            "diff",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>"
+        ]
+    )
 }
 
 #[cfg(test)]
