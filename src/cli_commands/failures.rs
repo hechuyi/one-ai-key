@@ -1096,6 +1096,16 @@ fn render_failure_table(report: &Value) -> String {
             table_str(window.get("truncated")),
         ));
     }
+    crate::cli_report::push_table_field(
+        &mut output,
+        "availability_source",
+        report.get("availability_source"),
+    );
+    crate::cli_report::push_table_field(
+        &mut output,
+        "current_availability",
+        report.get("current_availability"),
+    );
     if let Some(summary) = report
         .get("next_action")
         .and_then(|next_action| next_action.get("summary"))
@@ -1402,6 +1412,19 @@ mod tests {
     }
 
     #[test]
+    fn failures_tail_table_marks_bounded_evidence_not_current_availability() {
+        let rendered = render_tail_report(
+            &routing_fixture(),
+            &response_filter_fixture(),
+            &FailureFilters::default(),
+            crate::cli_report::OutputFormat::Table,
+        );
+
+        assert!(rendered.contains("availability_source: bounded_evidence"));
+        assert!(rendered.contains("current_availability: false"));
+    }
+
+    #[test]
     fn failures_explain_filters_bounded_events_by_request_model_channel_and_directive() {
         let rendered = render_explain_report(
             &routing_fixture(),
@@ -1433,6 +1456,20 @@ mod tests {
             report["data"]["explanation"]["final_outcome"],
             "client_visible_failure"
         );
+    }
+
+    #[test]
+    fn failures_explain_table_marks_bounded_evidence_not_current_availability() {
+        let rendered = render_explain_report(
+            &routing_fixture(),
+            &response_filter_fixture(),
+            "req_5xx",
+            &FailureFilters::default(),
+            crate::cli_report::OutputFormat::Table,
+        );
+
+        assert!(rendered.contains("availability_source: bounded_evidence"));
+        assert!(rendered.contains("current_availability: false"));
     }
 
     #[test]
