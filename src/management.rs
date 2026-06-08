@@ -91,6 +91,11 @@ pub struct ModelAvailabilityQuery {
     client_token: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ModelRouteUpsertQuery {
+    expected_staged_registry_version: Option<u64>,
+}
+
 async fn credential_id_from_path_segment_response(
     state: &AppState,
     credential_set_id: &str,
@@ -994,6 +999,7 @@ pub async fn model_availability(
 pub async fn upsert_registry_model_route(
     State(state): State<AppState>,
     Path(public_model): Path<String>,
+    Query(query): Query<ModelRouteUpsertQuery>,
     headers: HeaderMap,
     Json(payload): Json<ModelRouteConfig>,
 ) -> Response {
@@ -1003,7 +1009,19 @@ pub async fn upsert_registry_model_route(
         Err(resp) => return *resp,
     };
     let actor = management_actor(&principal);
-    match registry_model_route_upsert_response_for_state(&state, actor, public_model, payload).await
+    let Some(expected_staged_registry_version) = query.expected_staged_registry_version else {
+        return service_error(ManagementServiceError::Conflict(
+            "expected_staged_registry_version is required for model route upsert".to_string(),
+        ));
+    };
+    match registry_model_route_upsert_response_for_state(
+        &state,
+        actor,
+        public_model,
+        expected_staged_registry_version,
+        payload,
+    )
+    .await
     {
         Ok(response) => Json(response).into_response(),
         Err(err) => service_error(err),

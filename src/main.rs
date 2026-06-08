@@ -10257,7 +10257,9 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/management/registry/model-routes/gpt-public")
+                    .uri(
+                        "/management/registry/model-routes/gpt-public?expected_staged_registry_version=1",
+                    )
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
@@ -10284,6 +10286,11 @@ pools:
         let body = serde_json::from_slice::<Value>(&body).unwrap();
         assert_eq!(body["public_model"], "gpt-public");
         assert_eq!(body["registry_version"], 2);
+        assert_eq!(body["staged_registry_version"], 2);
+        assert!(
+            body["active_registry_generation"].as_u64().unwrap() > 0,
+            "model-route upsert response should include the active runtime generation"
+        );
         assert_eq!(body["applied_to_runtime"], false);
         assert_eq!(body["runtime_reload_required"], true);
 
@@ -10318,6 +10325,81 @@ pools:
     }
 
     #[tokio::test]
+    async fn management_registry_model_route_upsert_requires_staged_version_precondition() {
+        let (app, registry_store_path) = registry_provider_fixture();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/management/registry/model-routes/gpt-public")
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "targets":[{"channel":"test","upstream_model":"gpt-upstream-a"}]
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = serde_json::from_slice::<Value>(&body).unwrap();
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("expected_staged_registry_version"));
+
+        let stored = SqliteRegistryStore::open(&registry_store_path)
+            .unwrap()
+            .load_registry_for_validation()
+            .unwrap();
+        assert!(stored.model_routes.is_empty());
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert!(events["events"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn management_registry_model_route_upsert_rejects_stale_staged_version_before_mutation() {
+        let (app, registry_store_path) = registry_provider_fixture();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(
+                        "/management/registry/model-routes/gpt-public?expected_staged_registry_version=0",
+                    )
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "targets":[{"channel":"test","upstream_model":"gpt-upstream-a"}]
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let stored = SqliteRegistryStore::open(&registry_store_path)
+            .unwrap()
+            .load_registry_for_validation()
+            .unwrap();
+        assert!(stored.model_routes.is_empty());
+
+        let events = management_response_json(&app, "/management/events").await;
+        assert!(events["events"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn management_registry_model_route_upsert_rejects_unknown_channel() {
         let (app, registry_store_path) = registry_provider_fixture();
 
@@ -10325,7 +10407,9 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/management/registry/model-routes/gpt-public")
+                    .uri(
+                        "/management/registry/model-routes/gpt-public?expected_staged_registry_version=1",
+                    )
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
@@ -10354,7 +10438,9 @@ pools:
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/management/registry/model-routes/vendor/gpt-public")
+                    .uri(
+                        "/management/registry/model-routes/vendor%2Fgpt-public?expected_staged_registry_version=1",
+                    )
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(

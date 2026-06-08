@@ -13,6 +13,7 @@ use std::{
 pub enum Method {
     Get,
     Post,
+    Put,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +235,67 @@ impl OperatorClient {
         })
     }
 
+    pub async fn put_json<T: Serialize>(
+        &self,
+        endpoint: ManagementMutationEndpoint,
+        body: &T,
+    ) -> Result<Value, OperatorClientError> {
+        let request = endpoint.request()?;
+        let path = request.path.as_str();
+        if !is_management_mutation_path(Method::Put, path) {
+            return Err(OperatorClientError::new(
+                "management_mutation_path_rejected",
+                "management path is not in the mutation allowlist",
+            ));
+        }
+        let mut url = self.config.base_url.clone();
+        url.set_path(path);
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in &request.query {
+                pairs.append_pair(key, value);
+            }
+        }
+        let response = self
+            .http
+            .put(url.clone())
+            .bearer_auth(self.config.bearer_token.as_str())
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    OperatorClientError::timeout(url.as_str())
+                } else {
+                    OperatorClientError::new(
+                        "management_transport_error",
+                        "management API request failed",
+                    )
+                }
+            })?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.bytes().await.map_err(|_| {
+            OperatorClientError::new(
+                "management_body_error",
+                "failed to read management API body",
+            )
+        })?;
+        if !request.accepts_status(status) {
+            return Err(classify_http_error(status, content_type.as_deref(), &bytes));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| {
+            OperatorClientError::new(
+                "management_non_json_error",
+                "management API returned a non-json response",
+            )
+        })
+    }
+
     async fn get_json_request(
         &self,
         request: EndpointRequest,
@@ -346,6 +408,10 @@ pub enum ReadOnlyEndpoint {
 #[allow(clippy::enum_variant_names)]
 pub enum ManagementMutationEndpoint {
     RuntimeReload {
+        expected_staged_registry_version: u64,
+    },
+    RegistryModelRouteUpsert {
+        public_model: String,
         expected_staged_registry_version: u64,
     },
     CredentialSetCredentialsImport {
@@ -499,6 +565,19 @@ impl ManagementMutationEndpoint {
                 expected_staged_registry_version,
             } => EndpointRequest::new(
                 "/management/runtime/reload",
+                vec![(
+                    "expected_staged_registry_version".to_string(),
+                    expected_staged_registry_version.to_string(),
+                )],
+            ),
+            Self::RegistryModelRouteUpsert {
+                public_model,
+                expected_staged_registry_version,
+            } => EndpointRequest::new(
+                format!(
+                    "/management/registry/model-routes/{}",
+                    safe_model_route_path_component(public_model)?
+                ),
                 vec![(
                     "expected_staged_registry_version".to_string(),
                     expected_staged_registry_version.to_string(),
@@ -718,6 +797,81 @@ fn safe_credential_ref_path_segment(segment: &str) -> Result<&str, OperatorClien
     Ok(segment)
 }
 
+fn safe_model_route_path_component(public_model: &str) -> Result<String, OperatorClientError> {
+    validate_public_model_path(public_model)?;
+    let mut encoded = String::with_capacity(public_model.len());
+    for byte in public_model.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(hex_digit(byte >> 4));
+            encoded.push(hex_digit(byte & 0x0f));
+        }
+    }
+    Ok(encoded)
+}
+
+fn hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'A' + (value - 10)) as char,
+        _ => unreachable!("hex digit nibble must be in range"),
+    }
+}
+
+fn validate_public_model_path(public_model: &str) -> Result<(), OperatorClientError> {
+    if public_model.is_empty()
+        || public_model.bytes().any(|byte| byte.is_ascii_control())
+        || public_model
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(OperatorClientError::new(
+            "management_path_segment_invalid",
+            "public_model contains characters unsafe for a management path",
+        ));
+    }
+    Ok(())
+}
+
+fn safe_encoded_model_route_path_component(component: &str) -> bool {
+    if component.is_empty() || component.bytes().any(|byte| byte == b'/' || byte == b'\\') {
+        return false;
+    }
+    let Some(decoded) = percent_decode_path_component(component) else {
+        return false;
+    };
+    validate_public_model_path(&decoded).is_ok()
+}
+
+fn percent_decode_path_component(component: &str) -> Option<String> {
+    let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub fn classify_http_error(
     status: StatusCode,
     content_type: Option<&str>,
@@ -785,6 +939,15 @@ pub fn is_readonly_management_path(method: Method, path: &str) -> bool {
 }
 
 pub fn is_management_mutation_path(method: Method, path: &str) -> bool {
+    if method == Method::Put {
+        let parts = path.split('/').collect::<Vec<_>>();
+        return parts.len() == 5
+            && parts[0].is_empty()
+            && parts[1] == "management"
+            && parts[2] == "registry"
+            && parts[3] == "model-routes"
+            && safe_encoded_model_route_path_component(parts[4]);
+    }
     if method != Method::Post {
         return false;
     }
@@ -1308,5 +1471,61 @@ mod tests {
             Method::Post,
             "/management/runtime/reload"
         ));
+    }
+
+    #[test]
+    fn typed_mutation_endpoint_builds_model_route_upsert_put_path_and_query() {
+        let upsert = ManagementMutationEndpoint::RegistryModelRouteUpsert {
+            public_model: "vendor/gpt-public".to_string(),
+            expected_staged_registry_version: 7,
+        }
+        .test_request_parts()
+        .expect("model route upsert endpoint should build");
+
+        assert_eq!(
+            upsert,
+            (
+                "/management/registry/model-routes/vendor%2Fgpt-public".to_string(),
+                vec![(
+                    "expected_staged_registry_version".to_string(),
+                    "7".to_string()
+                )]
+            )
+        );
+        assert!(is_management_mutation_path(
+            Method::Put,
+            "/management/registry/model-routes/vendor%2Fgpt-public"
+        ));
+        assert!(!is_management_mutation_path(
+            Method::Post,
+            "/management/registry/model-routes/vendor%2Fgpt-public"
+        ));
+        assert!(!is_readonly_management_path(
+            Method::Get,
+            "/management/registry/model-routes/vendor%2Fgpt-public"
+        ));
+    }
+
+    #[test]
+    fn model_route_upsert_allowlist_rejects_raw_traversal_and_unencoded_slashes() {
+        for path in [
+            "/management/registry/model-routes/../runtime/reload",
+            "/management/registry/model-routes/vendor/gpt-public",
+            "/management/registry/model-routes/%2E%2E%2Fruntime",
+            "/management/registry/model-routes/",
+        ] {
+            assert!(
+                !is_management_mutation_path(Method::Put, path),
+                "{path} should not be allowlisted"
+            );
+        }
+
+        let error = ManagementMutationEndpoint::RegistryModelRouteUpsert {
+            public_model: "../runtime/reload".to_string(),
+            expected_staged_registry_version: 7,
+        }
+        .test_request_parts()
+        .expect_err("raw traversal should be rejected before encoding");
+        assert_eq!(error.reason_code(), "management_path_segment_invalid");
     }
 }
