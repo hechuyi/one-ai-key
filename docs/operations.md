@@ -138,6 +138,17 @@ management state: `doctor`, `models list`, `models explain`, `route explain`,
 `client-tokens list`, `keys list`, `keys stats`, `failures tail`, `failures
 explain`, `reload status`, and `reload diff`.
 
+`models onboard-plan --channel <channel-id> --public-model <public-model>
+--upstream-model <upstream-model> --dry-run` is a read-only publication plan
+projection. Add `--client-token-ref <client-token-ref> --endpoint-family
+<endpoint-family>` when the plan should include the current management
+model-availability projection for that client and endpoint family. The plan
+reports route/channel conflicts, endpoint-capability evidence when the channel
+projection contains it, client visibility when both visibility arguments are
+present, and reload-diff/version state. It does not publish the model, reload
+runtime state, mutate client-token scope, mutate registry/configuration, or
+call upstream discovery.
+
 Diagnosis recommendations stop at read-only commands. Diagnosis reports may
 recommend read-only reload investigation only: `reload status` or `reload diff`.
 `reload apply --dry-run` is an explicit operator reload-planning command, not a

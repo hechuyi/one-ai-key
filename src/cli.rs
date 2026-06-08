@@ -259,6 +259,10 @@ struct ModelsOnboardPlanArgs {
     public_model: String,
     #[arg(long = "upstream-model")]
     upstream_model: Option<String>,
+    #[arg(long = "client-token-ref")]
+    client_token_ref: Option<String>,
+    #[arg(long = "endpoint-family")]
+    endpoint_family: Option<String>,
     #[arg(long)]
     dry_run: bool,
     #[arg(long)]
@@ -590,6 +594,8 @@ where
                 channel_id: args.channel,
                 public_model: args.public_model,
                 upstream_model: args.upstream_model,
+                client_token_ref: args.client_token_ref,
+                endpoint_family: args.endpoint_family,
                 mode: if args.dry_run
                     && !args.discover
                     && !args.sync_plan
@@ -1241,8 +1247,57 @@ mod tests {
                     channel_id: "relay-a".to_string(),
                     public_model: "coding".to_string(),
                     upstream_model: Some("vendor/coding".to_string()),
+                    client_token_ref: None,
+                    endpoint_family: None,
                     mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DryRun,
                     output: crate::cli_report::OutputFormat::Json,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn models_onboard_plan_parse_accepts_visibility_projection_args() {
+        let action = parse_action_from([
+            "one-ai-key",
+            "--management-url",
+            "https://router.example",
+            "--management-token-env",
+            "ONE_AI_KEY_MANAGEMENT_TOKEN",
+            "models",
+            "onboard-plan",
+            "--channel",
+            "relay-a",
+            "--public-model",
+            "coding",
+            "--upstream-model",
+            "vendor/coding",
+            "--client-token-ref",
+            "operator-client",
+            "--endpoint-family",
+            "chat_completions",
+            "--dry-run",
+        ])
+        .expect("models onboard-plan visibility args should parse");
+
+        assert_eq!(
+            action,
+            CliAction::ModelsOnboardPlan(
+                crate::cli_commands::models_onboard::ModelsOnboardPlanOptions {
+                    connection: OperatorConnectionOptions {
+                        management_url: Some("https://router.example".to_string()),
+                        deprecated_base_url: None,
+                        management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                        management_token_stdin: false,
+                        timeout_seconds: 10,
+                    },
+                    channel_id: "relay-a".to_string(),
+                    public_model: "coding".to_string(),
+                    upstream_model: Some("vendor/coding".to_string()),
+                    client_token_ref: Some("operator-client".to_string()),
+                    endpoint_family: Some("chat_completions".to_string()),
+                    mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DryRun,
+                    output: crate::cli_report::OutputFormat::Table,
                 }
             )
         );
