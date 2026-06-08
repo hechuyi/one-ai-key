@@ -33790,6 +33790,502 @@ model_routes:
     }
 
     #[tokio::test]
+    async fn response_filter_precommit_plain_reject_does_not_mutate_lifecycle() {
+        let primary_hits = Arc::new(AtomicU64::new(0));
+        let primary_hits_for_handler = primary_hits.clone();
+        let primary = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let primary_hits = primary_hits_for_handler.clone();
+                async move {
+                    primary_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "blocked-marker"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let fallback_hits = Arc::new(AtomicU64::new(0));
+        let fallback_hits_for_handler = fallback_hits.clone();
+        let fallback = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "fallback-clean"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let primary_base = spawn_upstream(primary).await;
+        let fallback_base = spawn_upstream(fallback).await;
+
+        let mut pools = HashMap::new();
+        let mut credential_sets = HashMap::new();
+        for (name, api_base, keys) in [
+            (
+                "filter_plain_primary",
+                primary_base,
+                "plain-primary-key\nplain-primary-next-key\n",
+            ),
+            (
+                "filter_plain_fallback",
+                fallback_base,
+                "plain-fallback-key\n",
+            ),
+        ] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(keys),
+                },
+            );
+            pools.insert(name.to_string(), openai_pool(api_base, credential_set));
+        }
+        let mut document = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "test-client".to_string(),
+                token: fixture_client_token(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: fixture_admin_token(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path: None,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: TimeoutConfig::default(),
+            routing: crate::config::RoutingConfig::default(),
+            default_pool: Some("filter_plain_primary".to_string()),
+            providers: HashMap::new(),
+            accounts: HashMap::new(),
+            credential_sets,
+            model_routes: HashMap::from([priority_route(
+                "gpt-filter-plain",
+                ["filter_plain_primary", "filter_plain_fallback"],
+            )]),
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: std::collections::HashMap::from([(
+                "default-routing".to_string(),
+                crate::config::RoutingProfileConfig {
+                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry:
+                        crate::config::SameRequestCredentialRetryConfig {
+                            enabled: true,
+                            max_retries: 1,
+                        },
+                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            pools,
+        }
+        .into_registry_document();
+        document.response_filter = crate::config::ResponseFilterConfig {
+            enabled: true,
+            replacement: Some("[filtered]".to_string()),
+            event_window_capacity: None,
+            alert_window_seconds: None,
+            rules: vec![crate::config::ResponseFilterRuleConfig {
+                id: "plain-reject".to_string(),
+                enabled: true,
+                kind: crate::config::ResponseFilterRuleKindConfig::Literal,
+                action: crate::config::ResponseFilterActionConfig::Reject,
+                case_sensitive: false,
+                value: Some("blocked-marker".to_string()),
+                pattern: None,
+            }],
+        };
+        let state = AppState::new(document.resolve().unwrap()).unwrap();
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-filter-plain","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "response_filter_rejected");
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body_text.contains("blocked-marker"));
+        assert!(!body_text.contains("fallback-clean"));
+
+        let primary_channel = state.channels.get("filter_plain_primary").unwrap();
+        let pool = primary_channel.pool.lock().await;
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.cooling_down_credentials, 0);
+        assert_eq!(snapshot.expired_credentials, 0);
+        drop(pool);
+        assert_eq!(
+            state.channels.channel_route_state("filter_plain_primary"),
+            ChannelRouteState::Available
+        );
+
+        let filter_events =
+            management_response_json(&app(state.clone()), "/management/response-filter-events")
+                .await;
+        let events = filter_events["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["rule_id"], "plain-reject");
+        assert_eq!(events[0]["action"], "reject");
+        assert_eq!(events[0]["outcome"], "rejected");
+        assert_eq!(events[0]["body_committed"], false);
+
+        let telemetry =
+            management_response_json(&app(state.clone()), "/management/routing-telemetry").await;
+        let telemetry_events = telemetry["events"].as_array().unwrap();
+        assert!(telemetry_events
+            .iter()
+            .any(|event| event["kind"] == "route_selected"));
+        assert!(!telemetry_events.iter().any(|event| {
+            event["kind"] == "upstream_failure_observed"
+                && event["failure"]["failure_source"] == "response_filter_precommit"
+        }));
+        assert!(!telemetry_events.iter().any(|event| {
+            matches!(
+                event["kind"].as_str(),
+                Some("credential_transition_applied" | "channel_health_transition_applied")
+            )
+        }));
+        let serialized = serde_json::to_string(&telemetry).unwrap();
+        assert!(!serialized.contains("retry_same_target"));
+        assert!(!serialized.contains("plain-primary-key"));
+        assert!(!serialized.contains("plain-primary-next-key"));
+        assert!(!serialized.contains("plain-fallback-key"));
+    }
+
+    #[tokio::test]
+    async fn response_filter_committed_event_does_not_mutate_lifecycle_or_retry() {
+        const TEST_SUCCESS_GUARD_MAX_BYTES: usize = 8192;
+        let primary_hits = Arc::new(AtomicU64::new(0));
+        let primary_hits_for_handler = primary_hits.clone();
+        let primary = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let primary_hits = primary_hits_for_handler.clone();
+                async move {
+                    primary_hits.fetch_add(1, Ordering::SeqCst);
+                    let safe_prefix = "x".repeat(TEST_SUCCESS_GUARD_MAX_BYTES + 1);
+                    let stream = stream::iter([
+                        Ok::<Bytes, std::io::Error>(Bytes::from(safe_prefix)),
+                        Ok::<Bytes, std::io::Error>(Bytes::from_static(b"blocked-marker")),
+                    ]);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let fallback_hits = Arc::new(AtomicU64::new(0));
+        let fallback_hits_for_handler = fallback_hits.clone();
+        let fallback = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "fallback-clean"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let primary_base = spawn_upstream(primary).await;
+        let fallback_base = spawn_upstream(fallback).await;
+
+        let mut pools = HashMap::new();
+        let mut credential_sets = HashMap::new();
+        for (name, api_base, keys) in [
+            (
+                "filter_committed_primary",
+                primary_base,
+                "committed-primary-key\ncommitted-primary-next-key\n",
+            ),
+            (
+                "filter_committed_fallback",
+                fallback_base,
+                "committed-fallback-key\n",
+            ),
+        ] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(keys),
+                },
+            );
+            pools.insert(name.to_string(), openai_pool(api_base, credential_set));
+        }
+        let mut document = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "test-client".to_string(),
+                token: fixture_client_token(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: fixture_admin_token(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path: None,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: TimeoutConfig::default(),
+            routing: crate::config::RoutingConfig::default(),
+            default_pool: Some("filter_committed_primary".to_string()),
+            providers: HashMap::new(),
+            accounts: HashMap::new(),
+            credential_sets,
+            model_routes: HashMap::from([priority_route(
+                "gpt-filter-committed",
+                ["filter_committed_primary", "filter_committed_fallback"],
+            )]),
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: std::collections::HashMap::from([(
+                "default-routing".to_string(),
+                crate::config::RoutingProfileConfig {
+                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry:
+                        crate::config::SameRequestCredentialRetryConfig {
+                            enabled: true,
+                            max_retries: 1,
+                        },
+                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            pools,
+        }
+        .into_registry_document();
+        document.response_filter = crate::config::ResponseFilterConfig {
+            enabled: true,
+            replacement: Some("[filtered]".to_string()),
+            event_window_capacity: None,
+            alert_window_seconds: None,
+            rules: vec![crate::config::ResponseFilterRuleConfig {
+                id: "committed-reject".to_string(),
+                enabled: true,
+                kind: crate::config::ResponseFilterRuleKindConfig::Literal,
+                action: crate::config::ResponseFilterActionConfig::RejectAndExpireCredential,
+                case_sensitive: false,
+                value: Some("blocked-marker".to_string()),
+                pattern: None,
+            }],
+        };
+        let state = AppState::new(document.resolve().unwrap()).unwrap();
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-filter-committed","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+        let body = to_bytes(response.into_body(), TEST_SUCCESS_GUARD_MAX_BYTES * 3)
+            .await
+            .unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_text.contains("response_filter_rejected"));
+        assert!(!body_text.contains("blocked-marker"));
+        assert!(!body_text.contains("fallback-clean"));
+
+        let primary_channel = state.channels.get("filter_committed_primary").unwrap();
+        let pool = primary_channel.pool.lock().await;
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.cooling_down_credentials, 0);
+        assert_eq!(snapshot.expired_credentials, 0);
+        drop(pool);
+        assert_eq!(
+            state
+                .channels
+                .channel_route_state("filter_committed_primary"),
+            ChannelRouteState::Available
+        );
+
+        let filter_events =
+            management_response_json(&app(state.clone()), "/management/response-filter-events")
+                .await;
+        let events = filter_events["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["rule_id"], "committed-reject");
+        assert_eq!(events[0]["action"], "reject_and_expire_credential");
+        assert_eq!(events[0]["outcome"], "rejected");
+        assert_eq!(events[0]["body_committed"], true);
+
+        let telemetry =
+            management_response_json(&app(state.clone()), "/management/routing-telemetry").await;
+        let telemetry_events = telemetry["events"].as_array().unwrap();
+        assert!(telemetry_events
+            .iter()
+            .any(|event| event["kind"] == "route_selected"));
+        assert!(!telemetry_events.iter().any(|event| {
+            event["kind"] == "upstream_failure_observed"
+                && event["failure"]["failure_source"] == "response_filter_precommit"
+        }));
+        assert!(!telemetry_events.iter().any(|event| {
+            matches!(
+                event["kind"].as_str(),
+                Some("credential_transition_applied" | "channel_health_transition_applied")
+            )
+        }));
+        let serialized = serde_json::to_string(&telemetry).unwrap();
+        assert!(!serialized.contains("retry_same_target"));
+        assert!(!serialized.contains("committed-primary-key"));
+        assert!(!serialized.contains("committed-primary-next-key"));
+        assert!(!serialized.contains("committed-fallback-key"));
+    }
+
+    #[tokio::test]
+    async fn response_filter_events_snapshot_stays_metadata_only_and_redacted() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(serde_json::json!({
+                    "id": "fixture",
+                    "object": "chat.completion",
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "sk-response-secret"}}
+                    ]
+                }))
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let mut document = test_config_with_api_base(&api_base).into_registry_document();
+        document.credential_sets.insert(
+            "test-credentials".to_string(),
+            CredentialSetConfig {
+                keys_file: temp_keys_file("sk-upstream-secret\n"),
+            },
+        );
+        document.response_filter = crate::config::ResponseFilterConfig {
+            enabled: true,
+            replacement: Some("[filtered]".to_string()),
+            event_window_capacity: None,
+            alert_window_seconds: None,
+            rules: vec![crate::config::ResponseFilterRuleConfig {
+                id: "sk-rule-secret:https://internal.invalid/private?token=fixture-secret"
+                    .to_string(),
+                enabled: true,
+                kind: crate::config::ResponseFilterRuleKindConfig::Literal,
+                action: crate::config::ResponseFilterActionConfig::Reject,
+                case_sensitive: false,
+                value: Some("sk-response-secret".to_string()),
+                pattern: None,
+            }],
+        };
+        let state = AppState::new(document.resolve().unwrap()).unwrap();
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","messages":[{"role":"user","content":"request-body-secret"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let response_body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+        assert!(!response_text.contains("sk-response-secret"));
+        assert!(!response_text.contains("request-body-secret"));
+
+        let filter_events =
+            management_response_json(&app(state.clone()), "/management/response-filter-events")
+                .await;
+        let events = filter_events["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0]["rule_id"].is_null());
+        assert_eq!(events[0]["action"], "reject");
+        assert_eq!(events[0]["content_kind"], "json");
+        assert_eq!(events[0]["reason_code"], "rule_matched");
+        assert_eq!(events[0]["outcome"], "rejected");
+        assert_eq!(events[0]["body_committed"], false);
+
+        let serialized = serde_json::to_string(&filter_events).unwrap();
+        for forbidden in [
+            "matched_text",
+            "raw_chunk",
+            "request_body",
+            "response_body",
+            "request-body-secret",
+            "sk-response-secret",
+            "sk-rule-secret",
+            "internal.invalid",
+            "fixture-secret",
+            "sk-upstream-secret",
+            fixture_client_token().as_str(),
+            fixture_admin_token().as_str(),
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "response filter event snapshot leaked {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn response_filter_precommit_rejection_expires_credential_and_returns_error() {
         let hits = Arc::new(AtomicU64::new(0));
         let hits_for_handler = hits.clone();
@@ -34338,21 +34834,27 @@ model_routes:
     }
 
     #[tokio::test]
-    async fn guarded_success_json_error_returns_error_without_route_fallback() {
+    async fn guarded_success_retryable_envelope_does_not_route_fallback() {
+        let primary_hits = Arc::new(AtomicU64::new(0));
+        let primary_hits_for_handler = primary_hits.clone();
         let fallback_hits = Arc::new(AtomicU64::new(0));
         let fallback_hits_for_handler = fallback_hits.clone();
         let primary = Router::new().route(
             "/v1/chat/completions",
-            post(|| async {
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "error": {
-                            "code": "guarded_provider_unavailable",
-                            "message": "synthetic guarded success"
-                        }
-                    })),
-                )
+            post(move || {
+                let primary_hits = primary_hits_for_handler.clone();
+                async move {
+                    primary_hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "guarded_provider_unavailable",
+                                "message": "synthetic guarded success"
+                            }
+                        })),
+                    )
+                }
             }),
         );
         let fallback = Router::new().route(
@@ -34384,7 +34886,7 @@ model_routes:
             credential_sets.insert(
                 credential_set.clone(),
                 CredentialSetConfig {
-                    keys_file: temp_keys_file(&format!("{key}\n")),
+                    keys_file: temp_keys_file(&format!("{key}\n{key}-next\n")),
                 },
             );
             let mut pool = openai_pool(api_base, credential_set);
@@ -34445,8 +34947,8 @@ model_routes:
                     default_credential_cooldown_seconds: 20,
                     same_request_credential_retry:
                         crate::config::SameRequestCredentialRetryConfig {
-                            enabled: false,
-                            max_retries: 0,
+                            enabled: true,
+                            max_retries: 1,
                         },
                     route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
                 },
@@ -34473,6 +34975,7 @@ model_routes:
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();

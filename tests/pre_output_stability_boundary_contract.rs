@@ -102,14 +102,16 @@ fn existing_guarded_success_tests_cover_2xx_body_boundary() {
     assert_contains_all(
         test_body(
             &main,
-            "guarded_success_json_error_returns_error_without_route_fallback",
+            "guarded_success_retryable_envelope_does_not_route_fallback",
         ),
         "guarded 2xx error-envelope characterization",
         &[
             "StatusCode::OK",
             "guarded_success_envelope",
             "StatusCode::BAD_GATEWAY",
+            "primary_hits.load(Ordering::SeqCst), 1",
             "fallback_hits.load(Ordering::SeqCst), 0",
+            "same_request_credential_retry",
             "denial_reason",
             "failure_not_retryable",
             "duplicate_charge_risk",
@@ -291,6 +293,124 @@ fn stage1_task5_m3_retry_non_expansion_contract_is_explicit() {
             "failure_not_retryable",
             "duplicate_charge_risk",
             "none",
+        ],
+    );
+}
+
+#[test]
+fn stage1_task6_pre_output_guard_and_filter_stability_contract_is_explicit() {
+    let main = read_repo_file("src/main.rs");
+    let proxy = read_repo_file("src/proxy.rs");
+    let upstream_response = read_repo_file("src/upstream_response.rs");
+    let management_runtime = read_repo_file("src/management_runtime.rs");
+
+    assert_contains_all(
+        test_body(
+            &main,
+            "response_filter_precommit_plain_reject_does_not_mutate_lifecycle",
+        ),
+        "plain precommit Reject boundary",
+        &[
+            "ResponseFilterActionConfig::Reject",
+            "response_filter_rejected",
+            "primary_hits.load(Ordering::SeqCst), 1",
+            "fallback_hits.load(Ordering::SeqCst), 0",
+            "snapshot.cooling_down_credentials, 0",
+            "snapshot.expired_credentials, 0",
+            "ChannelRouteState::Available",
+            "body_committed",
+            "false",
+            "response_filter_precommit",
+            "retry_same_target",
+        ],
+    );
+
+    assert_contains_all(
+        test_body(
+            &main,
+            "response_filter_committed_event_does_not_mutate_lifecycle_or_retry",
+        ),
+        "committed filter event boundary",
+        &[
+            "TEST_SUCCESS_GUARD_MAX_BYTES + 1",
+            "ResponseFilterActionConfig::RejectAndExpireCredential",
+            "StatusCode::OK",
+            "primary_hits.load(Ordering::SeqCst), 1",
+            "fallback_hits.load(Ordering::SeqCst), 0",
+            "snapshot.cooling_down_credentials, 0",
+            "snapshot.expired_credentials, 0",
+            "body_committed",
+            "true",
+            "response_filter_precommit",
+            "retry_same_target",
+        ],
+    );
+
+    assert_contains_all(
+        test_body(
+            &main,
+            "guarded_success_retryable_envelope_does_not_route_fallback",
+        ),
+        "retryable guarded success envelope boundary",
+        &[
+            "retryable: Some(true)",
+            "same_request_credential_retry",
+            "enabled: true",
+            "primary_hits.load(Ordering::SeqCst), 1",
+            "fallback_hits.load(Ordering::SeqCst), 0",
+            "guarded_success_envelope",
+            "failure_not_retryable",
+            "duplicate_charge_risk",
+            "none",
+        ],
+    );
+
+    assert_contains_all(
+        test_body(
+            &main,
+            "response_filter_events_snapshot_stays_metadata_only_and_redacted",
+        ),
+        "response filter event snapshot redaction boundary",
+        &[
+            "rule_id",
+            "is_null",
+            "matched_text",
+            "raw_chunk",
+            "request_body",
+            "response_body",
+            "fixture_client_token",
+            "fixture_admin_token",
+            "sk-upstream-secret",
+        ],
+    );
+
+    assert_contains_all(
+        &proxy,
+        "precommit lifecycle scope must remain explicit-action only",
+        &[
+            "inspect_response_filter_before_commit",
+            "lifecycle_failure_scope()",
+            "ResponseFilterPrecommit",
+            "response_filter_precommit_rejected_response",
+        ],
+    );
+    assert_contains_all(
+        &upstream_response,
+        "committed filter events must remain metadata-only",
+        &[
+            "body_committed: true",
+            "ResponseFilterEventInput",
+            "rule_id: matched_rule.rule_id.clone()",
+            "outcome: outcome.to_string()",
+        ],
+    );
+    assert_contains_all(
+        &management_runtime,
+        "management response filter snapshot sanitizer",
+        &[
+            "sanitize_response_filter_event",
+            "safe_management_id(&event.rule_id)",
+            "body_committed",
         ],
     );
 }
