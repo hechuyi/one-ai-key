@@ -1091,6 +1091,18 @@ fn render_models_explain_table(
         );
         crate::cli_report::push_table_field(
             &mut output,
+            "availability.blocking_domain",
+            availability.get("blocking_domain"),
+        );
+        if availability
+            .get("evidence")
+            .filter(|value| !value.is_null())
+            .is_some()
+        {
+            output.push_str("availability.evidence_source: management_model_availability\n");
+        }
+        crate::cli_report::push_table_field(
+            &mut output,
             "availability.next_action",
             availability.get("next_action"),
         );
@@ -1643,6 +1655,59 @@ mod tests {
                 "<public-model>"
             ])
         );
+    }
+
+    #[test]
+    fn models_explain_table_reports_endpoint_family_blocking_domain_and_evidence_source() {
+        let preview = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "explicit_model_route",
+            "registry_generation": 5,
+            "client_token": {"name": "local-client"},
+            "selected_target": {"channel_id": "preview-selected", "plan_position": 0},
+            "candidates": []
+        });
+        let availability = serde_json::json!({
+            "status": "unavailable",
+            "can_use": false,
+            "blocking_domain": "endpoint_family",
+            "reason_code": "endpoint_family_mismatch",
+            "endpoint_family": "embeddings",
+            "model": "gpt-public",
+            "public_model": "gpt-public",
+            "client_token_ref": "local-client",
+            "route_kind": "explicit_model_route",
+            "registry_generation": 7,
+            "evidence": {
+                "route_target_count": 1,
+                "endpoint_family_target_count": 0,
+                "unknown_or_missing_target_count": 1,
+                "raw_secret": "SHOULD_NOT_RENDER"
+            },
+            "next_step": {
+                "summary": "Inspect runtime route target endpoint capabilities.",
+                "template_id": "route_explain",
+                "safe_argv": ["one-ai-key", "route", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "<public-model>"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            },
+            "next_action": "configure_endpoint_capabilities_or_route"
+        });
+
+        let rendered = super::render_models_explain_report_with_management_projection(
+            &preview,
+            None,
+            Some(&availability),
+            crate::cli_report::OutputFormat::Table,
+        );
+
+        assert!(rendered.contains("availability.blocking_domain: endpoint_family"));
+        assert!(rendered.contains(
+            "availability.evidence_source: management_model_availability"
+        ));
+        assert!(rendered.contains("availability.endpoint_family: embeddings"));
+        assert!(!rendered.contains("raw_secret"));
+        assert!(!rendered.contains("SHOULD_NOT_RENDER"));
     }
 
     #[test]
