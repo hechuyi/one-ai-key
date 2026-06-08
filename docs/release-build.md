@@ -91,8 +91,13 @@ generated placeholder tokens and a local mock upstream. It must cover offline
 config generation/checking, authenticated `/v1/models`, one model-bearing
 request, redacted operator reports for `doctor`, `models`, `route`, `keys`,
 `failures`, and `reload`, and rejection of a client `/v1` URL used as a
-management URL. It must not use `cargo run`, a source checkout binary, real
-upstream credentials, or a deployment host.
+management URL. The smoke exercises the canonical first diagnosis command,
+`models explain --model <public-model-id> --client-token-ref <client-token ref>
+--endpoint-family chat_completions`, and verifies that it answers whether the
+client-token ref can use the model on that endpoint family with `can_use`,
+`blocking_domain`, `endpoint_family`, bounded evidence, and a safe next_action. It
+must not use `cargo run`, a source checkout binary, real upstream
+credentials, or a deployment host.
 
 ## Release Checklist
 
@@ -106,7 +111,8 @@ upstream credentials, or a deployment host.
    its `.sha256` sidecar exist, and that the sidecar contains only the archive
    basename.
 6. Run `scripts/release-smoke.sh`; it must exercise the extracted artifact with
-   local placeholder tokens and a local mock upstream.
+   local placeholder tokens and a local mock upstream. Release and deployment
+   smoke remains local, redacted, and operator-run.
 7. Run `scripts/check-staged-denylist.sh`, then create the release commit and
    tag after checking that runtime state and generated artifacts are not staged.
 8. Upload the tarball and `.sha256` sidecar as GitHub Release assets.

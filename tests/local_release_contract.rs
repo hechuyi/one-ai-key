@@ -413,19 +413,40 @@ fn release_smoke_script_covers_local_mock_data_plane_and_operator_commands() {
         "invalid router api key",
         "invalid client token response leaked token material",
         "side_effect_class",
-        "model_visible_to_client",
+        "models-explain.json",
+        "models explain --model gpt-example --client-token-ref local-client --endpoint-family chat_completions --output json",
+        r#".can_use == true"#,
+        r#".blocking_domain == "none""#,
+        r#".endpoint_family == "chat_completions""#,
+        r#".model == "gpt-example""#,
+        r#".client_token_ref == "local-client""#,
+        r#".reason_code == "available""#,
+        r#".next_action.template_id"#,
+        r#".requires_confirmation == false"#,
+        r#".next_action.safe_argv"#,
+        "assert_bounded_evidence",
         r#".status == "available" and .reason_code == "available""#,
         r#".admission_summary.status == "available""#,
         r#".admission_summary.reason_code == "available""#,
+        r#".admission_summary.reason_code == .reason_code"#,
+        r#".model == $model"#,
+        r#".scope.client_token_ref == $client_token_ref"#,
         "selected_target",
         "candidates",
         "doctor --output json",
         "client-tokens list --output json",
         "models list --client-token-ref local-client --output json",
-        "models explain --model gpt-example --client-token-ref local-client --output json",
         "route explain gpt-example --client-token-ref local-client --output json",
         "keys stats --credential-set relay_credentials --output json",
         "failures tail --last 20 --output json",
+        "failures-tail.json",
+        r#".availability_source == "bounded_evidence""#,
+        r#".current_availability == false"#,
+        r#".window.kind == "bounded_recent_events""#,
+        r#".window.limit"#,
+        r#".window.returned"#,
+        r#".window.truncated"#,
+        r#".data.failures | length == 0"#,
         "reload status --output json",
         "reload diff --output json",
         "reload apply --dry-run --output json",
@@ -434,6 +455,37 @@ fn release_smoke_script_covers_local_mock_data_plane_and_operator_commands() {
         assert!(
             script.contains(required),
             "{path} must cover release gate token `{required}`"
+        );
+    }
+}
+
+#[test]
+fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
+    let path = "scripts/release-smoke.sh";
+    let script = read_repo_file(path);
+
+    for required in [
+        "MANAGEMENT_REPORTS=(",
+        "assert_no_management_report_leaks",
+        "release-smoke-client-token",
+        "release-smoke-management-token",
+        "release-smoke-upstream-token",
+        "release-smoke-invalid-client-token",
+        "${WORK_DIR}",
+        "data/relay.keys",
+        "127.0.0.1:${MOCK_PORT}",
+        "raw_management_url",
+        "raw body text",
+        "grep -Eq",
+        "token-looking URL component",
+        "assert_bounded_evidence",
+        "bounded_evidence",
+        "max_items",
+        "truncated",
+    ] {
+        assert!(
+            script.contains(required),
+            "{path} must contain shared redaction/bounded-output guard `{required}`"
         );
     }
 }
@@ -466,4 +518,48 @@ fn release_smoke_script_is_local_redacted_and_cleans_processes() {
             "{path} must not contain remote operation or secret-like token `{forbidden}`"
         );
     }
+}
+
+#[test]
+fn docs_make_models_explain_endpoint_family_the_canonical_first_diagnosis() {
+    let docs = [
+        ("README.md", read_repo_file("README.md")),
+        ("docs/operations.md", read_repo_file("docs/operations.md")),
+        (
+            "docs/release-build.md",
+            read_repo_file("docs/release-build.md"),
+        ),
+    ];
+
+    for (path, text) in docs {
+        for required in [
+            "models explain",
+            "--endpoint-family chat_completions",
+            "client-token ref",
+            "endpoint family",
+            "can_use",
+            "blocking_domain",
+            "bounded evidence",
+            "safe next_action",
+        ] {
+            assert!(
+                text.contains(required),
+                "{path} must document canonical diagnosis field `{required}`"
+            );
+        }
+    }
+
+    let operations = read_repo_file("docs/operations.md");
+    assert!(
+        operations.contains("Diagnosis recommendations stop at read-only commands")
+            || operations.contains("diagnosis recommendations stop at read-only commands"),
+        "docs/operations.md must state that diagnosis recommendations stop at read-only commands"
+    );
+    let release_build = read_repo_file("docs/release-build.md");
+    assert!(
+        release_build.contains("local")
+            && release_build.contains("redacted")
+            && release_build.contains("operator-run"),
+        "docs/release-build.md must state that release/deployment smoke remains local, redacted, and operator-run"
+    );
 }

@@ -117,6 +117,8 @@ with socket.socket() as sock:
     print(sock.getsockname()[1])
 PY
 )
+MOCK_UPSTREAM_URL="http://127.0.0.1:${MOCK_PORT}/v1"
+RAW_BODY_TEXT="raw body text"
 
 cat > mock_upstream.py <<'PY'
 import json
@@ -172,17 +174,17 @@ PY
 python3 mock_upstream.py "${MOCK_PORT}" >mock-upstream.log 2>&1 &
 MOCK_PID=$!
 
-python3 - <<'PY' "${SERVICE_PORT}" "${MOCK_PORT}" "${CLIENT_TOKEN}" "${MANAGEMENT_TOKEN}" "config/local.yaml"
+python3 - <<'PY' "${SERVICE_PORT}" "${MOCK_UPSTREAM_URL}" "${CLIENT_TOKEN}" "${MANAGEMENT_TOKEN}" "config/local.yaml"
 import pathlib
 import sys
 
-service_port, mock_port, client_token, management_token, config_path = sys.argv[1:]
+service_port, mock_upstream_url, client_token, management_token, config_path = sys.argv[1:]
 path = pathlib.Path(config_path)
 text = path.read_text()
 text = text.replace("listen: 127.0.0.1:4101", f"listen: 127.0.0.1:{service_port}")
 text = text.replace("<client-token-placeholder>", client_token)
 text = text.replace("<management-token-placeholder>", management_token)
-text = text.replace("https://relay.example/v1", f"http://127.0.0.1:{mock_port}/v1")
+text = text.replace("https://relay.example/v1", mock_upstream_url)
 path.write_text(text)
 PY
 printf '%s\n' "${UPSTREAM_TOKEN}" > data/relay.keys
@@ -251,27 +253,126 @@ fi
 export ONE_AI_KEY_MANAGEMENT_TOKEN="${MANAGEMENT_TOKEN}"
 MANAGEMENT_URL="http://127.0.0.1:${SERVICE_PORT}"
 COMMON=(--management-url "${MANAGEMENT_URL}" --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN)
+MANAGEMENT_REPORTS=()
 
-"${BIN}" "${COMMON[@]}" doctor --output json \
-  | jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
-"${BIN}" "${COMMON[@]}" client-tokens list --output json \
-  | jq -e '.status == "ok" and .reason_code == "client_tokens_available" and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
-"${BIN}" "${COMMON[@]}" models list --client-token-ref local-client --output json \
-  | jq -e '.status == "ok" and .reason_code == "model_routes_available" and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
-"${BIN}" "${COMMON[@]}" models explain --model gpt-example --client-token-ref local-client --output json \
-  | jq -e '.status == "ok" and .reason_code == "model_visible_to_client" and .side_effect_class == "runtime_readonly" and (.next_action.safe_argv | type == "array")' >/dev/null
-"${BIN}" "${COMMON[@]}" route explain gpt-example --client-token-ref local-client --output json \
-  | jq -e '.status == "available" and .reason_code == "available" and .admission_summary.status == "available" and .admission_summary.reason_code == "available" and (.selected_target.channel_id | type == "string") and (.admission_summary.selected_target.channel_id == .selected_target.channel_id) and (.candidates | type == "array" and length > 0) and .side_effect_class == "runtime_readonly" and (.next_action.safe_argv | type == "array")' >/dev/null
-"${BIN}" "${COMMON[@]}" keys stats --credential-set relay_credentials --output json \
-  | jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
-"${BIN}" "${COMMON[@]}" failures tail --last 20 --output json \
-  | jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
-"${BIN}" "${COMMON[@]}" reload status --output json \
-  | jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
-"${BIN}" "${COMMON[@]}" reload diff --output json \
-  | jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
-"${BIN}" "${COMMON[@]}" reload apply --dry-run --output json \
-  | jq -e '.status == "planned" and .reason_code == "reload_apply_dry_run" and .side_effect_class and (.next_action.safe_argv | type == "array")' >/dev/null
+capture_management_report() {
+  local output_path=$1
+  shift
+  "${BIN}" "${COMMON[@]}" "$@" > "${output_path}"
+  MANAGEMENT_REPORTS+=("${output_path}")
+}
+
+assert_bounded_evidence() {
+  local report_path=$1
+  local max_items=8
+  local truncated=false
+  jq -e --argjson max_items "${max_items}" --argjson truncated "${truncated}" '
+    (.evidence | type == "object")
+    and (.evidence.candidate_reason_codes | type == "array" and length <= $max_items)
+    and (.evidence.candidate_limit | type == "number")
+    and (.evidence.endpoint_family_target_count | type == "number")
+    and (.evidence.preview_candidate_count | type == "number")
+    and ($truncated == false)
+  ' "${report_path}" >/dev/null
+}
+
+assert_no_management_report_leaks() {
+  local raw_management_url="${MANAGEMENT_URL}/v1"
+  local forbidden_literals=(
+    "${CLIENT_TOKEN}"
+    "${MANAGEMENT_TOKEN}"
+    "${UPSTREAM_TOKEN}"
+    "${INVALID_CLIENT_TOKEN}"
+    "${WORK_DIR}"
+    "data/relay.keys"
+    "${MOCK_UPSTREAM_URL}"
+    "${MANAGEMENT_URL}"
+    "${raw_management_url}"
+    "${RAW_BODY_TEXT}"
+  )
+  local report
+  local forbidden
+  for report in "$@"; do
+    for forbidden in "${forbidden_literals[@]}"; do
+      if grep -Fq "${forbidden}" "${report}"; then
+        printf 'error: management report %s leaked forbidden local value\n' "${report}" >&2
+        exit 1
+      fi
+    done
+    if grep -Eq "https?://[^[:space:]\"']*(token|key|secret|bearer|s[k]-)[^[:space:]\"']*" "${report}"; then
+      printf 'error: management report %s leaked token-looking URL component\n' "${report}" >&2
+      exit 1
+    fi
+  done
+}
+
+capture_management_report doctor.json doctor --output json
+jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' doctor.json >/dev/null
+capture_management_report client-tokens-list.json client-tokens list --output json
+jq -e '.status == "ok" and .reason_code == "client_tokens_available" and .side_effect_class and (.next_action.safe_argv | type == "array")' client-tokens-list.json >/dev/null
+capture_management_report models-list.json models list --client-token-ref local-client --output json
+jq -e '.status == "ok" and .reason_code == "model_routes_available" and .side_effect_class and (.next_action.safe_argv | type == "array")' models-list.json >/dev/null
+capture_management_report models-explain.json models explain --model gpt-example --client-token-ref local-client --endpoint-family chat_completions --output json
+jq -e '
+  .status == "ok"
+  and .can_use == true
+  and .reason_code == "available"
+  and .blocking_domain == "none"
+  and .endpoint_family == "chat_completions"
+  and .model == "gpt-example"
+  and .client_token_ref == "local-client"
+  and (.next_action.template_id | type == "string")
+  and .next_action.side_effect_class == "runtime_readonly"
+  and .next_action.requires_confirmation == false
+  and (.next_action.safe_argv | type == "array")
+  and .side_effect_class == "runtime_readonly"
+  and (.data.availability.next_step.template_id | type == "string")
+  and .data.availability.next_step.side_effect_class == "runtime_readonly"
+  and .data.availability.next_step.requires_confirmation == false
+  and (.data.availability.next_step.safe_argv | type == "array")
+' models-explain.json >/dev/null
+assert_bounded_evidence models-explain.json
+MODEL_EXPLAIN_MODEL=$(jq -r '.model' models-explain.json)
+MODEL_EXPLAIN_CLIENT_TOKEN_REF=$(jq -r '.client_token_ref' models-explain.json)
+MODEL_EXPLAIN_REASON_CODE=$(jq -r '.reason_code' models-explain.json)
+capture_management_report route-explain.json route explain gpt-example --client-token-ref local-client --output json
+jq -e --arg model "${MODEL_EXPLAIN_MODEL}" --arg client_token_ref "${MODEL_EXPLAIN_CLIENT_TOKEN_REF}" --arg reason_code "${MODEL_EXPLAIN_REASON_CODE}" '
+  .status == "available" and .reason_code == "available"
+  and .reason_code == $reason_code
+  and .admission_summary.status == "available"
+  and .admission_summary.reason_code == "available"
+  and .admission_summary.reason_code == .reason_code
+  and .model == $model
+  and .scope.client_token_ref == $client_token_ref
+  and (.selected_target.channel_id | type == "string")
+  and (.admission_summary.selected_target.channel_id == .selected_target.channel_id)
+  and (.candidates | type == "array" and length > 0)
+  and .side_effect_class == "runtime_readonly"
+  and (.next_action.safe_argv | type == "array")
+' route-explain.json >/dev/null
+capture_management_report keys-stats.json keys stats --credential-set relay_credentials --output json
+jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' keys-stats.json >/dev/null
+capture_management_report failures-tail.json failures tail --last 20 --output json
+jq -e '
+  .status
+  and .reason_code
+  and .side_effect_class
+  and (.next_action.safe_argv | type == "array")
+  and .availability_source == "bounded_evidence"
+  and .current_availability == false
+  and .window.kind == "bounded_recent_events"
+  and (.window.limit | type == "number")
+  and (.window.returned | type == "number")
+  and (.window.truncated | type == "boolean")
+  and .data.failure_count == 0
+  and (.data.failures | length == 0)
+' failures-tail.json >/dev/null
+capture_management_report reload-status.json reload status --output json
+jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' reload-status.json >/dev/null
+capture_management_report reload-diff.json reload diff --output json
+jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' reload-diff.json >/dev/null
+capture_management_report reload-apply-dry-run.json reload apply --dry-run --output json
+jq -e '.status == "planned" and .reason_code == "reload_apply_dry_run" and .side_effect_class and (.next_action.safe_argv | type == "array")' reload-apply-dry-run.json >/dev/null
 
 set +e
 NEGATIVE_OUTPUT=$("${BIN}" --management-url "${MANAGEMENT_URL}/v1" --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN models list --output json 2>&1)
@@ -281,5 +382,9 @@ if [[ "${NEGATIVE_STATUS}" -eq 0 || "${NEGATIVE_OUTPUT}" != *"client_base_url_us
   printf 'error: client /v1 base URL was not rejected for management commands\n' >&2
   exit 1
 fi
+printf '%s\n' "${NEGATIVE_OUTPUT}" > negative-management-url.txt
+MANAGEMENT_REPORTS+=("negative-management-url.txt")
+
+assert_no_management_report_leaks "${MANAGEMENT_REPORTS[@]}"
 
 printf 'release smoke passed for %s %s\n' "${PACKAGE_NAME}" "${VERSION}"

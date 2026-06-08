@@ -107,7 +107,8 @@ one-ai-key models list --management-url <management-origin> \
 one-ai-key models explain --management-url <management-origin> \
   --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
   --model <public-model-id> \
-  --client-token-ref <client-token-ref>
+  --client-token-ref <client-token-ref> \
+  --endpoint-family chat_completions
 
 one-ai-key route explain <public-model-id> --management-url <management-origin> \
   --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
@@ -125,14 +126,22 @@ side-effect class, effect vector, scope/window data when applicable, and a safe
 next action. Table output can be shorter than JSON, but it must preserve the
 same decision-bearing fields.
 
+Use `models explain --model <public-model-id> --client-token-ref <client-token
+ref> --endpoint-family chat_completions` as the canonical first command for
+client/model/endpoint availability. It answers whether that client-token ref can
+use the model on the requested endpoint family and returns `can_use`,
+`blocking_domain`, `endpoint_family`, bounded evidence, and a safe next_action before
+any route-target detail is inspected.
+
 Read-only commands do not write local files, call upstreams, or mutate
 management state: `doctor`, `models list`, `models explain`, `route explain`,
 `client-tokens list`, `keys list`, `keys stats`, `failures tail`, `failures
 explain`, `reload status`, and `reload diff`.
 
-Diagnosis reports may recommend read-only reload investigation only:
-`reload status` or `reload diff`. `reload apply --dry-run` is an explicit
-operator reload-planning command, not a diagnosis next action.
+Diagnosis recommendations stop at read-only commands. Diagnosis reports may
+recommend read-only reload investigation only: `reload status` or `reload diff`.
+`reload apply --dry-run` is an explicit operator reload-planning command, not a
+diagnosis next action.
 
 Dry-run commands preview the intended effect and must leave write/upstream bits
 off: `init local --dry-run`, `keys import --credential-set <id> --source <path>
