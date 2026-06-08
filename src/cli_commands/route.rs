@@ -77,6 +77,9 @@ fn sanitized_route_explain_report(preview: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("admission_summary_missing");
     let reason = route_admission_reason(status, reason_code);
+    let diagnostic_contract = crate::diagnostic_contract::contract_for_reason(reason_code)
+        .unwrap_or_else(crate::diagnostic_contract::fallback_contract);
+    let next_action = diagnostic_contract.next_action.clone();
     let data = serde_json::json!({
         "command": "route explain",
         "active_registry_generation": runtime_reload.active_registry_generation,
@@ -95,7 +98,8 @@ fn sanitized_route_explain_report(preview: &Value) -> Value {
         "client_token": sanitize_client_token(preview.get("client_token")),
         "selected_target": sanitize_target(preview.get("selected_target")),
         "admission_summary": admission_summary,
-        "next_action": route_next_action(status, preview),
+        "blocking_domain": diagnostic_contract.blocking_domain,
+        "next_action": next_action,
         "candidates": candidates,
     });
     envelope_with_legacy_fields(
@@ -110,7 +114,7 @@ fn sanitized_route_explain_report(preview: &Value) -> Value {
                 .and_then(|client_token| client_token.get("name"))
                 .and_then(Value::as_str),
         }),
-        route_next_action(status, preview),
+        diagnostic_contract.next_action,
         data,
     )
 }
@@ -129,30 +133,6 @@ fn route_admission_reason(status: &str, reason_code: &str) -> String {
             )
         }
         _ => "Backend route admission projection is unavailable.".to_string(),
-    }
-}
-
-fn route_next_action(status: &str, preview: &Value) -> Value {
-    let model = preview
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("<unknown>");
-    if matches!(status, "available" | "last_resort") {
-        serde_json::json!({
-            "summary": "A runtime route candidate is selected. No repair action is required by route explain.",
-            "template_id": "no_action_required",
-            "safe_argv": [],
-            "side_effect_class": "runtime_readonly",
-            "requires_confirmation": false,
-        })
-    } else {
-        serde_json::json!({
-            "summary": format!("No runtime route candidate is selected for public model {model}. Inspect model visibility and channel health when the corresponding read-only commands are available."),
-            "template_id": "models_explain",
-            "safe_argv": ["one-ai-key", "models", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "--model", "<public-model>"],
-            "side_effect_class": "runtime_readonly",
-            "requires_confirmation": false,
-        })
     }
 }
 
@@ -825,6 +805,41 @@ mod tests {
         assert!(rendered_table.contains("admission.last_resort_used: true"));
         assert!(rendered_table
             .contains("admission.last_resort_reason: provider_cooling_down_last_resort"));
+    }
+
+    #[test]
+    fn route_explain_aligns_blocking_domain_and_next_action_with_diagnostic_contract() {
+        let preview = json!({
+            "model": "gpt-missing",
+            "selected_target": null,
+            "admission_summary": {
+                "status": "unavailable",
+                "reason_code": "no_route_candidate",
+                "selected_target": null,
+                "candidate_count": 0,
+                "included_count": 0,
+                "blocked_count": 0,
+                "soft_suppressed_count": 0,
+                "hard_blocked_count": 0,
+                "last_resort_used": false,
+                "last_resort_reason": null
+            },
+            "candidates": []
+        });
+
+        let rendered =
+            super::render_route_explain_report(&preview, crate::cli_report::OutputFormat::Json);
+        let report: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let contract = crate::diagnostic_contract::contract_for_reason("no_route_candidate")
+            .expect("stage 2 route reason should have a diagnostic contract");
+
+        assert_eq!(report["blocking_domain"], contract.blocking_domain);
+        assert_eq!(report["next_action"], contract.next_action);
+        assert_eq!(
+            report["next_action"]["side_effect_class"],
+            "runtime_readonly"
+        );
+        assert_eq!(report["next_action"]["requires_confirmation"], false);
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod config_diagnostics;
 mod credential_probe;
 mod credential_repository;
 mod credentials;
+mod diagnostic_contract;
 mod endpoint_capabilities;
 mod error;
 mod events;

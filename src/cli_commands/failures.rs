@@ -373,6 +373,8 @@ fn report_envelope_with_data(
         "effect_vector": crate::cli_effects::effect_vector_json(effect.effect_vector),
         "scope": filters_metadata(filters),
         "window": window.metadata(returned),
+        "availability_source": "bounded_evidence",
+        "current_availability": false,
         "next_action": aggregate_next_action(&failures),
         "data": data,
     })
@@ -546,6 +548,8 @@ fn classify_upstream_failure(event: &Value) -> Value {
         .and_then(Value::as_str);
     let retry_eligibility = retry_eligibility(failure, directive, retry_decision_reason);
     let failure_class = upstream_failure_class(failure_kind, status);
+    let reason_code = reason_code_for_class(failure_class);
+    let contract = diagnostic_contract_for(reason_code);
     let stage = upstream_stage(failure.get("failure_source").and_then(Value::as_str));
     let router_action = router_action_for_directive(directive);
     let request_id = safe_local_id(event.get("request_id"));
@@ -566,10 +570,11 @@ fn classify_upstream_failure(event: &Value) -> Value {
         "retry_eligibility": retry_eligibility,
         "retry_blocked_reason": retry_blocked_reason(&retry_eligibility, retry_decision_reason),
         "client_visible_status": client_visible_status(status, directive, &retry_eligibility),
-        "reason_code": reason_code_for_class(failure_class),
+        "reason_code": reason_code,
+        "blocking_domain": contract.blocking_domain,
         "directive": directive,
         "attempt": failure.get("attempt").and_then(Value::as_u64),
-        "next_action": next_action_for(stage, failure_class, request_id.as_deref(), public_model.as_deref(), channel_id.as_deref(), client_token_ref.as_deref()),
+        "next_action": contract.next_action,
     })
 }
 
@@ -586,6 +591,11 @@ fn classify_channel_transition(event: &Value) -> Value {
     let request_id = safe_local_id(event.get("request_id"));
     let channel_id = safe_local_id(event.get("channel_id"));
     let client_token_ref = safe_local_id(event.get("client_token_ref"));
+    let reason_code = stable_reason(
+        event.get("reason").and_then(Value::as_str),
+        "channel_degraded",
+    );
+    let contract = diagnostic_contract_for(reason_code);
     serde_json::json!({
         "source": "routing_telemetry",
         "event_kind": "channel_health_transition_applied",
@@ -600,9 +610,10 @@ fn classify_channel_transition(event: &Value) -> Value {
         "retry_eligibility": "not_applicable",
         "retry_blocked_reason": Value::Null,
         "client_visible_status": "not_applicable",
-        "reason_code": stable_reason(event.get("reason").and_then(Value::as_str), "channel_degraded"),
+        "reason_code": reason_code,
+        "blocking_domain": contract.blocking_domain,
         "directive": Value::Null,
-        "next_action": next_action_for("credential_selection", failure_class, request_id.as_deref(), None, channel_id.as_deref(), client_token_ref.as_deref()),
+        "next_action": contract.next_action,
     })
 }
 
@@ -610,6 +621,11 @@ fn classify_credential_transition(event: &Value) -> Value {
     let request_id = safe_local_id(event.get("request_id"));
     let channel_id = safe_local_id(event.get("channel_id"));
     let client_token_ref = safe_local_id(event.get("client_token_ref"));
+    let reason_code = stable_reason(
+        event.get("reason").and_then(Value::as_str),
+        "credential_unavailable",
+    );
+    let contract = diagnostic_contract_for(reason_code);
     serde_json::json!({
         "source": "routing_telemetry",
         "event_kind": credential_event_kind(event.get("kind").and_then(Value::as_str)),
@@ -624,9 +640,10 @@ fn classify_credential_transition(event: &Value) -> Value {
         "retry_eligibility": "not_applicable",
         "retry_blocked_reason": Value::Null,
         "client_visible_status": "not_applicable",
-        "reason_code": stable_reason(event.get("reason").and_then(Value::as_str), "credential_unavailable"),
+        "reason_code": reason_code,
+        "blocking_domain": contract.blocking_domain,
         "directive": Value::Null,
-        "next_action": next_action_for("credential_selection", "credential_unavailable", request_id.as_deref(), None, channel_id.as_deref(), client_token_ref.as_deref()),
+        "next_action": contract.next_action,
     })
 }
 
@@ -635,6 +652,7 @@ fn classify_route_planning_failure(event: &Value) -> Value {
     let public_model = safe_local_id(event.get("public_model"));
     let channel_id = safe_local_id(event.get("channel_id"));
     let client_token_ref = safe_local_id(event.get("client_token_ref"));
+    let contract = diagnostic_contract_for("no_route_candidate");
     serde_json::json!({
         "source": "routing_telemetry",
         "event_kind": route_event_kind(event.get("kind").and_then(Value::as_str)),
@@ -650,8 +668,9 @@ fn classify_route_planning_failure(event: &Value) -> Value {
         "retry_blocked_reason": Value::Null,
         "client_visible_status": safe_status(event.get("client_visible_status")).unwrap_or("local_404"),
         "reason_code": "no_route_candidate",
+        "blocking_domain": contract.blocking_domain,
         "directive": Value::Null,
-        "next_action": next_action_for("route_planning", "no_route_candidate", request_id.as_deref(), public_model.as_deref(), channel_id.as_deref(), client_token_ref.as_deref()),
+        "next_action": contract.next_action,
     })
 }
 
@@ -660,6 +679,7 @@ fn classify_model_visibility_failure(event: &Value) -> Value {
     let public_model = safe_local_id(event.get("public_model"));
     let channel_id = safe_local_id(event.get("channel_id"));
     let client_token_ref = safe_local_id(event.get("client_token_ref"));
+    let contract = diagnostic_contract_for("model_not_in_client_scope");
     serde_json::json!({
         "source": "routing_telemetry",
         "event_kind": visibility_event_kind(event.get("kind").and_then(Value::as_str)),
@@ -675,8 +695,9 @@ fn classify_model_visibility_failure(event: &Value) -> Value {
         "retry_blocked_reason": Value::Null,
         "client_visible_status": safe_status(event.get("client_visible_status")).unwrap_or("local_404"),
         "reason_code": "model_not_in_client_scope",
+        "blocking_domain": contract.blocking_domain,
         "directive": Value::Null,
-        "next_action": next_action_for("model_visibility", "model_not_visible", request_id.as_deref(), public_model.as_deref(), channel_id.as_deref(), client_token_ref.as_deref()),
+        "next_action": contract.next_action,
     })
 }
 
@@ -693,6 +714,15 @@ fn classify_response_filter_event(event: &Value) -> Option<Value> {
     let public_model = safe_local_id(event.get("public_model"));
     let channel_id = safe_local_id(event.get("channel_id"));
     let client_token_ref = safe_local_id(event.get("client_token_ref"));
+    let reason_code = stable_reason(
+        event.get("reason_code").and_then(Value::as_str),
+        if body_committed {
+            "stream_committed_failure"
+        } else {
+            "response_filter_rejected"
+        },
+    );
+    let contract = diagnostic_contract_for(reason_code);
     Some(serde_json::json!({
         "source": "response_filter_events",
         "event_kind": "response_filter_rejected",
@@ -707,10 +737,11 @@ fn classify_response_filter_event(event: &Value) -> Option<Value> {
         "retry_eligibility": if body_committed { "blocked_streaming" } else { "eligible_before_output" },
         "retry_blocked_reason": if body_committed { Value::from("partial_output_started") } else { Value::Null },
         "client_visible_status": if body_committed { "stream_committed_failure" } else { "local_502" },
-        "reason_code": stable_reason(event.get("reason_code").and_then(Value::as_str), "response_filter_rejected"),
+        "reason_code": reason_code,
+        "blocking_domain": contract.blocking_domain,
         "directive": action,
         "content_kind": safe_status(event.get("content_kind")).unwrap_or("unknown"),
-        "next_action": next_action_for(if body_committed { "post_output" } else { "response_filter" }, "response_filter_rejected", request_id.as_deref(), public_model.as_deref(), channel_id.as_deref(), client_token_ref.as_deref()),
+        "next_action": contract.next_action,
     }))
 }
 
@@ -886,194 +917,16 @@ fn sanitize_selected_target(channel_id: Option<&str>) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn next_action_for(
-    stage: &str,
-    failure_class: &str,
-    request_id: Option<&str>,
-    public_model: Option<&str>,
-    channel_id: Option<&str>,
-    client_token_ref: Option<&str>,
-) -> Value {
-    match (stage, failure_class) {
-        ("model_visibility", _,) => next_action(
-            "models_explain_visibility",
-            "Inspect the compiled model route and client-token scope for this public model.",
-            model_explain_argv(public_model, client_token_ref),
-            "runtime_readonly",
-            false,
-        ),
-        ("route_planning", "no_route_candidate") => next_action(
-            "route_explain_no_candidate",
-            "Inspect route candidates for this public model.",
-            route_explain_argv(public_model),
-            "runtime_readonly",
-            false,
-        ),
-        ("credential_selection", "credential_unavailable") => next_action(
-            "failures_tail_channel",
-            "Inspect recent bounded failures for the affected channel. Credential probing is unavailable until M3.",
-            failures_tail_argv(channel_id),
-            "runtime_readonly",
-            false,
-        ),
-        ("response_filter", _) | ("post_output", _) => next_action(
-            "failures_explain_request",
-            "Inspect this bounded failure record. Do not retry after client-visible output.",
-            failures_explain_argv(request_id),
-            "runtime_readonly",
-            false,
-        ),
-        ("upstream_transport", "upstream_5xx") | ("upstream_transport", "upstream_timeout") => {
-            next_action(
-                "route_explain_upstream_failure",
-                "Inspect route candidates and recent failures before changing configuration.",
-                route_explain_argv(public_model),
-                "runtime_readonly",
-                false,
-            )
-        }
-        _ => next_action(
-            "failures_tail",
-            "Inspect recent bounded failures for related events.",
-            failures_tail_argv(channel_id),
-            "runtime_readonly",
-            false,
-        ),
-    }
-}
-
-fn next_action(
-    template_id: &'static str,
-    summary: &'static str,
-    safe_argv: Vec<String>,
-    side_effect_class: &'static str,
-    requires_confirmation: bool,
-) -> Value {
-    serde_json::json!({
-        "summary": summary,
-        "template_id": template_id,
-        "safe_argv": validate_safe_argv(safe_argv),
-        "side_effect_class": side_effect_class,
-        "requires_confirmation": requires_confirmation,
-    })
-}
-
-fn model_explain_argv(public_model: Option<&str>, client_token_ref: Option<&str>) -> Vec<String> {
-    let mut argv = common_management_argv("models", "explain");
-    argv.push("--model".to_string());
-    argv.push(public_model.unwrap_or("<public-model>").to_string());
-    argv.push("--client-token-ref".to_string());
-    argv.push(client_token_ref.unwrap_or("<client-token-ref>").to_string());
-    argv
-}
-
-fn route_explain_argv(public_model: Option<&str>) -> Vec<String> {
-    let mut argv = common_management_argv("route", "explain");
-    argv.push(public_model.unwrap_or("<public-model>").to_string());
-    argv
-}
-
-fn failures_tail_argv(channel_id: Option<&str>) -> Vec<String> {
-    let mut argv = common_management_argv("failures", "tail");
-    argv.push("--last".to_string());
-    argv.push("50".to_string());
-    if let Some(channel_id) = channel_id {
-        argv.push("--channel".to_string());
-        argv.push(channel_id.to_string());
-    }
-    argv
-}
-
-fn failures_explain_argv(request_id: Option<&str>) -> Vec<String> {
-    let mut argv = common_management_argv("failures", "explain");
-    argv.push(request_id.unwrap_or("<request-id>").to_string());
-    argv.push("--last".to_string());
-    argv.push("50".to_string());
-    argv
-}
-
-fn common_management_argv(command: &'static str, subcommand: &'static str) -> Vec<String> {
-    vec![
-        "one-ai-key".to_string(),
-        command.to_string(),
-        subcommand.to_string(),
-        "--management-url".to_string(),
-        "<url>".to_string(),
-        "--management-token-env".to_string(),
-        "<env>".to_string(),
-    ]
-}
-
-fn validate_safe_argv(argv: Vec<String>) -> Vec<Value> {
-    if is_allowlisted_safe_argv(&argv) && argv.iter().all(|arg| is_safe_argv_arg(arg)) {
-        argv.into_iter().map(Value::from).collect()
-    } else {
-        Vec::new()
-    }
-}
-
-fn is_allowlisted_safe_argv(argv: &[String]) -> bool {
-    if argv.is_empty() {
-        return true;
-    }
-    if argv.len() < 7
-        || argv[0] != "one-ai-key"
-        || argv[3] != "--management-url"
-        || argv[4] != "<url>"
-        || argv[5] != "--management-token-env"
-        || argv[6] != "<env>"
-    {
-        return false;
-    }
-    match (
-        argv.get(1).map(String::as_str),
-        argv.get(2).map(String::as_str),
-    ) {
-        (Some("models"), Some("explain")) => {
-            argv.len() == 11 && argv[7] == "--model" && argv[9] == "--client-token-ref"
-        }
-        (Some("route"), Some("explain")) => argv.len() == 8,
-        (Some("failures"), Some("tail")) => {
-            (argv.len() == 9 && argv[7] == "--last" && argv[8] == "50")
-                || (argv.len() == 11
-                    && argv[7] == "--last"
-                    && argv[8] == "50"
-                    && argv[9] == "--channel")
-        }
-        (Some("failures"), Some("explain")) => {
-            argv.len() == 10 && argv[8] == "--last" && argv[9] == "50"
-        }
-        _ => false,
-    }
-}
-
-fn is_safe_argv_arg(arg: &str) -> bool {
-    const SAFE_PLACEHOLDERS: &[&str] = &[
-        "<url>",
-        "<env>",
-        "<client-token-ref>",
-        "<public-model>",
-        "<request-id>",
-    ];
-    if SAFE_PLACEHOLDERS.contains(&arg) {
-        return true;
-    }
-    sanitize_local_string(arg).is_some()
+fn diagnostic_contract_for(reason_code: &str) -> crate::diagnostic_contract::DiagnosticContract {
+    crate::diagnostic_contract::contract_for_reason(reason_code)
+        .unwrap_or_else(crate::diagnostic_contract::fallback_contract)
 }
 
 fn aggregate_next_action(failures: &[Value]) -> Value {
     primary_failure(failures)
         .and_then(|failure| failure.get("next_action"))
         .cloned()
-        .unwrap_or_else(|| {
-            next_action(
-                "no_action_required",
-                "No failures matched the bounded local event window.",
-                Vec::new(),
-                "runtime_readonly",
-                false,
-            )
-        })
+        .unwrap_or_else(|| diagnostic_contract_for("no_failures_in_window").next_action)
 }
 
 fn primary_reason_code(failures: &[Value]) -> String {
@@ -1751,7 +1604,7 @@ mod tests {
         let report: Value = serde_json::from_str(&rendered).unwrap();
         let next_action = &report["next_action"];
 
-        assert_eq!(next_action["template_id"], "failures_tail_channel");
+        assert_eq!(next_action["template_id"], "failures_tail");
         assert!(next_action["safe_argv"].is_array());
         let legacy_safe_field = ["safe", "command"].join("_");
         let legacy_dry_run_field = ["dry", "run", "command"].join("_");
@@ -1762,27 +1615,24 @@ mod tests {
 
     #[test]
     fn failures_safe_argv_validation_rejects_unknown_templates_and_unsafe_args() {
-        assert!(validate_safe_argv(vec![
-            "one-ai-key".to_string(),
-            "unknown".to_string(),
-            "explain".to_string(),
-            "--management-url".to_string(),
-            "<url>".to_string(),
-            "--management-token-env".to_string(),
-            "<env>".to_string(),
-        ])
-        .is_empty());
-        assert!(validate_safe_argv(vec![
-            "one-ai-key".to_string(),
-            "route".to_string(),
-            "explain".to_string(),
-            "--management-url".to_string(),
-            "<url>".to_string(),
-            "--management-token-env".to_string(),
-            "<env>".to_string(),
-            "bad/model".to_string(),
-        ])
-        .is_empty());
+        assert!(!crate::diagnostic_contract::is_valid_safe_next_action(
+            &serde_json::json!({
+                "summary": "unsafe",
+                "template_id": "unknown_explain",
+                "safe_argv": ["one-ai-key", "unknown", "explain", "--management-url", "<url>", "--management-token-env", "<env>"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            })
+        ));
+        assert!(!crate::diagnostic_contract::is_valid_safe_next_action(
+            &serde_json::json!({
+                "summary": "unsafe",
+                "template_id": "route_explain",
+                "safe_argv": ["one-ai-key", "route", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "/tmp/private-model"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            })
+        ));
     }
 
     #[test]
@@ -1809,14 +1659,40 @@ mod tests {
             crate::cli_report::OutputFormat::Json,
         );
         let report: Value = serde_json::from_str(&rendered).unwrap();
+        let contract =
+            crate::diagnostic_contract::contract_for_reason("model_not_in_client_scope").unwrap();
         let argv = report["next_action"]["safe_argv"].as_array().unwrap();
 
-        assert_eq!(
-            report["next_action"]["template_id"],
-            "models_explain_visibility"
+        assert_eq!(report["next_action"], contract.next_action);
+        assert!(rendered.contains("<client-token-ref>"));
+        assert!(!argv.iter().any(|arg| arg == "local-client"));
+    }
+
+    #[test]
+    fn failures_explain_is_bounded_evidence_and_uses_diagnostic_contract() {
+        let rendered = render_explain_report(
+            &routing_fixture(),
+            &response_filter_fixture(),
+            "req_scope",
+            &FailureFilters::default(),
+            crate::cli_report::OutputFormat::Json,
         );
-        assert!(argv.iter().any(|arg| arg == "local-client"));
-        assert!(!rendered.contains("<client-token-ref>"));
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        let contract = crate::diagnostic_contract::contract_for_reason("model_not_in_client_scope")
+            .expect("stage 2 failure reason should have a diagnostic contract");
+
+        assert_eq!(report["availability_source"], "bounded_evidence");
+        assert_eq!(report["current_availability"], false);
+        assert_eq!(
+            report["data"]["evidence"][0]["blocking_domain"],
+            contract.blocking_domain
+        );
+        assert_eq!(report["next_action"], contract.next_action);
+        assert_eq!(
+            report["next_action"]["side_effect_class"],
+            "runtime_readonly"
+        );
+        assert_eq!(report["next_action"]["requires_confirmation"], false);
     }
 
     #[test]

@@ -343,6 +343,26 @@ fn sanitized_models_explain_report(
         .and_then(|value| value.get("reason_code"))
         .and_then(Value::as_str)
         .unwrap_or_else(|| models_explain_reason_code(has_selected_target, client_scope_status));
+    let diagnostic_contract = crate::diagnostic_contract::contract_for_reason(reason_code);
+    let availability_contract = availability.as_ref().map(|_| {
+        diagnostic_contract
+            .clone()
+            .unwrap_or_else(crate::diagnostic_contract::fallback_contract)
+    });
+    let blocking_domain = diagnostic_contract
+        .as_ref()
+        .map(|contract| contract.blocking_domain)
+        .or_else(|| {
+            availability_contract
+                .as_ref()
+                .map(|contract| contract.blocking_domain)
+        })
+        .or_else(|| {
+            availability
+                .as_ref()
+                .and_then(|value| value.get("blocking_domain"))
+                .and_then(Value::as_str)
+        });
     let report_model = availability
         .as_ref()
         .and_then(|value| value.get("model"))
@@ -359,10 +379,11 @@ fn sanitized_models_explain_report(
         .or_else(|| client_token.get("name").and_then(Value::as_str));
     let next_action = availability
         .as_ref()
-        .and_then(|value| value.get("next_step"))
-        .filter(|value| !value.is_null())
-        .cloned()
-        .unwrap_or_else(|| models_explain_next_action(status, preview, client_scope_status));
+        .and_then(|_| availability_contract.as_ref())
+        .map(|contract| contract.next_action.clone())
+        .unwrap_or_else(|| {
+            models_explain_next_action(status, preview, client_scope_status, reason_code)
+        });
     let data = serde_json::json!({
         "command": "models explain",
         "active_registry_generation": runtime_reload.active_registry_generation,
@@ -374,10 +395,7 @@ fn sanitized_models_explain_report(
         "reload_diff_next_action": runtime_reload.reload_diff_next_action,
         "capability_status": capability_status,
         "can_use": availability_can_use,
-        "blocking_domain": availability
-            .as_ref()
-            .and_then(|value| value.get("blocking_domain"))
-            .and_then(Value::as_str),
+        "blocking_domain": blocking_domain,
         "endpoint_family": report_endpoint_family,
         "model": report_model,
         "client_token_ref": report_client_token_ref,
@@ -411,6 +429,19 @@ fn sanitized_models_explain_report(
 }
 
 fn sanitize_model_availability(value: &Value) -> Value {
+    let reason_code = value
+        .get("reason_code")
+        .and_then(Value::as_str)
+        .filter(|value| is_safe_reason_code(value));
+    let diagnostic_contract = reason_code.and_then(crate::diagnostic_contract::contract_for_reason);
+    let availability_contract = diagnostic_contract
+        .clone()
+        .unwrap_or_else(crate::diagnostic_contract::fallback_contract);
+    let blocking_domain = diagnostic_contract
+        .as_ref()
+        .map(|contract| contract.blocking_domain)
+        .or(Some(availability_contract.blocking_domain));
+    let next_step = availability_contract.next_action.clone();
     let client_token = value
         .get("client_token")
         .and_then(Value::as_object)
@@ -430,14 +461,8 @@ fn sanitize_model_availability(value: &Value) -> Value {
     serde_json::json!({
         "status": value.get("status").and_then(Value::as_str),
         "can_use": value.get("can_use").and_then(Value::as_bool),
-        "blocking_domain": value
-            .get("blocking_domain")
-            .and_then(Value::as_str)
-            .filter(|value| is_safe_reason_code(value)),
-        "reason_code": value
-            .get("reason_code")
-            .and_then(Value::as_str)
-            .filter(|value| is_safe_reason_code(value)),
+        "blocking_domain": blocking_domain,
+        "reason_code": reason_code,
         "next_action": value
             .get("next_action")
             .and_then(Value::as_str)
@@ -464,7 +489,7 @@ fn sanitize_model_availability(value: &Value) -> Value {
             .filter(|value| is_safe_reason_code(value)),
         "registry_generation": value.get("registry_generation").and_then(Value::as_u64),
         "evidence": sanitize_availability_evidence(value.get("evidence")),
-        "next_step": sanitize_availability_next_step(value.get("next_step")),
+        "next_step": next_step,
         "client_token": client_token,
     })
 }
@@ -516,101 +541,6 @@ fn sanitize_availability_evidence(evidence: Option<&Value>) -> Value {
         );
     }
     Value::Object(sanitized)
-}
-
-fn sanitize_availability_next_step(next_step: Option<&Value>) -> Value {
-    let Some(next_step) = next_step.and_then(Value::as_object) else {
-        return Value::Null;
-    };
-    let safe_argv = next_step
-        .get("safe_argv")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|value| is_safe_next_action_arg(value))
-                .take(16)
-                .map(Value::from)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    serde_json::json!({
-        "summary": next_step
-            .get("summary")
-            .and_then(Value::as_str)
-            .filter(|value| is_safe_next_action_summary(value))
-            .map(crate::cli_report::escape_table_value),
-        "template_id": next_step
-            .get("template_id")
-            .and_then(Value::as_str)
-            .filter(|value| is_safe_reason_code(value)),
-        "safe_argv": safe_argv,
-        "side_effect_class": next_step
-            .get("side_effect_class")
-            .and_then(Value::as_str)
-            .filter(|value| is_safe_reason_code(value)),
-        "requires_confirmation": next_step
-            .get("requires_confirmation")
-            .and_then(Value::as_bool),
-    })
-}
-
-fn is_safe_next_action_arg(value: &str) -> bool {
-    if value.is_empty()
-        || value.len() > 128
-        || value.contains("://")
-        || value.contains('?')
-        || value.contains('&')
-        || value.contains('=')
-        || value.starts_with('/')
-        || value.starts_with("~/")
-        || value.starts_with("./")
-        || value.starts_with("../")
-        || value.contains('\\')
-        || value.chars().any(char::is_control)
-    {
-        return false;
-    }
-    let lower = value.to_ascii_lowercase();
-    if lower.contains("token")
-        || lower.contains("secret")
-        || lower.contains("authorization")
-        || lower.contains("bearer")
-        || lower.contains("sk-")
-        || lower.contains("sk_")
-    {
-        return matches!(
-            value,
-            "--management-token-env"
-                | "client-tokens"
-                | "--client-token-ref"
-                | "<client-token-ref>"
-        );
-    }
-    value.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'<' | b'>')
-    })
-}
-
-fn is_safe_next_action_summary(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 240
-        && !value.contains("://")
-        && !value.contains('?')
-        && !value.contains('&')
-        && !value.contains('=')
-        && !value.chars().any(char::is_control)
-        && {
-            let lower = value.to_ascii_lowercase();
-            !lower.contains("token_hash")
-                && !lower.contains("raw_token")
-                && !lower.contains("secret")
-                && !lower.contains("authorization")
-                && !lower.contains("bearer")
-                && !lower.contains("sk-")
-                && !lower.contains("sk_")
-        }
 }
 
 fn is_safe_reason_code(value: &str) -> bool {
@@ -764,7 +694,15 @@ fn models_explain_reason(reason_code: &str) -> &'static str {
     }
 }
 
-fn models_explain_next_action(status: &str, preview: &Value, client_scope_status: &str) -> Value {
+fn models_explain_next_action(
+    status: &str,
+    preview: &Value,
+    client_scope_status: &str,
+    reason_code: &str,
+) -> Value {
+    if let Some(contract) = crate::diagnostic_contract::contract_for_reason(reason_code) {
+        return contract.next_action;
+    }
     let model = preview
         .get("model")
         .and_then(Value::as_str)
@@ -1201,11 +1139,15 @@ mod tests {
         assert_eq!(report["client_scope_status"], "model_not_in_client_scope");
         assert_eq!(report["reload_diff_status"], "unknown");
         assert_eq!(report["capability_status"], "unknown");
-        assert_eq!(report["next_action"]["repair_path"], "deferred_by_m1_m4");
-        assert_eq!(report["next_action"]["reload_status"], "available");
+        let contract =
+            crate::diagnostic_contract::contract_for_reason("model_not_in_client_scope").unwrap();
+        assert_eq!(report["blocking_domain"], contract.blocking_domain);
+        assert_eq!(report["next_action"], contract.next_action);
+        assert!(report["next_action"].get("repair_path").is_none());
+        assert!(report["next_action"].get("reload_status").is_none());
         assert_eq!(
             report["next_action"]["side_effect_class"],
-            "offline_readonly"
+            "runtime_readonly"
         );
         assert_eq!(report["candidates"][0]["credentials"]["total"], 2);
         let legacy_safe_field = ["safe", "command"].join("_");
@@ -1214,7 +1156,7 @@ mod tests {
         assert!(report["next_action"].get(&legacy_dry_run_field).is_none());
         assert_eq!(
             report["next_action"]["safe_argv"],
-            serde_json::json!(["one-ai-key", "check-config", "--config", "<config>"])
+            contract.next_action["safe_argv"]
         );
         assert!(!rendered.contains("SHOULD_NOT_RENDER_TOKEN_HASH"));
         assert!(!rendered.contains("token_hash"));
@@ -1541,6 +1483,61 @@ mod tests {
                 "<public-model>"
             ])
         );
+    }
+
+    #[test]
+    fn models_explain_endpoint_family_next_action_is_rebuilt_from_diagnostic_contract() {
+        let preview = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "explicit_model_route",
+            "registry_generation": 5,
+            "client_token": {"name": "local-client"},
+            "selected_target": {"channel_id": "preview-selected", "plan_position": 0},
+            "candidates": []
+        });
+        let availability = serde_json::json!({
+            "status": "unavailable",
+            "can_use": false,
+            "blocking_domain": "wrong_domain",
+            "reason_code": "no_route",
+            "endpoint_family": "chat_completions",
+            "model": "gpt-public",
+            "public_model": "gpt-public",
+            "client_token_ref": "local-client",
+            "route_kind": "no_route",
+            "registry_generation": 7,
+            "evidence": {
+                "route_target_count": 0,
+                "endpoint_family_target_count": 0,
+                "candidate_reason_codes": ["no_route"]
+            },
+            "next_step": {
+                "summary": "unsafe backend suggestion must not be copied",
+                "template_id": "keys_import",
+                "safe_argv": ["one-ai-key", "keys", "import", "--file", "/tmp/key.txt", "--yes"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            },
+            "next_action": "unsafe_backend_next_action"
+        });
+
+        let rendered = super::render_models_explain_report_with_management_projection(
+            &preview,
+            None,
+            Some(&availability),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        let contract = crate::diagnostic_contract::contract_for_reason("no_route")
+            .expect("stage 2 availability reason should have a diagnostic contract");
+
+        assert_eq!(report["blocking_domain"], contract.blocking_domain);
+        assert_eq!(report["next_action"], contract.next_action);
+        assert_eq!(report["availability"]["next_step"], contract.next_action);
+        assert!(!rendered.contains("keys"));
+        assert!(!rendered.contains("/tmp/key.txt"));
+        assert!(!rendered.contains("--yes"));
+        assert!(!rendered.contains("unsafe backend suggestion"));
     }
 
     #[test]
