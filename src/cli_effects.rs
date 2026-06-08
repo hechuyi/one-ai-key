@@ -73,7 +73,6 @@ pub fn classify_action(action: &CliAction) -> CommandEffect {
         CliAction::RouteExplain(_)
         | CliAction::ModelsList(_)
         | CliAction::ModelsExplain(_)
-        | CliAction::ModelsOnboardPlan(_)
         | CliAction::ReloadStatus(_)
         | CliAction::ClientTokensList(_) => CommandEffect {
             side_effect_class: SideEffectClass::RuntimeReadonly,
@@ -81,6 +80,17 @@ pub fn classify_action(action: &CliAction) -> CommandEffect {
                 reads_management_runtime: true,
                 ..EffectVector::default()
             },
+        },
+        CliAction::ModelsOnboardPlan(options) => match options.mode {
+            crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DryRun
+            | crate::cli_commands::models_onboard::ModelsOnboardPlanMode::ApplyDryRun
+            | crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DeferredToSeparatePlan => {
+                runtime_readonly_effect()
+            }
+            crate::cli_commands::models_onboard::ModelsOnboardPlanMode::NeedsConfirmation
+            | crate::cli_commands::models_onboard::ModelsOnboardPlanMode::Apply => {
+                crate::cli_commands::models_onboard::models_onboard_apply_management_effect()
+            }
         },
         CliAction::ReloadDiff(_) => runtime_readonly_effect(),
         CliAction::ReloadApply(options) => match options.mode {
@@ -339,6 +349,23 @@ pub fn confirmation_outcome(action: &CliAction, stdin_is_tty: bool) -> Confirmat
             ConfirmationOutcome::Denied {
                 exit_code: 3,
                 reason_code: "deferred_to_separate_plan",
+            }
+        }
+        CliAction::ModelsOnboardPlan(options)
+            if matches!(
+                options.mode,
+                crate::cli_commands::models_onboard::ModelsOnboardPlanMode::NeedsConfirmation
+            ) =>
+        {
+            if stdin_is_tty {
+                ConfirmationOutcome::PromptRequired {
+                    reason_code: "confirmation_required",
+                }
+            } else {
+                ConfirmationOutcome::Denied {
+                    exit_code: 3,
+                    reason_code: "confirmation_required",
+                }
             }
         }
         _ => ConfirmationOutcome::Allowed,
@@ -1141,6 +1168,7 @@ mod tests {
                 client_token_ref: None,
                 endpoint_family: None,
                 mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DryRun,
+                expected_staged_registry_version: None,
                 output: crate::cli_report::OutputFormat::Json,
             },
         );
@@ -1166,6 +1194,90 @@ mod tests {
     }
 
     #[test]
+    fn classifies_models_onboard_apply_dry_run_as_runtime_readonly() {
+        let action = CliAction::ModelsOnboardPlan(
+            crate::cli_commands::models_onboard::ModelsOnboardPlanOptions {
+                connection: crate::cli::OperatorConnectionOptions {
+                    management_url: Some("https://router.example".to_string()),
+                    deprecated_base_url: None,
+                    management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                    management_token_stdin: false,
+                    timeout_seconds: 10,
+                },
+                channel_id: "relay-a".to_string(),
+                public_model: "coding".to_string(),
+                upstream_model: Some("vendor/coding".to_string()),
+                client_token_ref: None,
+                endpoint_family: None,
+                mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::ApplyDryRun,
+                expected_staged_registry_version: Some(12),
+                output: crate::cli_report::OutputFormat::Json,
+            },
+        );
+
+        let effect = super::classify_action(&action);
+
+        assert_eq!(
+            effect.side_effect_class,
+            super::SideEffectClass::RuntimeReadonly
+        );
+        assert_eq!(
+            effect.effect_vector,
+            super::EffectVector {
+                reads_local_files: false,
+                reads_management_runtime: true,
+                reads_management_store: false,
+                writes_local_files: false,
+                writes_management_store: false,
+                calls_upstream: false,
+                mutates_runtime: false,
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_models_onboard_apply_as_management_write_without_runtime_mutation() {
+        let action = CliAction::ModelsOnboardPlan(
+            crate::cli_commands::models_onboard::ModelsOnboardPlanOptions {
+                connection: crate::cli::OperatorConnectionOptions {
+                    management_url: Some("https://router.example".to_string()),
+                    deprecated_base_url: None,
+                    management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                    management_token_stdin: false,
+                    timeout_seconds: 10,
+                },
+                channel_id: "relay-a".to_string(),
+                public_model: "coding".to_string(),
+                upstream_model: Some("vendor/coding".to_string()),
+                client_token_ref: None,
+                endpoint_family: None,
+                mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::Apply,
+                expected_staged_registry_version: Some(12),
+                output: crate::cli_report::OutputFormat::Json,
+            },
+        );
+
+        let effect = super::classify_action(&action);
+
+        assert_eq!(
+            effect.side_effect_class,
+            super::SideEffectClass::ManagementWrite
+        );
+        assert_eq!(
+            effect.effect_vector,
+            super::EffectVector {
+                reads_local_files: false,
+                reads_management_runtime: false,
+                reads_management_store: false,
+                writes_local_files: false,
+                writes_management_store: true,
+                calls_upstream: false,
+                mutates_runtime: false,
+            }
+        );
+    }
+
+    #[test]
     fn models_onboard_plan_live_variants_are_denied_before_http() {
         let action = CliAction::ModelsOnboardPlan(
             crate::cli_commands::models_onboard::ModelsOnboardPlanOptions {
@@ -1182,6 +1294,7 @@ mod tests {
                 client_token_ref: None,
                 endpoint_family: None,
                 mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DeferredToSeparatePlan,
+                expected_staged_registry_version: None,
                 output: crate::cli_report::OutputFormat::Json,
             },
         );
@@ -1191,6 +1304,37 @@ mod tests {
             super::ConfirmationOutcome::Denied {
                 exit_code: 3,
                 reason_code: "deferred_to_separate_plan"
+            }
+        );
+    }
+
+    #[test]
+    fn models_onboard_apply_without_yes_requires_confirmation_before_http() {
+        let action = CliAction::ModelsOnboardPlan(
+            crate::cli_commands::models_onboard::ModelsOnboardPlanOptions {
+                connection: crate::cli::OperatorConnectionOptions {
+                    management_url: Some("https://router.example".to_string()),
+                    deprecated_base_url: None,
+                    management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                    management_token_stdin: false,
+                    timeout_seconds: 10,
+                },
+                channel_id: "relay-a".to_string(),
+                public_model: "coding".to_string(),
+                upstream_model: Some("vendor/coding".to_string()),
+                client_token_ref: None,
+                endpoint_family: None,
+                mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::NeedsConfirmation,
+                expected_staged_registry_version: Some(12),
+                output: crate::cli_report::OutputFormat::Json,
+            },
+        );
+
+        assert_eq!(
+            super::confirmation_outcome(&action, false),
+            super::ConfirmationOutcome::Denied {
+                exit_code: 3,
+                reason_code: "confirmation_required"
             }
         );
     }

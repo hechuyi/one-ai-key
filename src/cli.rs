@@ -250,7 +250,7 @@ struct ModelsExplainArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    long_about = "Plan local model-route onboarding from read-only runtime projections. Side-effect class: runtime_readonly. Writes local files: no. Calls upstreams: no. Mutates management state or active runtime: no. Only --dry-run is implemented in M1-M4."
+    long_about = "Plan local model-route onboarding from read-only runtime projections. Side-effect class: runtime_readonly unless confirmed --apply. Writes local files: no. Calls upstreams: no. Confirmed --apply writes only the staged registry and does not reload active runtime."
 )]
 struct ModelsOnboardPlanArgs {
     #[arg(long)]
@@ -263,7 +263,7 @@ struct ModelsOnboardPlanArgs {
     client_token_ref: Option<String>,
     #[arg(long = "endpoint-family")]
     endpoint_family: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "yes")]
     dry_run: bool,
     #[arg(long)]
     discover: bool,
@@ -273,6 +273,8 @@ struct ModelsOnboardPlanArgs {
     sync_apply: bool,
     #[arg(long)]
     apply: bool,
+    #[arg(long, requires = "apply")]
+    expected_staged_registry_version: Option<u64>,
     #[arg(long)]
     reload: bool,
     #[arg(long = "reload-apply")]
@@ -596,19 +598,25 @@ where
                 upstream_model: args.upstream_model,
                 client_token_ref: args.client_token_ref,
                 endpoint_family: args.endpoint_family,
-                mode: if args.dry_run
-                    && !args.discover
-                    && !args.sync_plan
-                    && !args.sync_apply
-                    && !args.apply
-                    && !args.reload
-                    && !args.reload_apply
-                    && !args.yes
+                mode: if args.discover
+                    || args.sync_plan
+                    || args.sync_apply
+                    || args.reload
+                    || args.reload_apply
                 {
+                    crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DeferredToSeparatePlan
+                } else if args.apply && args.dry_run {
+                    crate::cli_commands::models_onboard::ModelsOnboardPlanMode::ApplyDryRun
+                } else if args.apply && args.yes {
+                    crate::cli_commands::models_onboard::ModelsOnboardPlanMode::Apply
+                } else if args.apply {
+                    crate::cli_commands::models_onboard::ModelsOnboardPlanMode::NeedsConfirmation
+                } else if args.dry_run && !args.yes {
                     crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DryRun
                 } else {
                     crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DeferredToSeparatePlan
                 },
+                expected_staged_registry_version: args.expected_staged_registry_version,
                 output: args.output,
             },
         ),
@@ -1250,6 +1258,7 @@ mod tests {
                     client_token_ref: None,
                     endpoint_family: None,
                     mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DryRun,
+                    expected_staged_registry_version: None,
                     output: crate::cli_report::OutputFormat::Json,
                 }
             )
@@ -1297,10 +1306,117 @@ mod tests {
                     client_token_ref: Some("operator-client".to_string()),
                     endpoint_family: Some("chat_completions".to_string()),
                     mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DryRun,
+                    expected_staged_registry_version: None,
                     output: crate::cli_report::OutputFormat::Table,
                 }
             )
         );
+    }
+
+    #[test]
+    fn models_onboard_plan_parse_accepts_apply_precondition_and_yes() {
+        let action = parse_action_from([
+            "one-ai-key",
+            "--management-url",
+            "https://router.example",
+            "--management-token-env",
+            "ONE_AI_KEY_MANAGEMENT_TOKEN",
+            "models",
+            "onboard-plan",
+            "--channel",
+            "relay-a",
+            "--public-model",
+            "coding",
+            "--upstream-model",
+            "vendor/coding",
+            "--apply",
+            "--expected-staged-registry-version",
+            "12",
+            "--yes",
+            "--output",
+            "json",
+        ])
+        .expect("models onboard-plan confirmed apply should parse");
+
+        assert_eq!(
+            action,
+            CliAction::ModelsOnboardPlan(
+                crate::cli_commands::models_onboard::ModelsOnboardPlanOptions {
+                    connection: OperatorConnectionOptions {
+                        management_url: Some("https://router.example".to_string()),
+                        deprecated_base_url: None,
+                        management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                        management_token_stdin: false,
+                        timeout_seconds: 10,
+                    },
+                    channel_id: "relay-a".to_string(),
+                    public_model: "coding".to_string(),
+                    upstream_model: Some("vendor/coding".to_string()),
+                    client_token_ref: None,
+                    endpoint_family: None,
+                    mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::Apply,
+                    expected_staged_registry_version: Some(12),
+                    output: crate::cli_report::OutputFormat::Json,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn models_onboard_plan_parse_apply_without_yes_needs_confirmation() {
+        let action = parse_action_from([
+            "one-ai-key",
+            "models",
+            "onboard-plan",
+            "--channel",
+            "relay-a",
+            "--public-model",
+            "coding",
+            "--apply",
+            "--expected-staged-registry-version",
+            "12",
+        ])
+        .expect("models onboard-plan apply without yes should parse before confirmation policy");
+
+        assert!(matches!(
+            action,
+            CliAction::ModelsOnboardPlan(
+                crate::cli_commands::models_onboard::ModelsOnboardPlanOptions {
+                    mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::NeedsConfirmation,
+                    expected_staged_registry_version: Some(12),
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn models_onboard_plan_parse_apply_dry_run_is_readonly_apply_preview() {
+        let action = parse_action_from([
+            "one-ai-key",
+            "models",
+            "onboard-plan",
+            "--channel",
+            "relay-a",
+            "--public-model",
+            "coding",
+            "--upstream-model",
+            "vendor/coding",
+            "--apply",
+            "--dry-run",
+        ])
+        .expect("models onboard-plan apply dry-run should parse");
+
+        assert!(matches!(
+            action,
+            CliAction::ModelsOnboardPlan(
+                crate::cli_commands::models_onboard::ModelsOnboardPlanOptions {
+                    mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::ApplyDryRun,
+                    expected_staged_registry_version: None,
+                    ..
+                }
+            )
+        ));
     }
 
     #[test]
@@ -1309,7 +1425,6 @@ mod tests {
             "--discover",
             "--sync-plan",
             "--sync-apply",
-            "--apply",
             "--reload",
             "--reload-apply",
             "--yes",
@@ -1352,7 +1467,7 @@ mod tests {
         assert!(help.contains("Side-effect class: runtime_readonly"));
         assert!(help.contains("Writes local files: no"));
         assert!(help.contains("Calls upstreams: no"));
-        assert!(help.contains("Only --dry-run is implemented in M1-M4"));
+        assert!(help.contains("Confirmed --apply writes only the staged registry"));
     }
 
     #[test]
