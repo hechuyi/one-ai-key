@@ -192,7 +192,7 @@ pub fn tail_endpoint_sequence(
     routing_buffered_events: usize,
     response_filter_buffered_events: usize,
 ) -> Vec<crate::operator_client::ReadOnlyEndpoint> {
-    let effective_last = last.unwrap_or(DEFAULT_LAST).min(MAX_LAST).max(1);
+    let effective_last = last.unwrap_or(DEFAULT_LAST).clamp(1, MAX_LAST);
     vec![
         crate::operator_client::ReadOnlyEndpoint::RoutingTelemetry {
             offset: Some(0),
@@ -392,24 +392,6 @@ fn request_explanation(failures: &[Value]) -> Value {
             "final_outcome": "not_found_in_window",
         });
     };
-    let final_outcome = match primary
-        .get("client_visible_status")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-    {
-        "not_applicable_retry_before_output" => "recovered_before_client_output",
-        "not_applicable" => "management_or_lifecycle_event",
-        "local_400"
-        | "local_401"
-        | "local_404"
-        | "local_429"
-        | "local_502"
-        | "local_503"
-        | "upstream_4xx"
-        | "upstream_5xx"
-        | "stream_committed_failure" => "client_visible_failure",
-        _ => "unknown",
-    };
     serde_json::json!({
         "stage": taxonomy_string(primary, "stage", "unknown"),
         "public_model": taxonomy_string(primary, "public_model", "unknown"),
@@ -420,7 +402,7 @@ fn request_explanation(failures: &[Value]) -> Value {
         "retry_eligibility": taxonomy_string(primary, "retry_eligibility", "not_applicable"),
         "retry_blocked_reason": primary.get("retry_blocked_reason").cloned().unwrap_or(Value::Null),
         "client_visible_status": taxonomy_string(primary, "client_visible_status", "unknown"),
-        "final_outcome": final_outcome,
+        "final_outcome": taxonomy_string(primary, "final_outcome", "unknown"),
     })
 }
 
@@ -497,424 +479,116 @@ fn filtered_failures(
     filters: &FailureFilters,
 ) -> Vec<Value> {
     routing
-        .get("events")
+        .get("failure_events")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(classify_routing_event)
+        .filter_map(projected_failure_event)
         .filter(|failure| matches_filters(failure, filters))
         .take(window.routing_limit)
         .chain(
             response_filter
-                .get("events")
+                .get("failure_events")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(classify_response_filter_event)
+                .filter_map(projected_failure_event)
                 .filter(|failure| matches_filters(failure, filters))
                 .take(window.response_filter_limit),
         )
         .collect::<Vec<_>>()
 }
 
-fn classify_routing_event(event: &Value) -> Option<Value> {
-    let kind = event
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    match kind {
-        "upstream_failure_observed" => Some(classify_upstream_failure(event)),
-        "channel_health_transition_applied" => Some(classify_channel_transition(event)),
-        "credential_transition_applied" | "credential_lifecycle_persistence_dropped" => {
-            Some(classify_credential_transition(event))
-        }
-        "no_route_candidate" | "route_rejected" => Some(classify_route_planning_failure(event)),
-        "model_not_visible" | "client_scope_miss" => Some(classify_model_visibility_failure(event)),
-        _ => None,
-    }
-}
-
-fn classify_upstream_failure(event: &Value) -> Value {
-    let failure = event.get("failure").unwrap_or(&Value::Null);
-    let failure_kind = failure
-        .get("failure_kind")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let status = failure.get("status").and_then(Value::as_u64);
-    let directive = safe_directive(failure.get("directive")).unwrap_or("return_error");
-    let retry_decision_reason = failure
-        .get("retry_decision_reason")
-        .or_else(|| failure.get("denial_reason"))
-        .and_then(Value::as_str);
-    let retry_eligibility = retry_eligibility(failure, directive, retry_decision_reason);
-    let failure_class = upstream_failure_class(failure_kind, status);
-    let reason_code = reason_code_for_class(failure_class);
-    let contract = diagnostic_contract_for(reason_code);
-    let stage = upstream_stage(failure.get("failure_source").and_then(Value::as_str));
-    let router_action = router_action_for_directive(directive);
-    let request_id = safe_local_id(event.get("request_id"));
-    let public_model = safe_local_id(failure.get("public_model"));
-    let channel_id = safe_local_id(event.get("channel_id"));
-    let client_token_ref = safe_local_id(event.get("client_token_ref"));
-    serde_json::json!({
-        "source": "routing_telemetry",
-        "event_kind": "upstream_failure_observed",
-        "request_id": nullable_string(request_id.as_deref()),
-        "stage": stage,
-        "public_model": public_model.clone().unwrap_or_else(|| "unknown".to_string()),
-        "client_token_ref": nullable_string(client_token_ref.as_deref()),
-        "selected_target": sanitize_selected_target(channel_id.as_deref()),
-        "channel_id": nullable_string(channel_id.as_deref()),
-        "failure_class": failure_class,
-        "router_action": router_action,
-        "retry_eligibility": retry_eligibility,
-        "retry_blocked_reason": retry_blocked_reason(&retry_eligibility, retry_decision_reason),
-        "client_visible_status": client_visible_status(status, directive, &retry_eligibility),
-        "reason_code": reason_code,
-        "blocking_domain": contract.blocking_domain,
-        "directive": directive,
-        "attempt": failure.get("attempt").and_then(Value::as_u64),
-        "next_action": contract.next_action,
-    })
-}
-
-fn classify_channel_transition(event: &Value) -> Value {
-    let state = event
-        .get("state")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let failure_class = if state == "cooling_down" || state == "degraded" {
-        "credential_unavailable"
-    } else {
-        "unknown"
-    };
-    let request_id = safe_local_id(event.get("request_id"));
-    let channel_id = safe_local_id(event.get("channel_id"));
-    let client_token_ref = safe_local_id(event.get("client_token_ref"));
-    let reason_code = stable_reason(
-        event.get("reason").and_then(Value::as_str),
-        "channel_degraded",
-    );
-    let contract = diagnostic_contract_for(reason_code);
-    serde_json::json!({
-        "source": "routing_telemetry",
-        "event_kind": "channel_health_transition_applied",
-        "request_id": nullable_string(request_id.as_deref()),
-        "stage": "credential_selection",
-        "public_model": safe_local_id(event.get("public_model")).unwrap_or_else(|| "unknown".to_string()),
-        "client_token_ref": nullable_string(client_token_ref.as_deref()),
-        "selected_target": sanitize_selected_target(channel_id.as_deref()),
-        "channel_id": nullable_string(channel_id.as_deref()),
-        "failure_class": failure_class,
-        "router_action": "marked_channel",
-        "retry_eligibility": "not_applicable",
-        "retry_blocked_reason": Value::Null,
-        "client_visible_status": "not_applicable",
-        "reason_code": reason_code,
-        "blocking_domain": contract.blocking_domain,
-        "directive": Value::Null,
-        "next_action": contract.next_action,
-    })
-}
-
-fn classify_credential_transition(event: &Value) -> Value {
-    let request_id = safe_local_id(event.get("request_id"));
-    let channel_id = safe_local_id(event.get("channel_id"));
-    let client_token_ref = safe_local_id(event.get("client_token_ref"));
-    let reason_code = stable_reason(
-        event.get("reason").and_then(Value::as_str),
-        "credential_unavailable",
-    );
-    let contract = diagnostic_contract_for(reason_code);
-    serde_json::json!({
-        "source": "routing_telemetry",
-        "event_kind": credential_event_kind(event.get("kind").and_then(Value::as_str)),
-        "request_id": nullable_string(request_id.as_deref()),
-        "stage": "credential_selection",
-        "public_model": safe_local_id(event.get("public_model")).unwrap_or_else(|| "unknown".to_string()),
-        "client_token_ref": nullable_string(client_token_ref.as_deref()),
-        "selected_target": sanitize_selected_target(channel_id.as_deref()),
-        "channel_id": nullable_string(channel_id.as_deref()),
-        "failure_class": "credential_unavailable",
-        "router_action": "marked_credential",
-        "retry_eligibility": "not_applicable",
-        "retry_blocked_reason": Value::Null,
-        "client_visible_status": "not_applicable",
-        "reason_code": reason_code,
-        "blocking_domain": contract.blocking_domain,
-        "directive": Value::Null,
-        "next_action": contract.next_action,
-    })
-}
-
-fn classify_route_planning_failure(event: &Value) -> Value {
-    let request_id = safe_local_id(event.get("request_id"));
-    let public_model = safe_local_id(event.get("public_model"));
-    let channel_id = safe_local_id(event.get("channel_id"));
-    let client_token_ref = safe_local_id(event.get("client_token_ref"));
-    let contract = diagnostic_contract_for("no_route_candidate");
-    serde_json::json!({
-        "source": "routing_telemetry",
-        "event_kind": route_event_kind(event.get("kind").and_then(Value::as_str)),
-        "request_id": nullable_string(request_id.as_deref()),
-        "stage": "route_planning",
-        "public_model": public_model.clone().unwrap_or_else(|| "unknown".to_string()),
-        "client_token_ref": nullable_string(client_token_ref.as_deref()),
-        "selected_target": Value::Null,
-        "channel_id": nullable_string(channel_id.as_deref()),
-        "failure_class": "no_route_candidate",
-        "router_action": "returned_local_error",
-        "retry_eligibility": "not_applicable",
-        "retry_blocked_reason": Value::Null,
-        "client_visible_status": safe_status(event.get("client_visible_status")).unwrap_or("local_404"),
-        "reason_code": "no_route_candidate",
-        "blocking_domain": contract.blocking_domain,
-        "directive": Value::Null,
-        "next_action": contract.next_action,
-    })
-}
-
-fn classify_model_visibility_failure(event: &Value) -> Value {
-    let request_id = safe_local_id(event.get("request_id"));
-    let public_model = safe_local_id(event.get("public_model"));
-    let channel_id = safe_local_id(event.get("channel_id"));
-    let client_token_ref = safe_local_id(event.get("client_token_ref"));
-    let contract = diagnostic_contract_for("model_not_in_client_scope");
-    serde_json::json!({
-        "source": "routing_telemetry",
-        "event_kind": visibility_event_kind(event.get("kind").and_then(Value::as_str)),
-        "request_id": nullable_string(request_id.as_deref()),
-        "stage": "model_visibility",
-        "public_model": public_model.clone().unwrap_or_else(|| "unknown".to_string()),
-        "client_token_ref": nullable_string(client_token_ref.as_deref()),
-        "selected_target": Value::Null,
-        "channel_id": nullable_string(channel_id.as_deref()),
-        "failure_class": "model_not_visible",
-        "router_action": "returned_local_error",
-        "retry_eligibility": "not_applicable",
-        "retry_blocked_reason": Value::Null,
-        "client_visible_status": safe_status(event.get("client_visible_status")).unwrap_or("local_404"),
-        "reason_code": "model_not_in_client_scope",
-        "blocking_domain": contract.blocking_domain,
-        "directive": Value::Null,
-        "next_action": contract.next_action,
-    })
-}
-
-fn classify_response_filter_event(event: &Value) -> Option<Value> {
-    if event.get("outcome").and_then(Value::as_str) != Some("rejected") {
+fn projected_failure_event(event: &Value) -> Option<Value> {
+    if !event.is_object() {
         return None;
     }
-    let body_committed = event
-        .get("body_committed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let action = safe_directive(event.get("action")).unwrap_or("reject");
-    let request_id = safe_local_id(event.get("request_id"));
-    let public_model = safe_local_id(event.get("public_model"));
-    let channel_id = safe_local_id(event.get("channel_id"));
-    let client_token_ref = safe_local_id(event.get("client_token_ref"));
-    let reason_code = stable_reason(
-        event.get("reason_code").and_then(Value::as_str),
-        if body_committed {
-            "stream_committed_failure"
-        } else {
-            "response_filter_rejected"
-        },
-    );
-    let contract = diagnostic_contract_for(reason_code);
     Some(serde_json::json!({
-        "source": "response_filter_events",
-        "event_kind": "response_filter_rejected",
-        "request_id": nullable_string(request_id.as_deref()),
-        "stage": if body_committed { "post_output" } else { "response_filter" },
-        "public_model": public_model.clone().unwrap_or_else(|| "unknown".to_string()),
-        "client_token_ref": nullable_string(client_token_ref.as_deref()),
-        "selected_target": sanitize_selected_target(channel_id.as_deref()),
-        "channel_id": nullable_string(channel_id.as_deref()),
-        "failure_class": if body_committed { "stream_committed_failure" } else { "response_filter_rejected" },
-        "router_action": response_filter_router_action(action),
-        "retry_eligibility": if body_committed { "blocked_streaming" } else { "eligible_before_output" },
-        "retry_blocked_reason": if body_committed { Value::from("partial_output_started") } else { Value::Null },
-        "client_visible_status": if body_committed { "stream_committed_failure" } else { "local_502" },
-        "reason_code": reason_code,
-        "blocking_domain": contract.blocking_domain,
-        "directive": action,
-        "content_kind": safe_status(event.get("content_kind")).unwrap_or("unknown"),
-        "next_action": contract.next_action,
+        "source": projected_string(event, "source", "unknown"),
+        "event_kind": projected_string(event, "event_kind", "unknown"),
+        "request_id": projected_nullable_string(event, "request_id"),
+        "stage": projected_string(event, "stage", "unknown"),
+        "public_model": projected_string(event, "public_model", "unknown"),
+        "client_token_ref": projected_nullable_string(event, "client_token_ref"),
+        "selected_target": projected_selected_target(event.get("selected_target")),
+        "channel_id": projected_nullable_string(event, "channel_id"),
+        "failure_class": projected_string(event, "failure_class", "unknown"),
+        "router_action": projected_string(event, "router_action", "none"),
+        "retry_eligibility": projected_string(event, "retry_eligibility", "not_applicable"),
+        "retry_blocked_reason": projected_nullable_string(event, "retry_blocked_reason"),
+        "client_visible_status": projected_string(event, "client_visible_status", "unknown"),
+        "final_outcome": projected_string(event, "final_outcome", "unknown"),
+        "reason_code": projected_string(event, "reason_code", "unknown_failure_class"),
+        "blocking_domain": projected_string(event, "blocking_domain", "unknown"),
+        "directive": projected_nullable_string(event, "directive"),
+        "attempt": event.get("attempt").and_then(Value::as_u64),
+        "content_kind": projected_nullable_string(event, "content_kind"),
+        "next_action": projected_next_action(event.get("next_action")),
     }))
 }
 
-fn upstream_stage(failure_source: Option<&str>) -> &'static str {
-    match failure_source.unwrap_or_default() {
-        "response_filter_precommit" => "response_filter",
-        "guarded_success_envelope" | "upstream_response_guard" => "upstream_response_guard",
-        "upstream_transaction" | "upstream_transport" => "upstream_transport",
-        _ => "upstream_transport",
-    }
+fn projected_string(event: &Value, field: &str, fallback: &'static str) -> String {
+    event
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(sanitize_local_string)
+        .unwrap_or_else(|| fallback.to_string())
 }
 
-fn upstream_failure_class(failure_kind: &str, status: Option<u64>) -> &'static str {
-    if matches!(status, Some(500..=599)) {
-        return "upstream_5xx";
-    }
-    match failure_kind {
-        "timeout" | "transport_timeout" => "upstream_timeout",
-        "response_filter_rejected" => "response_filter_rejected",
-        "auth_invalid"
-        | "quota_exhausted"
-        | "key_switch_cooldown"
-        | "relay_balance_unavailable" => "credential_unavailable",
-        "provider_unavailable" => "upstream_5xx",
-        _ => "unknown",
-    }
-}
-
-fn router_action_for_directive(directive: &str) -> &'static str {
-    match directive {
-        "retry" | "retry_credential" | "retry_same_target" => "retried_before_output",
-        "fallback" | "retry_route_target" => "fell_back_before_output",
-        "mark_credential" => "marked_credential",
-        "mark_channel" => "marked_channel",
-        "record_event_only" => "recorded_event_only",
-        _ => "returned_local_error",
-    }
-}
-
-fn retry_eligibility(
-    failure: &Value,
-    directive: &str,
-    retry_decision_reason: Option<&str>,
-) -> String {
-    if let Some(reason) = retry_decision_reason.and_then(stable_retry_blocked_reason) {
-        return format!("blocked_{reason}");
-    }
-    if failure
-        .get("bytes_sent_to_client")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return "blocked_bytes_sent".to_string();
-    }
-    if failure
-        .get("streaming")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && directive != "retry"
-    {
-        return "blocked_streaming".to_string();
-    }
-    if retry_directive_is_pre_output_continuation(directive) {
-        "eligible_before_output".to_string()
-    } else {
-        "not_applicable".to_string()
-    }
-}
-
-fn retry_blocked_reason(retry_eligibility: &str, retry_decision_reason: Option<&str>) -> Value {
-    if !retry_eligibility.starts_with("blocked_") {
-        return Value::Null;
-    }
-    retry_decision_reason
-        .and_then(stable_retry_blocked_reason)
+fn projected_nullable_string(event: &Value, field: &str) -> Value {
+    event
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(sanitize_local_string)
         .map(Value::from)
-        .unwrap_or_else(|| Value::from(retry_eligibility.trim_start_matches("blocked_")))
+        .unwrap_or(Value::Null)
 }
 
-fn stable_retry_blocked_reason(value: &str) -> Option<&'static str> {
-    match value {
-        "streaming" | "blocked_streaming" => Some("streaming"),
-        "bytes_sent" | "blocked_bytes_sent" => Some("bytes_sent"),
-        "policy" | "blocked_policy" => Some("policy"),
-        "duplicate_charge_risk" | "blocked_duplicate_charge_risk" => Some("duplicate_charge_risk"),
-        _ => None,
-    }
-}
-
-fn client_visible_status(status: Option<u64>, directive: &str, retry_eligibility: &str) -> String {
-    if retry_eligibility == "eligible_before_output" {
-        return "not_applicable_retry_before_output".to_string();
-    }
-    match status {
-        Some(400..=499) => "upstream_4xx".to_string(),
-        Some(500..=599) => "upstream_5xx".to_string(),
-        Some(value) => format!("upstream_status_{value}"),
-        None if directive == "retry" => "not_applicable_retry_before_output".to_string(),
-        None => "unknown".to_string(),
-    }
-}
-
-fn retry_directive_is_pre_output_continuation(directive: &str) -> bool {
-    matches!(
-        directive,
-        "retry" | "fallback" | "retry_credential" | "retry_route_target" | "retry_same_target"
-    )
-}
-
-fn reason_code_for_class(failure_class: &str) -> &'static str {
-    match failure_class {
-        "credential_unavailable" => "credential_unavailable",
-        "upstream_5xx" => "upstream_5xx",
-        "upstream_timeout" => "upstream_timeout",
-        "response_filter_rejected" => "response_filter_rejected",
-        _ => "unknown_failure_class",
-    }
-}
-
-fn stable_reason(value: Option<&str>, fallback: &'static str) -> &'static str {
-    match value.unwrap_or_default() {
-        "channel_degraded" => "channel_degraded",
-        "channel_cooling_down" => "channel_cooling_down",
-        "credential_unavailable" => "credential_unavailable",
-        "credential_cooling_down" => "credential_unavailable",
-        "credential_quota_exhausted" => "credential_unavailable",
-        "response_filter_rejected" => "response_filter_rejected",
-        "stream_committed_failure" => "stream_committed_failure",
-        "model_not_in_client_scope" => "model_not_in_client_scope",
-        "no_route_candidate" => "no_route_candidate",
-        "upstream_5xx" => "upstream_5xx",
-        "upstream_timeout" => "upstream_timeout",
-        _ => fallback,
-    }
-}
-
-fn response_filter_router_action(action: &str) -> &'static str {
-    match action {
-        "reject_and_expire_credential" => "marked_credential",
-        "reject_and_cooldown_channel" => "marked_channel",
-        "reject_and_disable_channel" => "marked_channel",
-        _ => "recorded_event_only",
-    }
-}
-
-fn credential_event_kind(kind: Option<&str>) -> &'static str {
-    match kind {
-        Some("credential_lifecycle_persistence_dropped") => {
-            "credential_lifecycle_persistence_dropped"
-        }
-        _ => "credential_transition_applied",
-    }
-}
-
-fn route_event_kind(kind: Option<&str>) -> &'static str {
-    match kind {
-        Some("route_rejected") => "route_rejected",
-        _ => "no_route_candidate",
-    }
-}
-
-fn visibility_event_kind(kind: Option<&str>) -> &'static str {
-    match kind {
-        Some("client_scope_miss") => "client_scope_miss",
-        _ => "model_not_visible",
-    }
-}
-
-fn sanitize_selected_target(channel_id: Option<&str>) -> Value {
-    channel_id
+fn projected_selected_target(value: Option<&Value>) -> Value {
+    value
+        .and_then(|target| target.get("channel_id"))
+        .and_then(Value::as_str)
         .and_then(sanitize_local_string)
         .map(|channel_id| serde_json::json!({ "channel_id": channel_id }))
         .unwrap_or(Value::Null)
+}
+
+fn projected_next_action(value: Option<&Value>) -> Value {
+    value
+        .filter(|next_action| safe_next_action_shape(next_action))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn safe_next_action_shape(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    for field in ["summary", "template_id", "side_effect_class"] {
+        if object
+            .get(field)
+            .and_then(Value::as_str)
+            .and_then(sanitize_local_text)
+            .is_none()
+        {
+            return false;
+        }
+    }
+    if object
+        .get("requires_confirmation")
+        .and_then(Value::as_bool)
+        .is_none()
+    {
+        return false;
+    }
+    object
+        .get("safe_argv")
+        .and_then(Value::as_array)
+        .is_some_and(|argv| argv.iter().all(safe_next_action_arg))
+}
+
+fn safe_next_action_arg(value: &Value) -> bool {
+    value.as_str().and_then(sanitize_local_text).is_some()
 }
 
 fn diagnostic_contract_for(reason_code: &str) -> crate::diagnostic_contract::DiagnosticContract {
@@ -925,6 +599,7 @@ fn diagnostic_contract_for(reason_code: &str) -> crate::diagnostic_contract::Dia
 fn aggregate_next_action(failures: &[Value]) -> Value {
     primary_failure(failures)
         .and_then(|failure| failure.get("next_action"))
+        .filter(|next_action| safe_next_action_shape(next_action))
         .cloned()
         .unwrap_or_else(|| diagnostic_contract_for("no_failures_in_window").next_action)
 }
@@ -933,9 +608,8 @@ fn primary_reason_code(failures: &[Value]) -> String {
     primary_failure(failures)
         .and_then(|failure| failure.get("reason_code"))
         .and_then(Value::as_str)
-        .map(|value| stable_reason(Some(value), "failures_found_in_window"))
-        .unwrap_or("failures_found_in_window")
-        .to_string()
+        .and_then(sanitize_local_string)
+        .unwrap_or_else(|| "failures_found_in_window".to_string())
 }
 
 fn matches_filters(failure: &Value, filters: &FailureFilters) -> bool {
@@ -973,16 +647,6 @@ fn filters_metadata(filters: &FailureFilters) -> Value {
     })
 }
 
-fn nullable_string(value: Option<&str>) -> Value {
-    value.map(Value::from).unwrap_or(Value::Null)
-}
-
-fn safe_local_id(value: Option<&Value>) -> Option<String> {
-    value
-        .and_then(Value::as_str)
-        .and_then(sanitize_local_string)
-}
-
 fn sanitize_local_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.len() > 128 {
@@ -1007,40 +671,28 @@ fn sanitize_local_string(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn safe_directive(value: Option<&Value>) -> Option<&'static str> {
-    match value.and_then(Value::as_str).unwrap_or_default() {
-        "retry" => Some("retry"),
-        "fallback" => Some("fallback"),
-        "retry_credential" => Some("retry_credential"),
-        "retry_route_target" => Some("retry_route_target"),
-        "retry_same_target" => Some("retry_same_target"),
-        "return_error" => Some("return_error"),
-        "mark_credential" => Some("mark_credential"),
-        "mark_channel" => Some("mark_channel"),
-        "record_event_only" => Some("record_event_only"),
-        "reject" => Some("reject"),
-        "reject_and_expire_credential" => Some("reject_and_expire_credential"),
-        "reject_and_cooldown_channel" => Some("reject_and_cooldown_channel"),
-        "reject_and_disable_channel" => Some("reject_and_disable_channel"),
-        _ => None,
+fn sanitize_local_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 256 {
+        return None;
     }
-}
-
-fn safe_status(value: Option<&Value>) -> Option<&'static str> {
-    match value.and_then(Value::as_str).unwrap_or_default() {
-        "local_400" => Some("local_400"),
-        "local_401" => Some("local_401"),
-        "local_404" => Some("local_404"),
-        "local_429" => Some("local_429"),
-        "local_502" => Some("local_502"),
-        "local_503" => Some("local_503"),
-        "upstream_4xx" => Some("upstream_4xx"),
-        "upstream_5xx" => Some("upstream_5xx"),
-        "stream_committed_failure" => Some("stream_committed_failure"),
-        "text" => Some("text"),
-        "json" => Some("json"),
-        _ => None,
+    if !trimmed
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+    {
+        return None;
     }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("sk-")
+        || lower.contains("://")
+        || lower.contains("http")
+        || lower.contains("telegram")
+        || lower.contains("promo")
+        || lower.contains("invite")
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 pub fn render_failure_report(report: &Value, output: crate::cli_report::OutputFormat) -> String {
@@ -1203,6 +855,51 @@ fn table_str(value: Option<&Value>) -> String {
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
+    fn projected_failure(
+        source: &str,
+        event_kind: &str,
+        request_id: &str,
+        stage: &str,
+        public_model: &str,
+        channel_id: Option<&str>,
+        failure_class: &str,
+        router_action: &str,
+        retry_eligibility: &str,
+        retry_blocked_reason: Option<&str>,
+        client_visible_status: &str,
+        final_outcome: &str,
+        reason_code: &str,
+        directive: Option<&str>,
+        attempt: Option<u64>,
+    ) -> Value {
+        let contract = crate::diagnostic_contract::contract_for_reason(reason_code)
+            .unwrap_or_else(crate::diagnostic_contract::fallback_contract);
+        serde_json::json!({
+            "source": source,
+            "event_kind": event_kind,
+            "request_id": request_id,
+            "stage": stage,
+            "public_model": public_model,
+            "client_token_ref": Value::Null,
+            "selected_target": channel_id
+                .map(|channel_id| serde_json::json!({ "channel_id": channel_id }))
+                .unwrap_or(Value::Null),
+            "channel_id": channel_id,
+            "failure_class": failure_class,
+            "router_action": router_action,
+            "retry_eligibility": retry_eligibility,
+            "retry_blocked_reason": retry_blocked_reason,
+            "client_visible_status": client_visible_status,
+            "final_outcome": final_outcome,
+            "reason_code": reason_code,
+            "blocking_domain": contract.blocking_domain,
+            "directive": directive,
+            "attempt": attempt,
+            "next_action": contract.next_action,
+        })
+    }
+
     fn routing_fixture() -> Value {
         serde_json::json!({
             "buffered_events": 6,
@@ -1210,56 +907,15 @@ mod tests {
             "dropped_events": 2,
             "offset": 0,
             "limit": 50,
-            "events": [
-                {
-                    "kind": "client_scope_miss",
-                    "request_id": "req_scope",
-                    "public_model": "gpt-example",
-                    "client_visible_status": "local_404"
-                },
-                {
-                    "kind": "no_route_candidate",
-                    "request_id": "req_no_route",
-                    "public_model": "gpt-missing",
-                    "client_visible_status": "local_404"
-                },
-                {
-                    "kind": "channel_health_transition_applied",
-                    "request_id": "req_cooldown",
-                    "channel_id": "relay-a",
-                    "state": "cooling_down",
-                    "reason": "channel_cooling_down"
-                },
-                {
-                    "kind": "credential_transition_applied",
-                    "request_id": "req_credential",
-                    "channel_id": "relay-a",
-                    "reason": "credential_quota_exhausted"
-                },
-                {
-                    "kind": "upstream_failure_observed",
-                    "request_id": "req_5xx",
-                    "channel_id": "relay-b",
-                    "failure": {
-                        "failure_kind": "provider_unavailable",
-                        "failure_source": "upstream_transport",
-                        "status": 503,
-                        "directive": "return_error",
-                        "public_model": "gpt-example"
-                    }
-                },
-                {
-                    "kind": "upstream_failure_observed",
-                    "request_id": "req_timeout",
-                    "channel_id": "relay-b",
-                    "failure": {
-                        "failure_kind": "timeout",
-                        "failure_source": "upstream_transport",
-                        "directive": "retry",
-                        "public_model": "gpt-example"
-                    }
-                }
-            ]
+            "failure_events": [
+                projected_failure("routing_telemetry", "client_scope_miss", "req_scope", "model_visibility", "gpt-example", None, "model_not_visible", "returned_local_error", "not_applicable", None, "local_404", "client_visible_failure", "model_not_in_client_scope", None, None),
+                projected_failure("routing_telemetry", "no_route_candidate", "req_no_route", "route_planning", "gpt-missing", None, "no_route_candidate", "returned_local_error", "not_applicable", None, "local_404", "client_visible_failure", "no_route_candidate", None, None),
+                projected_failure("routing_telemetry", "channel_health_transition_applied", "req_cooldown", "credential_selection", "unknown", Some("relay-a"), "credential_unavailable", "marked_channel", "not_applicable", None, "not_applicable", "management_or_lifecycle_event", "channel_cooling_down", None, None),
+                projected_failure("routing_telemetry", "credential_transition_applied", "req_credential", "credential_selection", "unknown", Some("relay-a"), "credential_unavailable", "marked_credential", "not_applicable", None, "not_applicable", "management_or_lifecycle_event", "credential_unavailable", None, None),
+                projected_failure("routing_telemetry", "upstream_failure_observed", "req_5xx", "upstream_transport", "gpt-example", Some("relay-b"), "upstream_5xx", "returned_local_error", "not_applicable", None, "upstream_5xx", "client_visible_failure", "upstream_5xx", Some("return_error"), Some(0)),
+                projected_failure("routing_telemetry", "upstream_failure_observed", "req_timeout", "upstream_transport", "gpt-example", Some("relay-b"), "upstream_timeout", "retried_before_output", "eligible_before_output", None, "not_applicable_retry_before_output", "recovered_before_client_output", "upstream_timeout", Some("retry"), Some(0))
+            ],
+            "events": []
         })
     }
 
@@ -1270,6 +926,10 @@ mod tests {
             "dropped_events": 3,
             "offset": 0,
             "limit": 50,
+            "failure_events": [
+                projected_failure("response_filter_events", "response_filter_rejected", "req_filter", "response_filter", "gpt-example", Some("relay-a"), "response_filter_rejected", "recorded_event_only", "eligible_before_output", None, "local_502", "client_visible_failure", "response_filter_rejected", Some("reject"), None),
+                projected_failure("response_filter_events", "response_filter_rejected", "req_stream", "post_output", "gpt-example", Some("relay-a"), "stream_committed_failure", "recorded_event_only", "blocked_streaming", Some("partial_output_started"), "stream_committed_failure", "client_visible_failure", "stream_committed_failure", Some("reject"), None)
+            ],
             "events": [
                 {
                     "outcome": "rejected",
@@ -1293,21 +953,100 @@ mod tests {
         })
     }
 
-    fn oversized_routing_fixture(count: usize, request_id: &str) -> Value {
-        let events = (0..count)
-            .map(|index| {
-                serde_json::json!({
-                    "kind": "upstream_failure_observed",
-                    "request_id": request_id,
-                    "channel_id": "relay-a",
-                    "failure": {
-                        "failure_kind": "provider_unavailable",
-                        "failure_source": "upstream_transport",
-                        "status": 503,
-                        "directive": "return_error",
-                        "public_model": format!("gpt-example-{index}")
+    #[test]
+    fn failures_tail_renders_management_projected_failure_events_instead_of_raw_events() {
+        let routing = serde_json::json!({
+            "buffered_events": 1,
+            "capacity": 1024,
+            "dropped_events": 0,
+            "offset": 0,
+            "limit": 50,
+            "failure_events": [
+                {
+                    "source": "routing_telemetry",
+                    "event_kind": "upstream_failure_observed",
+                    "request_id": "req_projected",
+                    "stage": "upstream_transport",
+                    "public_model": "gpt-projected",
+                    "client_token_ref": null,
+                    "selected_target": {"channel_id": "relay-projected"},
+                    "channel_id": "relay-projected",
+                    "failure_class": "upstream_5xx",
+                    "router_action": "returned_local_error",
+                    "retry_eligibility": "not_applicable",
+                    "retry_blocked_reason": null,
+                    "client_visible_status": "upstream_5xx",
+                    "reason_code": "upstream_5xx",
+                    "blocking_domain": "upstream_provider",
+                    "directive": "return_error",
+                    "attempt": 1,
+                    "next_action": {
+                        "summary": "Inspect recent failures.",
+                        "template_id": "failures_tail",
+                        "safe_argv": ["one-ai-key", "failures", "tail"],
+                        "side_effect_class": "runtime_readonly",
+                        "requires_confirmation": false
                     }
-                })
+                }
+            ],
+            "events": [
+                {
+                    "kind": "upstream_failure_observed",
+                    "request_id": "req_raw_should_be_ignored",
+                    "channel_id": "relay-raw",
+                    "failure": {
+                        "failure_kind": "timeout",
+                        "failure_source": "upstream_transport",
+                        "directive": "retry",
+                        "public_model": "gpt-raw"
+                    }
+                }
+            ]
+        });
+        let rendered = render_tail_report(
+            &routing,
+            &serde_json::json!({
+                "buffered_events": 0,
+                "capacity": 1024,
+                "dropped_events": 0,
+                "offset": 0,
+                "limit": 50,
+                "failure_events": [],
+                "events": []
+            }),
+            &FailureFilters::default(),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        let failures = report["data"]["failures"].as_array().unwrap();
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["request_id"], "req_projected");
+        assert_eq!(failures[0]["failure_class"], "upstream_5xx");
+        assert!(!rendered.contains("req_raw_should_be_ignored"));
+        assert!(!rendered.contains("gpt-raw"));
+    }
+
+    fn oversized_routing_fixture(count: usize, request_id: &str) -> Value {
+        let failure_events = (0..count)
+            .map(|index| {
+                projected_failure(
+                    "routing_telemetry",
+                    "upstream_failure_observed",
+                    request_id,
+                    "upstream_transport",
+                    &format!("gpt-example-{index}"),
+                    Some("relay-a"),
+                    "upstream_5xx",
+                    "returned_local_error",
+                    "not_applicable",
+                    None,
+                    "upstream_5xx",
+                    "client_visible_failure",
+                    "upstream_5xx",
+                    Some("return_error"),
+                    Some(0),
+                )
             })
             .collect::<Vec<_>>();
         serde_json::json!({
@@ -1316,21 +1055,31 @@ mod tests {
             "dropped_events": 0,
             "offset": 0,
             "limit": MAX_LAST,
-            "events": events,
+            "failure_events": failure_events,
+            "events": [],
         })
     }
 
     fn oversized_response_filter_fixture(count: usize, request_id: &str) -> Value {
-        let events = (0..count)
+        let failure_events = (0..count)
             .map(|index| {
-                serde_json::json!({
-                    "outcome": "rejected",
-                    "request_id": request_id,
-                    "public_model": format!("gpt-example-{index}"),
-                    "channel_id": "relay-a",
-                    "reason_code": "response_filter_rejected",
-                    "body_committed": false,
-                })
+                projected_failure(
+                    "response_filter_events",
+                    "response_filter_rejected",
+                    request_id,
+                    "response_filter",
+                    &format!("gpt-example-{index}"),
+                    Some("relay-a"),
+                    "response_filter_rejected",
+                    "recorded_event_only",
+                    "eligible_before_output",
+                    None,
+                    "local_502",
+                    "client_visible_failure",
+                    "response_filter_rejected",
+                    Some("reject"),
+                    None,
+                )
             })
             .collect::<Vec<_>>();
         serde_json::json!({
@@ -1339,7 +1088,8 @@ mod tests {
             "dropped_events": 0,
             "offset": 0,
             "limit": MAX_LAST,
-            "events": events,
+            "failure_events": failure_events,
+            "events": [],
         })
     }
 
@@ -1478,48 +1228,18 @@ mod tests {
             "buffered_events": 3,
             "offset": 0,
             "limit": 50,
-            "events": [
-                {
-                    "kind": "upstream_failure_observed",
-                    "request_id": "req_retry_credential",
-                    "channel_id": "relay-a",
-                    "failure": {
-                        "failure_kind": "provider_unavailable",
-                        "failure_source": "upstream_transaction",
-                        "status": 502,
-                        "directive": "retry_credential",
-                        "public_model": "gpt-example"
-                    }
-                },
-                {
-                    "kind": "upstream_failure_observed",
-                    "request_id": "req_retry_route",
-                    "channel_id": "relay-a",
-                    "failure": {
-                        "failure_kind": "provider_unavailable",
-                        "failure_source": "upstream_transaction",
-                        "status": 503,
-                        "directive": "retry_route_target",
-                        "public_model": "gpt-example"
-                    }
-                },
-                {
-                    "kind": "upstream_failure_observed",
-                    "request_id": "req_retry_same",
-                    "channel_id": "relay-a",
-                    "failure": {
-                        "failure_kind": "provider_unavailable",
-                        "failure_source": "local_transport",
-                        "directive": "retry_same_target",
-                        "public_model": "gpt-example"
-                    }
-                }
-            ]
+            "failure_events": [
+                projected_failure("routing_telemetry", "upstream_failure_observed", "req_retry_credential", "upstream_transport", "gpt-example", Some("relay-a"), "upstream_5xx", "retried_before_output", "eligible_before_output", None, "not_applicable_retry_before_output", "recovered_before_client_output", "upstream_5xx", Some("retry_credential"), Some(0)),
+                projected_failure("routing_telemetry", "upstream_failure_observed", "req_retry_route", "upstream_transport", "gpt-example", Some("relay-a"), "upstream_5xx", "fell_back_before_output", "eligible_before_output", None, "not_applicable_retry_before_output", "recovered_before_client_output", "upstream_5xx", Some("retry_route_target"), Some(0)),
+                projected_failure("routing_telemetry", "upstream_failure_observed", "req_retry_same", "upstream_transport", "gpt-example", Some("relay-a"), "upstream_timeout", "retried_before_output", "eligible_before_output", None, "not_applicable_retry_before_output", "recovered_before_client_output", "upstream_timeout", Some("retry_same_target"), Some(0))
+            ],
+            "events": []
         });
         let response_filter = serde_json::json!({
             "buffered_events": 0,
             "offset": 0,
             "limit": 50,
+            "failure_events": [],
             "events": []
         });
 
@@ -1577,36 +1297,15 @@ mod tests {
             "buffered_events": 2,
             "offset": 0,
             "limit": 50,
-            "events": [
-                {
-                    "kind": "upstream_failure_observed",
-                    "request_id": "req_multi",
-                    "channel_id": "relay-a",
-                    "failure": {
-                        "failure_kind": "provider_unavailable",
-                        "failure_source": "upstream_transport",
-                        "status": 503,
-                        "directive": "retry",
-                        "public_model": "gpt-example"
-                    }
-                },
-                {
-                    "kind": "upstream_failure_observed",
-                    "request_id": "req_multi",
-                    "channel_id": "relay-b",
-                    "failure": {
-                        "failure_kind": "provider_unavailable",
-                        "failure_source": "upstream_transport",
-                        "status": 503,
-                        "directive": "return_error",
-                        "public_model": "gpt-example"
-                    }
-                }
-            ]
+            "failure_events": [
+                projected_failure("routing_telemetry", "upstream_failure_observed", "req_multi", "upstream_transport", "gpt-example", Some("relay-a"), "upstream_5xx", "retried_before_output", "eligible_before_output", None, "not_applicable_retry_before_output", "recovered_before_client_output", "upstream_5xx", Some("retry"), Some(0)),
+                projected_failure("routing_telemetry", "upstream_failure_observed", "req_multi", "upstream_transport", "gpt-example", Some("relay-b"), "upstream_5xx", "returned_local_error", "not_applicable", None, "upstream_5xx", "client_visible_failure", "upstream_5xx", Some("return_error"), Some(0))
+            ],
+            "events": []
         });
         let rendered = render_explain_report(
             &routing,
-            &serde_json::json!({"buffered_events": 0, "offset": 0, "limit": 50, "events": []}),
+            &serde_json::json!({"buffered_events": 0, "offset": 0, "limit": 50, "failure_events": [], "events": []}),
             "req_multi",
             &FailureFilters::default(),
             crate::cli_report::OutputFormat::Json,
@@ -1674,23 +1373,34 @@ mod tests {
 
     #[test]
     fn failures_model_visibility_next_action_uses_safe_client_token_ref_when_available() {
+        let mut failure = projected_failure(
+            "routing_telemetry",
+            "client_scope_miss",
+            "req_scope_token",
+            "model_visibility",
+            "gpt-example",
+            None,
+            "model_not_visible",
+            "returned_local_error",
+            "not_applicable",
+            None,
+            "local_404",
+            "client_visible_failure",
+            "model_not_in_client_scope",
+            None,
+            None,
+        );
+        failure["client_token_ref"] = serde_json::json!("local-client");
         let routing = serde_json::json!({
             "buffered_events": 1,
             "offset": 0,
             "limit": 50,
-            "events": [
-                {
-                    "kind": "client_scope_miss",
-                    "request_id": "req_scope_token",
-                    "public_model": "gpt-example",
-                    "client_token_ref": "local-client",
-                    "client_visible_status": "local_404"
-                }
-            ]
+            "failure_events": [failure],
+            "events": []
         });
         let rendered = render_explain_report(
             &routing,
-            &serde_json::json!({"buffered_events": 0, "offset": 0, "limit": 50, "events": []}),
+            &serde_json::json!({"buffered_events": 0, "offset": 0, "limit": 50, "failure_events": [], "events": []}),
             "req_scope_token",
             &FailureFilters::default(),
             crate::cli_report::OutputFormat::Json,
@@ -1738,20 +1448,13 @@ mod tests {
             "buffered_events": 1,
             "offset": 0,
             "limit": 50,
-            "events": [
-                {
-                    "outcome": "rejected",
-                    "request_id": "req_expire",
-                    "public_model": "gpt-example",
-                    "channel_id": "relay-a",
-                    "action": "reject_and_expire_credential",
-                    "reason_code": "response_filter_rejected",
-                    "body_committed": false
-                }
-            ]
+            "failure_events": [
+                projected_failure("response_filter_events", "response_filter_rejected", "req_expire", "response_filter", "gpt-example", Some("relay-a"), "response_filter_rejected", "marked_credential", "eligible_before_output", None, "local_502", "client_visible_failure", "response_filter_rejected", Some("reject_and_expire_credential"), None)
+            ],
+            "events": []
         });
         let rendered = render_explain_report(
-            &serde_json::json!({"buffered_events": 0, "offset": 0, "limit": 50, "events": []}),
+            &serde_json::json!({"buffered_events": 0, "offset": 0, "limit": 50, "failure_events": [], "events": []}),
             &response_filter,
             "req_expire",
             &FailureFilters::default(),

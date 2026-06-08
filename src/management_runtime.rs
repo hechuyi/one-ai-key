@@ -36,6 +36,7 @@ pub struct ResponseFilterEventsResponse {
     pub dropped_events: u64,
     pub offset: usize,
     pub limit: usize,
+    pub failure_events: Vec<Value>,
     pub events: Vec<Value>,
 }
 
@@ -47,10 +48,14 @@ pub fn response_filter_events_response(
     limit: usize,
 ) -> ResponseFilterEventsResponse {
     let buffered_events = snapshot.len();
-    let events = snapshot
+    let window = snapshot
         .into_iter()
         .skip(offset)
         .take(limit)
+        .collect::<Vec<_>>();
+    let failure_events = response_filter_failure_events(&window);
+    let events = window
+        .into_iter()
         .map(sanitize_response_filter_event)
         .collect();
     ResponseFilterEventsResponse {
@@ -59,6 +64,7 @@ pub fn response_filter_events_response(
         dropped_events,
         offset,
         limit,
+        failure_events,
         events,
     }
 }
@@ -93,6 +99,7 @@ pub struct RoutingTelemetryResponse {
     pub offset: usize,
     pub limit: usize,
     pub events: Vec<Value>,
+    pub failure_events: Vec<Value>,
     pub failure_transition_summaries: Vec<FailureTransitionSummary>,
 }
 
@@ -130,12 +137,13 @@ pub fn routing_telemetry_response(
 ) -> RoutingTelemetryResponse {
     let buffered_events = snapshot.len();
     let failure_transition_summaries = failure_transition_summaries(&snapshot);
-    let events = snapshot
+    let window = snapshot
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(sanitize_routing_telemetry)
-        .collect();
+        .collect::<Vec<_>>();
+    let failure_events = routing_failure_events(&window);
+    let events = window.into_iter().map(sanitize_routing_telemetry).collect();
     RoutingTelemetryResponse {
         buffered_events,
         capacity,
@@ -143,6 +151,7 @@ pub fn routing_telemetry_response(
         offset,
         limit,
         events,
+        failure_events,
         failure_transition_summaries,
     }
 }
@@ -326,6 +335,263 @@ fn channel_transition_action(state: &str, reason: &str) -> String {
         _ => "channel_health_transition",
     }
     .to_string()
+}
+
+fn routing_failure_events(snapshot: &[RoutingTelemetry]) -> Vec<Value> {
+    failure_transition_summaries(snapshot)
+        .into_iter()
+        .map(project_routing_failure_event)
+        .collect()
+}
+
+fn project_routing_failure_event(summary: FailureTransitionSummary) -> Value {
+    let failure_class = routing_failure_class(&summary);
+    let reason_code = reason_code_for_failure_class(failure_class);
+    let contract = diagnostic_contract_for(reason_code);
+    let retry_eligibility = routing_retry_eligibility(&summary);
+    let retry_blocked_reason =
+        retry_blocked_reason(&retry_eligibility, summary.retry_decision_reason.as_deref());
+    let client_visible_status = client_visible_status(
+        summary.status,
+        summary.directive.as_deref(),
+        &retry_eligibility,
+    );
+    let router_action = routing_router_action(&summary);
+    json!({
+        "source": "routing_telemetry",
+        "event_kind": "upstream_failure_observed",
+        "request_id": summary.request_id,
+        "stage": upstream_stage(&summary.failure_source),
+        "public_model": summary.public_model.unwrap_or_else(|| "unknown".to_string()),
+        "client_token_ref": summary.client_token_ref,
+        "selected_target": selected_target(summary.channel_id.as_deref()),
+        "channel_id": summary.channel_id,
+        "failure_class": failure_class,
+        "router_action": router_action,
+        "retry_eligibility": retry_eligibility,
+        "retry_blocked_reason": retry_blocked_reason,
+        "client_visible_status": client_visible_status,
+        "final_outcome": final_outcome(&client_visible_status),
+        "reason_code": reason_code,
+        "blocking_domain": contract.blocking_domain,
+        "directive": summary.directive,
+        "attempt": summary.attempt,
+        "next_action": contract.next_action,
+    })
+}
+
+fn response_filter_failure_events(events: &[ResponseFilterEvent]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|event| event.outcome == "rejected")
+        .map(project_response_filter_failure_event)
+        .collect()
+}
+
+fn project_response_filter_failure_event(event: &ResponseFilterEvent) -> Value {
+    let body_committed = event.body_committed;
+    let reason_code = stable_reason_code(
+        &event.reason_code,
+        if body_committed {
+            "stream_committed_failure"
+        } else {
+            "response_filter_rejected"
+        },
+    );
+    let contract = diagnostic_contract_for(reason_code);
+    let client_visible_status = if body_committed {
+        "stream_committed_failure"
+    } else {
+        "local_502"
+    };
+    json!({
+        "source": "response_filter_events",
+        "event_kind": "response_filter_rejected",
+        "request_id": safe_management_id(&event.request_id),
+        "stage": if body_committed { "post_output" } else { "response_filter" },
+        "public_model": safe_management_code(&event.public_model),
+        "client_token_ref": Value::Null,
+        "selected_target": selected_target(Some(&event.channel_id)),
+        "channel_id": safe_management_id(&event.channel_id),
+        "failure_class": if body_committed { "stream_committed_failure" } else { "response_filter_rejected" },
+        "router_action": response_filter_router_action(&event.action),
+        "retry_eligibility": if body_committed { "blocked_streaming" } else { "eligible_before_output" },
+        "retry_blocked_reason": if body_committed { Value::from("partial_output_started") } else { Value::Null },
+        "client_visible_status": client_visible_status,
+        "final_outcome": final_outcome(client_visible_status),
+        "reason_code": reason_code,
+        "blocking_domain": contract.blocking_domain,
+        "directive": safe_management_id(&event.action),
+        "content_kind": safe_management_code(&event.content_kind),
+        "next_action": contract.next_action,
+    })
+}
+
+fn routing_failure_class(summary: &FailureTransitionSummary) -> &'static str {
+    if matches!(summary.status, Some(500..=599)) {
+        return "upstream_5xx";
+    }
+    if matches!(summary.status, Some(400..=499)) && summary.failure_scope == "credential" {
+        return "credential_unavailable";
+    }
+    match summary.failure_kind.as_str() {
+        "timeout" | "transport_timeout" => "upstream_timeout",
+        "response_filter_rejected" => "response_filter_rejected",
+        "auth_invalid"
+        | "quota_exhausted"
+        | "key_switch_cooldown"
+        | "relay_balance_unavailable" => "credential_unavailable",
+        "provider_unavailable" => "upstream_5xx",
+        _ => "unknown",
+    }
+}
+
+fn routing_router_action(summary: &FailureTransitionSummary) -> &'static str {
+    match summary.mutation_kind.as_str() {
+        "credential_transition" => "marked_credential",
+        "channel_health_transition" => "marked_channel",
+        _ => router_action_for_directive(summary.directive.as_deref()),
+    }
+}
+
+fn router_action_for_directive(directive: Option<&str>) -> &'static str {
+    match directive.unwrap_or_default() {
+        "retry" | "retry_credential" | "retry_same_target" => "retried_before_output",
+        "fallback" | "retry_route_target" => "fell_back_before_output",
+        "mark_credential" => "marked_credential",
+        "mark_channel" => "marked_channel",
+        "record_event_only" => "recorded_event_only",
+        _ => "returned_local_error",
+    }
+}
+
+fn routing_retry_eligibility(summary: &FailureTransitionSummary) -> String {
+    let directive = summary.directive.as_deref().unwrap_or_default();
+    let retry_decision = summary.retry_decision.as_deref().unwrap_or_default();
+    if retry_directive_is_pre_output_continuation(directive)
+        || retry_directive_is_pre_output_continuation(retry_decision)
+    {
+        return "eligible_before_output".to_string();
+    }
+    if let Some(reason) = summary
+        .retry_decision_reason
+        .as_deref()
+        .and_then(stable_retry_blocked_reason)
+    {
+        return format!("blocked_{reason}");
+    }
+    "not_applicable".to_string()
+}
+
+fn retry_blocked_reason(retry_eligibility: &str, retry_decision_reason: Option<&str>) -> Value {
+    if !retry_eligibility.starts_with("blocked_") {
+        return Value::Null;
+    }
+    retry_decision_reason
+        .and_then(stable_retry_blocked_reason)
+        .map(Value::from)
+        .unwrap_or_else(|| Value::from(retry_eligibility.trim_start_matches("blocked_")))
+}
+
+fn stable_retry_blocked_reason(value: &str) -> Option<&'static str> {
+    match value {
+        "streaming" | "blocked_streaming" => Some("streaming"),
+        "bytes_sent" | "blocked_bytes_sent" => Some("bytes_sent"),
+        "policy" | "blocked_policy" => Some("policy"),
+        "duplicate_charge_risk" | "blocked_duplicate_charge_risk" => Some("duplicate_charge_risk"),
+        "failure_not_retryable" | "blocked_failure_not_retryable" => Some("failure_not_retryable"),
+        "attempt_limit_reached" | "blocked_attempt_limit_reached" => Some("attempt_limit_reached"),
+        _ => None,
+    }
+}
+
+fn retry_directive_is_pre_output_continuation(value: &str) -> bool {
+    matches!(
+        value,
+        "retry" | "fallback" | "retry_credential" | "retry_route_target" | "retry_same_target"
+    )
+}
+
+fn client_visible_status(
+    status: Option<u16>,
+    directive: Option<&str>,
+    retry_eligibility: &str,
+) -> String {
+    if retry_eligibility == "eligible_before_output" {
+        return "not_applicable_retry_before_output".to_string();
+    }
+    match status {
+        Some(400..=499) => "upstream_4xx".to_string(),
+        Some(500..=599) => "upstream_5xx".to_string(),
+        Some(value) => format!("upstream_status_{value}"),
+        None if directive == Some("retry") => "not_applicable_retry_before_output".to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+fn upstream_stage(failure_source: &str) -> &'static str {
+    match failure_source {
+        "response_filter_precommit" => "response_filter",
+        "guarded_success_envelope" | "upstream_response_guard" => "upstream_response_guard",
+        "upstream_transaction" | "upstream_transport" => "upstream_transport",
+        _ => "upstream_transport",
+    }
+}
+
+fn reason_code_for_failure_class(failure_class: &str) -> &'static str {
+    match failure_class {
+        "credential_unavailable" => "credential_unavailable",
+        "upstream_5xx" => "upstream_5xx",
+        "upstream_timeout" => "upstream_timeout",
+        "response_filter_rejected" => "response_filter_rejected",
+        _ => "unknown_failure_class",
+    }
+}
+
+fn stable_reason_code(value: &str, fallback: &'static str) -> &'static str {
+    match value {
+        "response_filter_rejected" => "response_filter_rejected",
+        "stream_committed_failure" => "stream_committed_failure",
+        _ => fallback,
+    }
+}
+
+fn response_filter_router_action(action: &str) -> &'static str {
+    match action {
+        "reject_and_expire_credential" => "marked_credential",
+        "reject_and_cooldown_channel" => "marked_channel",
+        "reject_and_disable_channel" => "marked_channel",
+        _ => "recorded_event_only",
+    }
+}
+
+fn selected_target(channel_id: Option<&str>) -> Value {
+    channel_id
+        .and_then(safe_management_id)
+        .map(|channel_id| json!({ "channel_id": channel_id }))
+        .unwrap_or(Value::Null)
+}
+
+fn diagnostic_contract_for(reason_code: &str) -> crate::diagnostic_contract::DiagnosticContract {
+    crate::diagnostic_contract::contract_for_reason(reason_code)
+        .unwrap_or_else(crate::diagnostic_contract::fallback_contract)
+}
+
+fn final_outcome(client_visible_status: &str) -> &'static str {
+    match client_visible_status {
+        "not_applicable_retry_before_output" => "recovered_before_client_output",
+        "not_applicable" => "management_or_lifecycle_event",
+        "local_400"
+        | "local_401"
+        | "local_404"
+        | "local_429"
+        | "local_502"
+        | "local_503"
+        | "upstream_4xx"
+        | "upstream_5xx"
+        | "stream_committed_failure" => "client_visible_failure",
+        _ => "unknown",
+    }
 }
 
 fn total_dropped_events(buffer_dropped_events: u64, lock_contention_drops: &AtomicU64) -> u64 {
@@ -1428,6 +1694,59 @@ mod tests {
     }
 
     #[test]
+    fn response_filter_events_response_projects_failure_events_for_cli_without_raw_text() {
+        let response = response_filter_events_response(
+            vec![
+                ResponseFilterEvent {
+                    event_id: 1,
+                    created_at_unix_seconds: 10,
+                    request_id: "req_filter".to_string(),
+                    channel_id: "test".to_string(),
+                    public_model: "gpt-test".to_string(),
+                    rule_id: "rule-secret".to_string(),
+                    action: "reject_and_expire_credential".to_string(),
+                    content_kind: "json".to_string(),
+                    reason_code: "response_filter_rejected".to_string(),
+                    outcome: "rejected".to_string(),
+                    body_committed: false,
+                },
+                ResponseFilterEvent {
+                    event_id: 2,
+                    created_at_unix_seconds: 11,
+                    request_id: "req_allowed".to_string(),
+                    channel_id: "test".to_string(),
+                    public_model: "gpt-test".to_string(),
+                    rule_id: "rule-allowed".to_string(),
+                    action: "allow".to_string(),
+                    content_kind: "json".to_string(),
+                    reason_code: "none".to_string(),
+                    outcome: "allowed".to_string(),
+                    body_committed: false,
+                },
+            ],
+            64,
+            0,
+            0,
+            50,
+        );
+        let value = serde_json::to_value(response).unwrap();
+        let body = value.to_string();
+        let failures = value["failure_events"].as_array().unwrap();
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["request_id"], "req_filter");
+        assert_eq!(failures[0]["source"], "response_filter_events");
+        assert_eq!(failures[0]["stage"], "response_filter");
+        assert_eq!(failures[0]["failure_class"], "response_filter_rejected");
+        assert_eq!(failures[0]["router_action"], "marked_credential");
+        assert_eq!(failures[0]["retry_eligibility"], "eligible_before_output");
+        assert_eq!(failures[0]["client_visible_status"], "local_502");
+        assert_eq!(failures[0]["reason_code"], "response_filter_rejected");
+        assert!(!body.contains("matched_text"));
+        assert!(!body.contains("response_body"));
+    }
+
+    #[test]
     fn failure_transition_summary_projects_credential_expiration_without_raw_ids() {
         let response = routing_telemetry_response(
             vec![
@@ -1477,6 +1796,21 @@ mod tests {
         assert_eq!(summary["public_model"], "gpt-test");
         assert_eq!(summary["retry_decision"], "return_current_error");
         assert_eq!(summary["retry_decision_reason"], "failure_not_retryable");
+
+        let failures = value["failure_events"].as_array().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["request_id"], "req_expire");
+        assert_eq!(failures[0]["source"], "routing_telemetry");
+        assert_eq!(failures[0]["stage"], "upstream_transport");
+        assert_eq!(failures[0]["failure_class"], "credential_unavailable");
+        assert_eq!(failures[0]["router_action"], "marked_credential");
+        assert_eq!(
+            failures[0]["retry_eligibility"],
+            "blocked_failure_not_retryable"
+        );
+        assert_eq!(failures[0]["retry_blocked_reason"], "failure_not_retryable");
+        assert_eq!(failures[0]["client_visible_status"], "upstream_4xx");
+        assert_eq!(failures[0]["reason_code"], "credential_unavailable");
     }
 
     #[test]
