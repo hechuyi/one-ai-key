@@ -244,6 +244,8 @@ struct ModelsExplainArgs {
     endpoint_family: Option<String>,
     #[arg(long, value_enum, default_value_t = crate::cli_report::OutputFormat::Table)]
     output: crate::cli_report::OutputFormat,
+    #[arg(long = "json", conflicts_with = "output")]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -574,7 +576,11 @@ where
             model: args.model,
             client_token_ref: args.client_token_ref,
             endpoint_family: args.endpoint_family,
-            output: args.output,
+            output: if args.json {
+                crate::cli_report::OutputFormat::Json
+            } else {
+                args.output
+            },
         }),
         Some(CliCommand::Models {
             command: ModelsCommand::OnboardPlan(args),
@@ -1161,6 +1167,40 @@ mod tests {
                 client_token_ref: Some("local-client".to_string()),
                 endpoint_family: Some("chat_completions".to_string()),
                 output: crate::cli_report::OutputFormat::Table,
+            })
+        );
+    }
+
+    #[test]
+    fn models_explain_parse_accepts_json_alias() {
+        let action = parse_action_from([
+            "one-ai-key",
+            "--management-url",
+            "https://router.example/v1",
+            "--management-token-env",
+            "ONE_AI_KEY_MANAGEMENT_TOKEN",
+            "models",
+            "explain",
+            "--model",
+            "gpt-4o",
+            "--json",
+        ])
+        .expect("models explain --json alias should parse");
+
+        assert_eq!(
+            action,
+            CliAction::ModelsExplain(crate::cli_commands::models::ModelsExplainOptions {
+                connection: OperatorConnectionOptions {
+                    management_url: Some("https://router.example/v1".to_string()),
+                    deprecated_base_url: None,
+                    management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                    management_token_stdin: false,
+                    timeout_seconds: 10,
+                },
+                model: "gpt-4o".to_string(),
+                client_token_ref: None,
+                endpoint_family: None,
+                output: crate::cli_report::OutputFormat::Json,
             })
         );
     }

@@ -19795,6 +19795,20 @@ pools:
         assert_eq!(available["next_action"], "none");
         assert_eq!(available["endpoint_family"], "chat_completions");
         assert_eq!(available["public_model"], "gpt-capability");
+        assert_eq!(available["can_use"], true);
+        assert_eq!(available["blocking_domain"], "none");
+        assert_eq!(available["model"], "gpt-capability");
+        assert_eq!(available["client_token_ref"], "test-client");
+        assert_eq!(available["evidence"]["route_target_count"], 2);
+        assert_eq!(available["evidence"]["endpoint_family_target_count"], 2);
+        assert_eq!(available["evidence"]["selected_target_present"], true);
+        assert_eq!(available["next_step"]["template_id"], "no_action_required");
+        assert_eq!(available["next_step"]["safe_argv"], serde_json::json!([]));
+        assert_eq!(
+            available["next_step"]["side_effect_class"],
+            "runtime_readonly"
+        );
+        assert_eq!(available["next_step"]["requires_confirmation"], false);
         assert_eq!(available["client_token"]["name"], "test-client");
 
         let unsupported = management_response_json(
@@ -19805,6 +19819,16 @@ pools:
         assert_eq!(unsupported["status"], "unavailable");
         assert_eq!(unsupported["reason_code"], "unsupported_endpoint_family");
         assert_eq!(unsupported["next_action"], "use_supported_endpoint_family");
+        assert_eq!(unsupported["can_use"], false);
+        assert_eq!(unsupported["blocking_domain"], "endpoint_family");
+        assert_eq!(
+            unsupported["next_step"]["template_id"],
+            "use_supported_endpoint_family"
+        );
+        assert_eq!(
+            unsupported["next_step"]["side_effect_class"],
+            "runtime_readonly"
+        );
 
         let disabled = management_response_json(
             &app,
@@ -19813,6 +19837,9 @@ pools:
         .await;
         assert_eq!(disabled["status"], "unavailable");
         assert_eq!(disabled["reason_code"], "token_disabled");
+        assert_eq!(disabled["can_use"], false);
+        assert_eq!(disabled["blocking_domain"], "client_token");
+        assert_eq!(disabled["evidence"]["client_token_enabled"], false);
         assert_eq!(disabled["client_token"]["enabled"], false);
     }
 
@@ -19885,6 +19912,8 @@ pools:
         let body = to_bytes(response.into_body(), 8192).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         let value: Value = serde_json::from_str(&body).unwrap();
+        assert!(value.get("evidence").is_some());
+        assert!(value.get("next_step").is_some());
         assert_eq!(value["status"], "available");
         assert_eq!(value["route_kind"], "default_channel");
         assert_eq!(value["public_model"], "<redacted-public-model>");

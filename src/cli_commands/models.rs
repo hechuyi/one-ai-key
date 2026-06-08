@@ -314,8 +314,6 @@ fn sanitized_models_explain_report(
     let selected_target = sanitize_selected_target(preview.get("selected_target"));
     let has_selected_target = !selected_target.is_null();
     let client_scope_status = client_scope_status(&client_token, preview);
-    let status = if has_selected_target { "ok" } else { "blocked" };
-    let reason_code = models_explain_reason_code(has_selected_target, client_scope_status);
     let capability_status =
         crate::cli_report::endpoint_capability_status_from_candidates(&candidates);
     let runtime_reload =
@@ -325,6 +323,46 @@ fn sanitized_models_explain_report(
                 .or_else(|| preview.get("runtime_reload")),
         );
     let availability = availability.map(sanitize_model_availability);
+    let availability_can_use = availability
+        .as_ref()
+        .and_then(|value| value.get("can_use"))
+        .and_then(Value::as_bool);
+    let status = if let Some(can_use) = availability_can_use {
+        if can_use {
+            "ok"
+        } else {
+            "blocked"
+        }
+    } else if has_selected_target {
+        "ok"
+    } else {
+        "blocked"
+    };
+    let reason_code = availability
+        .as_ref()
+        .and_then(|value| value.get("reason_code"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| models_explain_reason_code(has_selected_target, client_scope_status));
+    let report_model = availability
+        .as_ref()
+        .and_then(|value| value.get("model"))
+        .and_then(Value::as_str)
+        .or_else(|| preview.get("model").and_then(Value::as_str));
+    let report_endpoint_family = availability
+        .as_ref()
+        .and_then(|value| value.get("endpoint_family"))
+        .and_then(Value::as_str);
+    let report_client_token_ref = availability
+        .as_ref()
+        .and_then(|value| value.get("client_token_ref"))
+        .and_then(Value::as_str)
+        .or_else(|| client_token.get("name").and_then(Value::as_str));
+    let next_action = availability
+        .as_ref()
+        .and_then(|value| value.get("next_step"))
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| models_explain_next_action(status, preview, client_scope_status));
     let data = serde_json::json!({
         "command": "models explain",
         "active_registry_generation": runtime_reload.active_registry_generation,
@@ -335,7 +373,18 @@ fn sanitized_models_explain_report(
         "reload_diff_reason_code": runtime_reload.reload_diff_reason_code,
         "reload_diff_next_action": runtime_reload.reload_diff_next_action,
         "capability_status": capability_status,
-        "model": preview.get("model").and_then(Value::as_str),
+        "can_use": availability_can_use,
+        "blocking_domain": availability
+            .as_ref()
+            .and_then(|value| value.get("blocking_domain"))
+            .and_then(Value::as_str),
+        "endpoint_family": report_endpoint_family,
+        "model": report_model,
+        "client_token_ref": report_client_token_ref,
+        "evidence": availability
+            .as_ref()
+            .and_then(|value| value.get("evidence"))
+            .cloned(),
         "route_kind": preview.get("route_kind").and_then(Value::as_str),
         "registry_generation": preview.get("registry_generation").and_then(Value::as_u64),
         "candidate_limit": preview.get("candidate_limit").and_then(Value::as_u64),
@@ -351,15 +400,12 @@ fn sanitized_models_explain_report(
         reason_code,
         effect: crate::cli_effects::runtime_readonly_effect(),
         scope: serde_json::json!({
-            "model": preview.get("model").and_then(Value::as_str),
-            "client_token_ref": client_token.get("name").and_then(Value::as_str),
-            "endpoint_family": availability
-                .as_ref()
-                .and_then(|value| value.get("endpoint_family"))
-                .and_then(Value::as_str),
+            "model": report_model,
+            "client_token_ref": report_client_token_ref,
+            "endpoint_family": report_endpoint_family,
         }),
         window: Value::Null,
-        next_action: models_explain_next_action(status, preview, client_scope_status),
+        next_action,
         data,
     })
 }
@@ -377,17 +423,217 @@ fn sanitize_model_availability(value: &Value) -> Value {
         });
     serde_json::json!({
         "status": value.get("status").and_then(Value::as_str),
-        "reason_code": value.get("reason_code").and_then(Value::as_str),
-        "next_action": value.get("next_action").and_then(Value::as_str),
-        "endpoint_family": value.get("endpoint_family").and_then(Value::as_str),
+        "can_use": value.get("can_use").and_then(Value::as_bool),
+        "blocking_domain": value
+            .get("blocking_domain")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_reason_code(value)),
+        "reason_code": value
+            .get("reason_code")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_reason_code(value)),
+        "next_action": value
+            .get("next_action")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_reason_code(value)),
+        "endpoint_family": value
+            .get("endpoint_family")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_reason_code(value)),
+        "model": value
+            .get("model")
+            .and_then(Value::as_str)
+            .map(safe_public_model_label),
         "public_model": value
             .get("public_model")
             .and_then(Value::as_str)
             .map(safe_public_model_label),
-        "route_kind": value.get("route_kind").and_then(Value::as_str),
+        "client_token_ref": value
+            .get("client_token_ref")
+            .and_then(Value::as_str)
+            .and_then(safe_reference_label_value),
+        "route_kind": value
+            .get("route_kind")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_reason_code(value)),
         "registry_generation": value.get("registry_generation").and_then(Value::as_u64),
+        "evidence": sanitize_availability_evidence(value.get("evidence")),
+        "next_step": sanitize_availability_next_step(value.get("next_step")),
         "client_token": client_token,
     })
+}
+
+fn sanitize_availability_evidence(evidence: Option<&Value>) -> Value {
+    let Some(evidence) = evidence.and_then(Value::as_object) else {
+        return Value::Null;
+    };
+    let mut sanitized = serde_json::Map::new();
+    for key in [
+        "client_token_ref_supplied",
+        "client_token_known",
+        "client_token_enabled",
+        "model_allowed",
+        "model_visible",
+        "route_present",
+        "selected_target_present",
+    ] {
+        if let Some(value) = evidence.get(key).and_then(Value::as_bool) {
+            sanitized.insert(key.to_string(), Value::Bool(value));
+        }
+    }
+    for key in [
+        "route_target_count",
+        "endpoint_family_target_count",
+        "unsupported_target_count",
+        "unknown_or_missing_target_count",
+        "preview_candidate_count",
+        "candidate_limit",
+    ] {
+        if let Some(value) = evidence.get(key).and_then(Value::as_u64) {
+            sanitized.insert(key.to_string(), Value::from(value));
+        }
+    }
+    if let Some(reason_codes) = evidence
+        .get("candidate_reason_codes")
+        .and_then(Value::as_array)
+    {
+        let reason_codes = reason_codes
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|value| is_safe_reason_code(value))
+            .take(8)
+            .map(Value::from)
+            .collect::<Vec<_>>();
+        sanitized.insert(
+            "candidate_reason_codes".to_string(),
+            Value::Array(reason_codes),
+        );
+    }
+    Value::Object(sanitized)
+}
+
+fn sanitize_availability_next_step(next_step: Option<&Value>) -> Value {
+    let Some(next_step) = next_step.and_then(Value::as_object) else {
+        return Value::Null;
+    };
+    let safe_argv = next_step
+        .get("safe_argv")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|value| is_safe_next_action_arg(value))
+                .take(16)
+                .map(Value::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "summary": next_step
+            .get("summary")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_next_action_summary(value))
+            .map(crate::cli_report::escape_table_value),
+        "template_id": next_step
+            .get("template_id")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_reason_code(value)),
+        "safe_argv": safe_argv,
+        "side_effect_class": next_step
+            .get("side_effect_class")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_reason_code(value)),
+        "requires_confirmation": next_step
+            .get("requires_confirmation")
+            .and_then(Value::as_bool),
+    })
+}
+
+fn is_safe_next_action_arg(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 128
+        || value.contains("://")
+        || value.contains('?')
+        || value.contains('&')
+        || value.contains('=')
+        || value.starts_with('/')
+        || value.starts_with("~/")
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("authorization")
+        || lower.contains("bearer")
+        || lower.contains("sk-")
+        || lower.contains("sk_")
+    {
+        return matches!(
+            value,
+            "--management-token-env"
+                | "client-tokens"
+                | "--client-token-ref"
+                | "<client-token-ref>"
+        );
+    }
+    value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'<' | b'>')
+    })
+}
+
+fn is_safe_next_action_summary(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 240
+        && !value.contains("://")
+        && !value.contains('?')
+        && !value.contains('&')
+        && !value.contains('=')
+        && !value.chars().any(char::is_control)
+        && {
+            let lower = value.to_ascii_lowercase();
+            !lower.contains("token_hash")
+                && !lower.contains("raw_token")
+                && !lower.contains("secret")
+                && !lower.contains("authorization")
+                && !lower.contains("bearer")
+                && !lower.contains("sk-")
+                && !lower.contains("sk_")
+        }
+}
+
+fn is_safe_reason_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn safe_reference_label_value(reference: &str) -> Option<String> {
+    let trimmed = reference.trim();
+    if !trimmed.is_empty()
+        && trimmed.len() <= 128
+        && trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && !trimmed.to_ascii_lowercase().contains("secret")
+        && !trimmed.to_ascii_lowercase().contains("authorization")
+        && !trimmed.to_ascii_lowercase().contains("api_key")
+        && !trimmed.to_ascii_lowercase().contains("apikey")
+        && !trimmed.to_ascii_lowercase().contains("bearer")
+        && !trimmed.to_ascii_lowercase().contains("sk-")
+        && !trimmed.to_ascii_lowercase().contains("sk_")
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
 }
 
 fn safe_public_model_label(public_model: &str) -> String {
@@ -1088,6 +1334,151 @@ mod tests {
     }
 
     #[test]
+    fn models_explain_json_uses_server_availability_as_canonical_top_level_projection() {
+        let preview = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "explicit_model_route",
+            "registry_generation": 5,
+            "client_token": {"name": "local-client"},
+            "selected_target": null,
+            "candidates": [
+                {
+                    "channel_id": "preview-blocked",
+                    "included": false,
+                    "selected": false,
+                    "health": {"kind": "disabled", "reason_code": "channel_disabled"},
+                    "credentials": {"total": 0, "available": 0}
+                }
+            ]
+        });
+        let availability = serde_json::json!({
+            "status": "available",
+            "can_use": true,
+            "blocking_domain": "none",
+            "reason_code": "available",
+            "endpoint_family": "chat_completions",
+            "model": "gpt-public",
+            "public_model": "gpt-public",
+            "client_token_ref": "local-client",
+            "route_kind": "explicit_model_route",
+            "registry_generation": 7,
+            "evidence": {
+                "route_target_count": 2,
+                "endpoint_family_target_count": 1,
+                "candidate_reason_codes": ["no_available_credentials", "token_hash_SHOULD_NOT_RENDER"],
+                "raw_secret": "SHOULD_NOT_RENDER"
+            },
+            "next_step": {
+                "summary": "No repair action is required.",
+                "template_id": "no_action_required",
+                "safe_argv": [],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false,
+                "unsafe_path": "/tmp/SHOULD_NOT_RENDER"
+            },
+            "next_action": "none",
+            "raw_token": "SHOULD_NOT_RENDER"
+        });
+
+        let rendered = super::render_models_explain_report_with_management_projection(
+            &preview,
+            None,
+            Some(&availability),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["can_use"], true);
+        assert_eq!(report["blocking_domain"], "none");
+        assert_eq!(report["reason_code"], "available");
+        assert_eq!(report["endpoint_family"], "chat_completions");
+        assert_eq!(report["model"], "gpt-public");
+        assert_eq!(report["client_token_ref"], "local-client");
+        assert_eq!(report["evidence"]["route_target_count"], 2);
+        assert_eq!(report["evidence"]["endpoint_family_target_count"], 1);
+        assert_eq!(
+            report["evidence"]["candidate_reason_codes"],
+            serde_json::json!(["no_available_credentials"])
+        );
+        assert_eq!(report["next_action"]["template_id"], "no_action_required");
+        assert_eq!(report["next_action"]["safe_argv"], serde_json::json!([]));
+        assert_eq!(report["availability"]["can_use"], true);
+        assert_eq!(report["availability"]["blocking_domain"], "none");
+        assert_eq!(report["selected_target"], serde_json::Value::Null);
+        assert_eq!(report["route_kind"], "explicit_model_route");
+        assert_eq!(report["registry_generation"], 5);
+        assert!(!rendered.contains("SHOULD_NOT_RENDER"));
+        assert!(!rendered.contains("/tmp/"));
+        assert!(!rendered.contains("raw_secret"));
+    }
+
+    #[test]
+    fn models_explain_json_reports_unavailable_server_projection_top_level() {
+        let preview = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "explicit_model_route",
+            "registry_generation": 5,
+            "client_token": {"name": "local-client"},
+            "selected_target": {"channel_id": "preview-selected", "plan_position": 0},
+            "candidates": []
+        });
+        let availability = serde_json::json!({
+            "status": "unavailable",
+            "can_use": false,
+            "blocking_domain": "endpoint_family",
+            "reason_code": "endpoint_family_mismatch",
+            "endpoint_family": "embeddings",
+            "model": "gpt-public",
+            "public_model": "gpt-public",
+            "client_token_ref": "local-client",
+            "route_kind": "explicit_model_route",
+            "registry_generation": 7,
+            "evidence": {
+                "route_target_count": 1,
+                "endpoint_family_target_count": 0,
+                "unsupported_target_count": 0,
+                "unknown_or_missing_target_count": 1
+            },
+            "next_step": {
+                "summary": "Inspect runtime route target endpoint capabilities.",
+                "template_id": "route_explain",
+                "safe_argv": ["one-ai-key", "route", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "<public-model>"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            },
+            "next_action": "configure_endpoint_capabilities_or_route"
+        });
+
+        let rendered = super::render_models_explain_report_with_management_projection(
+            &preview,
+            None,
+            Some(&availability),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["can_use"], false);
+        assert_eq!(report["blocking_domain"], "endpoint_family");
+        assert_eq!(report["reason_code"], "endpoint_family_mismatch");
+        assert_eq!(report["next_action"]["template_id"], "route_explain");
+        assert_eq!(
+            report["next_action"]["safe_argv"],
+            serde_json::json!([
+                "one-ai-key",
+                "route",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "<public-model>"
+            ])
+        );
+    }
+
+    #[test]
     fn models_explain_json_reports_runtime_reload_projection_without_sensitive_fields() {
         let legacy_safe_field = ["safe", "command"].join("_");
         let legacy_dry_run_field = ["dry", "run", "command"].join("_");
@@ -1313,9 +1704,26 @@ mod tests {
                             .push("/management/model-availability".to_string());
                         Json(serde_json::json!({
                             "status": "available",
+                            "can_use": true,
+                            "blocking_domain": "none",
                             "reason_code": "available",
                             "next_action": "none",
                             "endpoint_family": "chat_completions",
+                            "model": "gpt-public",
+                            "client_token_ref": "local-client",
+                            "evidence": {
+                                "route_target_count": 1,
+                                "endpoint_family_target_count": 1,
+                                "selected_target_present": true,
+                                "candidate_reason_codes": ["available", "raw_SHOULD_NOT_RENDER"]
+                            },
+                            "next_step": {
+                                "summary": "No repair action is required.",
+                                "template_id": "no_action_required",
+                                "safe_argv": [],
+                                "side_effect_class": "runtime_readonly",
+                                "requires_confirmation": false
+                            },
                             "public_model": "https://relay.example/v1?token=sk-SHOULD_NOT_RENDER",
                             "route_kind": "explicit_model_route",
                             "registry_generation": 7,
@@ -1366,6 +1774,18 @@ mod tests {
         );
         assert_eq!(report["availability"]["status"], "available");
         assert_eq!(report["availability"]["reason_code"], "available");
+        assert_eq!(report["can_use"], true);
+        assert_eq!(report["blocking_domain"], "none");
+        assert_eq!(report["reason_code"], "available");
+        assert_eq!(report["endpoint_family"], "chat_completions");
+        assert_eq!(report["model"], "gpt-public");
+        assert_eq!(report["client_token_ref"], "local-client");
+        assert_eq!(
+            report["evidence"]["candidate_reason_codes"],
+            serde_json::json!(["available"])
+        );
+        assert_eq!(report["next_action"]["template_id"], "no_action_required");
+        assert_eq!(report["next_action"]["safe_argv"], serde_json::json!([]));
         assert_eq!(
             report["availability"]["endpoint_family"],
             "chat_completions"
@@ -1375,6 +1795,132 @@ mod tests {
         assert!(!rendered.contains("sk-"));
         assert!(!rendered.contains("token="));
         assert!(!rendered.contains("https://relay.example/v1"));
+    }
+
+    #[tokio::test]
+    async fn models_explain_run_reports_unavailable_model_availability_as_top_level_block() {
+        let seen_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let preview_seen = Arc::clone(&seen_paths);
+        let diff_seen = Arc::clone(&seen_paths);
+        let availability_seen = Arc::clone(&seen_paths);
+        let router = Router::new()
+            .route(
+                "/management/routing/preview",
+                get(move || {
+                    let preview_seen = Arc::clone(&preview_seen);
+                    async move {
+                        preview_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/routing/preview".to_string());
+                        Json(serde_json::json!({
+                            "model": "gpt-public",
+                            "route_kind": "explicit_model_route",
+                            "selected_target": {"channel_id": "primary", "plan_position": 0},
+                            "client_token": {"name": "local-client"},
+                            "candidates": []
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/management/runtime/reload-diff",
+                get(move || {
+                    let diff_seen = Arc::clone(&diff_seen);
+                    async move {
+                        diff_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/runtime/reload-diff".to_string());
+                        Json(serde_json::json!({
+                            "status": "ok",
+                            "reason_code": "reload_diff_empty",
+                            "runtime_reload_required": false
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/management/model-availability",
+                get(move || {
+                    let availability_seen = Arc::clone(&availability_seen);
+                    async move {
+                        availability_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/model-availability".to_string());
+                        Json(serde_json::json!({
+                            "status": "unavailable",
+                            "can_use": false,
+                            "blocking_domain": "endpoint_family",
+                            "reason_code": "endpoint_family_mismatch",
+                            "next_action": "configure_endpoint_capabilities_or_route",
+                            "endpoint_family": "embeddings",
+                            "model": "gpt-public",
+                            "public_model": "gpt-public",
+                            "client_token_ref": "local-client",
+                            "route_kind": "explicit_model_route",
+                            "registry_generation": 7,
+                            "evidence": {
+                                "route_target_count": 1,
+                                "endpoint_family_target_count": 0,
+                                "unknown_or_missing_target_count": 1
+                            },
+                            "next_step": {
+                                "summary": "Inspect runtime route target endpoint capabilities.",
+                                "template_id": "route_explain",
+                                "safe_argv": ["one-ai-key", "route", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "<public-model>"],
+                                "side_effect_class": "runtime_readonly",
+                                "requires_confirmation": false
+                            }
+                        }))
+                    }
+                }),
+            );
+        let management_url = spawn_management_fixture(router).await;
+        let env_name = format!(
+            "ONE_AI_KEY_TEST_MODELS_EXPLAIN_UNAVAILABLE_TOKEN_{}",
+            std::process::id()
+        );
+        std::env::set_var(&env_name, "opaque-management-fixture");
+
+        let rendered = super::run_explain(super::ModelsExplainOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some(management_url),
+                deprecated_base_url: None,
+                management_token_env: Some(env_name.clone()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            model: "gpt-public".to_string(),
+            client_token_ref: Some("local-client".to_string()),
+            endpoint_family: Some("embeddings".to_string()),
+            output: crate::cli_report::OutputFormat::Json,
+        })
+        .await
+        .unwrap();
+        std::env::remove_var(env_name);
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            *seen_paths.lock().unwrap(),
+            vec![
+                "/management/routing/preview".to_string(),
+                "/management/runtime/reload-diff".to_string(),
+                "/management/model-availability".to_string(),
+            ]
+        );
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["can_use"], false);
+        assert_eq!(report["blocking_domain"], "endpoint_family");
+        assert_eq!(report["reason_code"], "endpoint_family_mismatch");
+        assert_eq!(report["selected_target"]["channel_id"], "primary");
+        assert_eq!(report["next_action"]["template_id"], "route_explain");
+        assert_eq!(
+            report["next_action"]["side_effect_class"],
+            "runtime_readonly"
+        );
+        assert_eq!(report["next_action"]["requires_confirmation"], false);
     }
 
     #[tokio::test]

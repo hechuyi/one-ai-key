@@ -12,8 +12,8 @@ use crate::{
     },
     provider::ProviderKind,
     route_plan::{
-        preview_route, ChannelRouteState, ModelRoute, RoutePreviewCandidate, RoutePreviewInput,
-        RoutePreviewReason, RouteStrategy, RouteTarget,
+        preview_route, ChannelRouteState, ModelRoute, RoutePreview, RoutePreviewCandidate,
+        RoutePreviewInput, RoutePreviewReason, RouteStrategy, RouteTarget,
     },
     state::{AppState, ChannelHealth, ChannelId, ChannelRoutePlanContext},
 };
@@ -691,12 +691,18 @@ pub fn routing_preview_candidate_statuses(
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct EndpointFamilyAvailabilityExplain {
     pub status: &'static str,
+    pub can_use: bool,
+    pub blocking_domain: &'static str,
     pub reason_code: &'static str,
     pub next_action: &'static str,
     pub endpoint_family: String,
+    pub model: String,
     pub public_model: String,
+    pub client_token_ref: Option<String>,
     pub route_kind: &'static str,
     pub registry_generation: u64,
+    pub evidence: EndpointFamilyAvailabilityEvidence,
+    pub next_step: EndpointFamilyAvailabilityNextStep,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_token: Option<EndpointFamilyAvailabilityClient>,
 }
@@ -706,6 +712,34 @@ pub struct EndpointFamilyAvailabilityClient {
     pub id: String,
     pub name: String,
     pub enabled: bool,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct EndpointFamilyAvailabilityEvidence {
+    pub client_token_ref_supplied: bool,
+    pub client_token_known: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_token_enabled: Option<bool>,
+    pub model_allowed: bool,
+    pub model_visible: bool,
+    pub route_present: bool,
+    pub route_target_count: usize,
+    pub endpoint_family_target_count: usize,
+    pub unsupported_target_count: usize,
+    pub unknown_or_missing_target_count: usize,
+    pub preview_candidate_count: usize,
+    pub selected_target_present: bool,
+    pub candidate_limit: usize,
+    pub candidate_reason_codes: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct EndpointFamilyAvailabilityNextStep {
+    pub summary: &'static str,
+    pub template_id: &'static str,
+    pub safe_argv: Vec<&'static str>,
+    pub side_effect_class: &'static str,
+    pub requires_confirmation: bool,
 }
 
 pub struct EndpointFamilyAvailabilityExplainInput<'a> {
@@ -784,12 +818,16 @@ pub fn endpoint_family_availability_explain_from_parts(
     input: EndpointFamilyAvailabilityExplainInput<'_>,
 ) -> EndpointFamilyAvailabilityExplain {
     let Some(client_token_ref) = input.client_token_ref else {
+        let evidence = endpoint_family_availability_evidence(&input, None, None, None);
         return endpoint_family_availability_explain_result(
             input,
             None,
             "unavailable",
+            false,
+            "client_token",
             "token_missing",
             "provide_client_token_ref",
+            evidence,
         );
     };
     let Some(client) = input
@@ -797,12 +835,16 @@ pub fn endpoint_family_availability_explain_from_parts(
         .iter()
         .find(|token| token.id == client_token_ref || token.name == client_token_ref)
     else {
+        let evidence = endpoint_family_availability_evidence(&input, None, None, None);
         return endpoint_family_availability_explain_result(
             input,
             None,
             "unavailable",
+            false,
+            "client_token",
             "token_unknown",
             "check_client_token_ref",
+            evidence,
         );
     };
     let client_status = EndpointFamilyAvailabilityClient {
@@ -811,40 +853,56 @@ pub fn endpoint_family_availability_explain_from_parts(
         enabled: client.enabled,
     };
     if !client.enabled {
+        let evidence = endpoint_family_availability_evidence(&input, Some(client), None, None);
         return endpoint_family_availability_explain_result(
             input,
             Some(client_status),
             "unavailable",
+            false,
+            "client_token",
             "token_disabled",
             "enable_client_token",
+            evidence,
         );
     }
 
     let Some(endpoint_family) = EndpointFamily::parse(input.endpoint_family) else {
+        let evidence = endpoint_family_availability_evidence(&input, Some(client), None, None);
         return endpoint_family_availability_explain_result(
             input,
             Some(client_status),
             "unavailable",
+            false,
+            "endpoint_family",
             "unsupported_endpoint_family",
             "use_supported_endpoint_family",
+            evidence,
         );
     };
     if !input.model_allowed || !input.model_visible {
+        let evidence = endpoint_family_availability_evidence(&input, Some(client), None, None);
         return endpoint_family_availability_explain_result(
             input,
             Some(client_status),
             "unavailable",
+            false,
+            "model",
             "model_missing",
             "publish_or_route_model",
+            evidence,
         );
     }
     let Some(route) = input.route else {
+        let evidence = endpoint_family_availability_evidence(&input, Some(client), None, None);
         return endpoint_family_availability_explain_result(
             input,
             Some(client_status),
             "unavailable",
+            false,
+            "route",
             "no_route",
             "configure_route_or_default_channel",
+            evidence,
         );
     };
 
@@ -856,12 +914,21 @@ pub fn endpoint_family_availability_explain_from_parts(
         } else {
             "endpoint_family_mismatch"
         };
+        let evidence = endpoint_family_availability_evidence(
+            &input,
+            Some(client),
+            Some(&family_targets),
+            None,
+        );
         return endpoint_family_availability_explain_result(
             input,
             Some(client_status),
             "unavailable",
+            false,
+            "endpoint_family",
             reason_code,
             "configure_endpoint_capabilities_or_route",
+            evidence,
         );
     };
     let preview = preview_route(RoutePreviewInput {
@@ -878,21 +945,39 @@ pub fn endpoint_family_availability_explain_from_parts(
         candidate_limit: input.candidate_limit,
     });
     if preview.selected_target_index.is_none() {
+        let evidence = endpoint_family_availability_evidence(
+            &input,
+            Some(client),
+            Some(&family_targets),
+            Some(&preview),
+        );
         return endpoint_family_availability_explain_result(
             input,
             Some(client_status),
             "unavailable",
+            false,
+            "target",
             "no_usable_key_or_target",
             "enable_target_or_key",
+            evidence,
         );
     }
 
+    let evidence = endpoint_family_availability_evidence(
+        &input,
+        Some(client),
+        Some(&family_targets),
+        Some(&preview),
+    );
     endpoint_family_availability_explain_result(
         input,
         Some(client_status),
         "available",
+        true,
+        "none",
         "available",
         "none",
+        evidence,
     )
 }
 
@@ -915,19 +1000,206 @@ fn endpoint_family_availability_explain_result(
     input: EndpointFamilyAvailabilityExplainInput<'_>,
     client_token: Option<EndpointFamilyAvailabilityClient>,
     status: &'static str,
+    can_use: bool,
+    blocking_domain: &'static str,
     reason_code: &'static str,
     next_action: &'static str,
+    evidence: EndpointFamilyAvailabilityEvidence,
 ) -> EndpointFamilyAvailabilityExplain {
+    let model = safe_public_model_label(input.public_model);
     EndpointFamilyAvailabilityExplain {
         status,
+        can_use,
+        blocking_domain,
         reason_code,
         next_action,
         endpoint_family: input.endpoint_family.to_string(),
-        public_model: safe_public_model_label(input.public_model),
+        model: model.clone(),
+        public_model: model,
+        client_token_ref: input.client_token_ref.map(safe_reference_label),
         route_kind: input.route_kind,
         registry_generation: input.registry_generation,
+        evidence,
+        next_step: endpoint_family_next_step(reason_code),
         client_token,
     }
+}
+
+fn endpoint_family_availability_evidence(
+    input: &EndpointFamilyAvailabilityExplainInput<'_>,
+    client: Option<&ResolvedClientToken>,
+    family_targets: Option<&EndpointFamilyRouteTargets>,
+    preview: Option<&RoutePreview>,
+) -> EndpointFamilyAvailabilityEvidence {
+    EndpointFamilyAvailabilityEvidence {
+        client_token_ref_supplied: input.client_token_ref.is_some(),
+        client_token_known: client.is_some(),
+        client_token_enabled: client.map(|client| client.enabled),
+        model_allowed: input.model_allowed,
+        model_visible: input.model_visible,
+        route_present: input.route.is_some(),
+        route_target_count: input
+            .route
+            .map(|route| route.targets.len())
+            .unwrap_or_default(),
+        endpoint_family_target_count: family_targets
+            .map(|targets| targets.supported_target_count)
+            .unwrap_or_default(),
+        unsupported_target_count: family_targets
+            .map(|targets| targets.unsupported_target_count)
+            .unwrap_or_default(),
+        unknown_or_missing_target_count: family_targets
+            .map(|targets| targets.unknown_or_missing_target_count)
+            .unwrap_or_default(),
+        preview_candidate_count: preview
+            .map(|preview| preview.candidates.len())
+            .unwrap_or_default(),
+        selected_target_present: preview
+            .and_then(|preview| preview.selected_target_index)
+            .is_some(),
+        candidate_limit: input.candidate_limit,
+        candidate_reason_codes: preview
+            .map(endpoint_family_candidate_reason_codes)
+            .unwrap_or_default(),
+    }
+}
+
+fn endpoint_family_candidate_reason_codes(preview: &RoutePreview) -> Vec<&'static str> {
+    let mut reason_codes = Vec::new();
+    for reason in preview
+        .candidates
+        .iter()
+        .flat_map(|candidate| candidate.reasons.iter())
+    {
+        let reason_code = reason.as_str();
+        if !reason_codes.contains(&reason_code) {
+            reason_codes.push(reason_code);
+        }
+        if reason_codes.len() >= 8 {
+            break;
+        }
+    }
+    reason_codes
+}
+
+fn endpoint_family_next_step(reason_code: &str) -> EndpointFamilyAvailabilityNextStep {
+    match reason_code {
+        "available" => EndpointFamilyAvailabilityNextStep {
+            summary: "The requested model is available for this client-token reference and endpoint family.",
+            template_id: "no_action_required",
+            safe_argv: Vec::new(),
+            side_effect_class: "runtime_readonly",
+            requires_confirmation: false,
+        },
+        "token_missing" => EndpointFamilyAvailabilityNextStep {
+            summary: "Rerun models explain with an explicit client-token reference.",
+            template_id: "models_explain_with_client_token_ref",
+            safe_argv: vec![
+                "one-ai-key",
+                "models",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "--model",
+                "<public-model>",
+                "--client-token-ref",
+                "<client-token-ref>",
+            ],
+            side_effect_class: "runtime_readonly",
+            requires_confirmation: false,
+        },
+        "token_unknown" | "token_disabled" => EndpointFamilyAvailabilityNextStep {
+            summary: "Inspect runtime client-token references before rerunning models explain.",
+            template_id: "client_tokens_list",
+            safe_argv: vec![
+                "one-ai-key",
+                "client-tokens",
+                "list",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+            ],
+            side_effect_class: "runtime_readonly",
+            requires_confirmation: false,
+        },
+        "unsupported_endpoint_family" => EndpointFamilyAvailabilityNextStep {
+            summary: "Use a supported endpoint family value for the read-only availability projection.",
+            template_id: "use_supported_endpoint_family",
+            safe_argv: vec![
+                "one-ai-key",
+                "models",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "--model",
+                "<public-model>",
+                "--endpoint-family",
+                "chat_completions",
+            ],
+            side_effect_class: "runtime_readonly",
+            requires_confirmation: false,
+        },
+        "model_missing" => EndpointFamilyAvailabilityNextStep {
+            summary: "Inspect compiled runtime public models before changing configuration.",
+            template_id: "models_list",
+            safe_argv: vec![
+                "one-ai-key",
+                "models",
+                "list",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+            ],
+            side_effect_class: "runtime_readonly",
+            requires_confirmation: false,
+        },
+        _ => EndpointFamilyAvailabilityNextStep {
+            summary: "Inspect runtime route target and endpoint-capability projection details.",
+            template_id: "route_explain",
+            safe_argv: vec![
+                "one-ai-key",
+                "route",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "<public-model>",
+            ],
+            side_effect_class: "runtime_readonly",
+            requires_confirmation: false,
+        },
+    }
+}
+
+fn safe_reference_label(reference: &str) -> String {
+    let trimmed = reference.trim();
+    if is_safe_reference_label(trimmed) {
+        trimmed.to_string()
+    } else {
+        "<redacted-reference>".to_string()
+    }
+}
+
+fn is_safe_reference_label(reference: &str) -> bool {
+    !reference.is_empty()
+        && reference.len() <= 128
+        && reference
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && !reference.to_ascii_lowercase().contains("secret")
+        && !reference.to_ascii_lowercase().contains("authorization")
+        && !reference.to_ascii_lowercase().contains("api_key")
+        && !reference.to_ascii_lowercase().contains("apikey")
+        && !reference.to_ascii_lowercase().contains("bearer")
+        && !reference.to_ascii_lowercase().contains("sk-")
+        && !reference.to_ascii_lowercase().contains("sk_")
 }
 
 fn safe_public_model_label(public_model: &str) -> String {
@@ -993,6 +1265,9 @@ fn looks_like_url_scheme(lower: &str) -> bool {
 struct EndpointFamilyRouteTargets {
     route: Option<ModelRoute>,
     has_unsupported_target: bool,
+    supported_target_count: usize,
+    unsupported_target_count: usize,
+    unknown_or_missing_target_count: usize,
 }
 
 fn route_with_endpoint_family_targets(
@@ -1001,28 +1276,33 @@ fn route_with_endpoint_family_targets(
     endpoint_capabilities: &HashMap<String, EndpointCapabilitiesStatus>,
 ) -> EndpointFamilyRouteTargets {
     let mut has_unsupported_target = false;
-    let targets: Vec<RouteTarget> = route
-        .targets
-        .iter()
-        .filter(|target| {
-            let Some(capabilities) = endpoint_capabilities.get(&target.channel_id.0) else {
-                return false;
-            };
-            match endpoint_family.support(capabilities) {
-                EndpointSupport::Supported => true,
-                EndpointSupport::Unsupported => {
-                    has_unsupported_target = true;
-                    false
-                }
-                EndpointSupport::Unknown => false,
+    let mut unsupported_target_count = 0;
+    let mut unknown_or_missing_target_count = 0;
+    let mut targets = Vec::new();
+    for target in &route.targets {
+        let Some(capabilities) = endpoint_capabilities.get(&target.channel_id.0) else {
+            unknown_or_missing_target_count += 1;
+            continue;
+        };
+        match endpoint_family.support(capabilities) {
+            EndpointSupport::Supported => targets.push(target.clone()),
+            EndpointSupport::Unsupported => {
+                has_unsupported_target = true;
+                unsupported_target_count += 1;
             }
-        })
-        .cloned()
-        .collect();
+            EndpointSupport::Unknown => {
+                unknown_or_missing_target_count += 1;
+            }
+        }
+    }
+    let supported_target_count = targets.len();
     if targets.is_empty() {
         return EndpointFamilyRouteTargets {
             route: None,
             has_unsupported_target,
+            supported_target_count,
+            unsupported_target_count,
+            unknown_or_missing_target_count,
         };
     }
     EndpointFamilyRouteTargets {
@@ -1032,6 +1312,9 @@ fn route_with_endpoint_family_targets(
             targets,
         }),
         has_unsupported_target,
+        supported_target_count,
+        unsupported_target_count,
+        unknown_or_missing_target_count,
     }
 }
 
@@ -1331,6 +1614,19 @@ mod tests {
         assert_eq!(explain.reason_code, "available");
         assert_eq!(explain.next_action, "none");
         assert_eq!(explain.client_token.as_ref().unwrap().id, "client-a");
+
+        let value = serde_json::to_value(&explain).unwrap();
+        assert_eq!(value["can_use"], true);
+        assert_eq!(value["blocking_domain"], "none");
+        assert_eq!(value["model"], "gpt-public");
+        assert_eq!(value["client_token_ref"], "client-a");
+        assert_eq!(value["evidence"]["route_target_count"], 1);
+        assert_eq!(value["evidence"]["endpoint_family_target_count"], 1);
+        assert_eq!(value["evidence"]["selected_target_present"], true);
+        assert_eq!(value["next_step"]["template_id"], "no_action_required");
+        assert_eq!(value["next_step"]["safe_argv"], serde_json::json!([]));
+        assert_eq!(value["next_step"]["side_effect_class"], "runtime_readonly");
+        assert_eq!(value["next_step"]["requires_confirmation"], false);
     }
 
     #[test]
@@ -1354,6 +1650,19 @@ mod tests {
             },
         );
         assert_eq!(missing.reason_code, "token_missing");
+        let missing_value = serde_json::to_value(&missing).unwrap();
+        assert_eq!(missing_value["can_use"], false);
+        assert_eq!(missing_value["blocking_domain"], "client_token");
+        assert_eq!(missing_value["client_token_ref"], serde_json::Value::Null);
+        assert_eq!(missing_value["evidence"]["client_token_known"], false);
+        assert_eq!(
+            missing_value["next_step"]["template_id"],
+            "models_explain_with_client_token_ref"
+        );
+        assert_eq!(
+            missing_value["next_step"]["side_effect_class"],
+            "runtime_readonly"
+        );
 
         let unknown = endpoint_family_availability_explain_from_parts(
             EndpointFamilyAvailabilityExplainInput {
@@ -1372,6 +1681,11 @@ mod tests {
             },
         );
         assert_eq!(unknown.reason_code, "token_unknown");
+        let unknown_value = serde_json::to_value(&unknown).unwrap();
+        assert_eq!(unknown_value["can_use"], false);
+        assert_eq!(unknown_value["blocking_domain"], "client_token");
+        assert_eq!(unknown_value["client_token_ref"], "unknown");
+        assert_eq!(unknown_value["evidence"]["client_token_known"], false);
 
         let disabled = endpoint_family_availability_explain_from_parts(
             EndpointFamilyAvailabilityExplainInput {
@@ -1390,6 +1704,12 @@ mod tests {
             },
         );
         assert_eq!(disabled.reason_code, "token_disabled");
+        let disabled_value = serde_json::to_value(&disabled).unwrap();
+        assert_eq!(disabled_value["can_use"], false);
+        assert_eq!(disabled_value["blocking_domain"], "client_token");
+        assert_eq!(disabled_value["client_token_ref"], "disabled");
+        assert_eq!(disabled_value["evidence"]["client_token_known"], true);
+        assert_eq!(disabled_value["evidence"]["client_token_enabled"], false);
     }
 
     #[test]
@@ -1414,6 +1734,12 @@ mod tests {
             },
         );
         assert_eq!(model_missing.reason_code, "model_missing");
+        let model_missing_value = serde_json::to_value(&model_missing).unwrap();
+        assert_eq!(model_missing_value["can_use"], false);
+        assert_eq!(model_missing_value["blocking_domain"], "model");
+        assert_eq!(model_missing_value["model"], "missing-model");
+        assert_eq!(model_missing_value["evidence"]["model_allowed"], true);
+        assert_eq!(model_missing_value["evidence"]["model_visible"], false);
 
         let unsupported_family = endpoint_family_availability_explain_from_parts(
             EndpointFamilyAvailabilityExplainInput {
@@ -1438,6 +1764,14 @@ mod tests {
             unsupported_family.reason_code,
             "endpoint_family_unsupported"
         );
+        let unsupported_value = serde_json::to_value(&unsupported_family).unwrap();
+        assert_eq!(unsupported_value["can_use"], false);
+        assert_eq!(unsupported_value["blocking_domain"], "endpoint_family");
+        assert_eq!(unsupported_value["evidence"]["unsupported_target_count"], 1);
+        assert_eq!(
+            unsupported_value["evidence"]["unknown_or_missing_target_count"],
+            0
+        );
 
         let family_mismatch = endpoint_family_availability_explain_from_parts(
             EndpointFamilyAvailabilityExplainInput {
@@ -1459,6 +1793,17 @@ mod tests {
             },
         );
         assert_eq!(family_mismatch.reason_code, "endpoint_family_mismatch");
+        let mismatch_value = serde_json::to_value(&family_mismatch).unwrap();
+        assert_eq!(mismatch_value["can_use"], false);
+        assert_eq!(mismatch_value["blocking_domain"], "endpoint_family");
+        assert_eq!(
+            mismatch_value["evidence"]["endpoint_family_target_count"],
+            0
+        );
+        assert_eq!(
+            mismatch_value["evidence"]["unknown_or_missing_target_count"],
+            1
+        );
     }
 
     #[test]
@@ -1483,6 +1828,10 @@ mod tests {
             },
         );
         assert_eq!(no_route.reason_code, "no_route");
+        let no_route_value = serde_json::to_value(&no_route).unwrap();
+        assert_eq!(no_route_value["can_use"], false);
+        assert_eq!(no_route_value["blocking_domain"], "route");
+        assert_eq!(no_route_value["evidence"]["route_present"], false);
 
         let no_usable = endpoint_family_availability_explain_from_parts(
             EndpointFamilyAvailabilityExplainInput {
@@ -1504,5 +1853,13 @@ mod tests {
             },
         );
         assert_eq!(no_usable.reason_code, "no_usable_key_or_target");
+        let no_usable_value = serde_json::to_value(&no_usable).unwrap();
+        assert_eq!(no_usable_value["can_use"], false);
+        assert_eq!(no_usable_value["blocking_domain"], "target");
+        assert_eq!(
+            no_usable_value["evidence"]["candidate_reason_codes"],
+            serde_json::json!(["no_available_credentials"])
+        );
+        assert_eq!(no_usable_value["next_step"]["template_id"], "route_explain");
     }
 }
