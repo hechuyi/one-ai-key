@@ -19879,6 +19879,98 @@ pools:
     }
 
     #[tokio::test]
+    async fn management_model_availability_redacts_unsafe_client_token_identity_fields() {
+        let state = endpoint_capability_projection_state();
+        state.client_tokens.write().unwrap().extend([
+            crate::config::ResolvedClientToken {
+                id: "safe-client-unsafe-name".to_string(),
+                name: "https://relay.example/v1?secret=sk-SHOULD_NOT_RENDER\njoin-now".to_string(),
+                token_hash: hash_token("unsafe-name-client-token"),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            },
+            crate::config::ResolvedClientToken {
+                id: "/tmp/private/sk-SHOULD_NOT_RENDER".to_string(),
+                name: "safe-client-unsafe-id".to_string(),
+                token_hash: hash_token("unsafe-id-client-token"),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            },
+            crate::config::ResolvedClientToken {
+                id: "\tcontrol-client-id".to_string(),
+                name: "safe-client-control-id".to_string(),
+                token_hash: hash_token("unsafe-control-client-token"),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            },
+        ]);
+        let app = app(state);
+
+        let unsafe_name = management_response_json(
+            &app,
+            "/management/model-availability?model=gpt-capability&endpoint_family=chat_completions&client_token_ref=safe-client-unsafe-name",
+        )
+        .await;
+        assert_eq!(unsafe_name["status"], "available");
+        assert_eq!(unsafe_name["client_token"]["id"], "safe-client-unsafe-name");
+        assert_eq!(
+            unsafe_name["client_token"]["name"],
+            "<redacted-client-token-name>"
+        );
+
+        let unsafe_id = management_response_json(
+            &app,
+            "/management/model-availability?model=gpt-capability&endpoint_family=chat_completions&client_token_ref=safe-client-unsafe-id",
+        )
+        .await;
+        assert_eq!(unsafe_id["status"], "available");
+        assert_eq!(
+            unsafe_id["client_token"]["id"],
+            "<redacted-client-token-id>"
+        );
+        assert_eq!(unsafe_id["client_token"]["name"], "safe-client-unsafe-id");
+
+        let unsafe_control_id = management_response_json(
+            &app,
+            "/management/model-availability?model=gpt-capability&endpoint_family=chat_completions&client_token_ref=safe-client-control-id",
+        )
+        .await;
+        assert_eq!(unsafe_control_id["status"], "available");
+        assert_eq!(
+            unsafe_control_id["client_token"]["id"],
+            "<redacted-client-token-id>"
+        );
+        assert_eq!(
+            unsafe_control_id["client_token"]["name"],
+            "safe-client-control-id"
+        );
+
+        let rendered = serde_json::to_string(&serde_json::json!([
+            unsafe_name,
+            unsafe_id,
+            unsafe_control_id
+        ]))
+        .unwrap();
+        for forbidden in [
+            "SHOULD_NOT_RENDER",
+            "sk-",
+            "secret=",
+            "https://relay.example",
+            "/tmp/private",
+            "\njoin-now",
+            "control-client-id",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "model availability leaked unsafe client-token identity material {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn management_model_availability_default_channel_passthrough_is_available() {
         let app = app(test_state());
 

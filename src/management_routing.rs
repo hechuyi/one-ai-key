@@ -848,8 +848,8 @@ pub fn endpoint_family_availability_explain_from_parts(
         );
     };
     let client_status = EndpointFamilyAvailabilityClient {
-        id: client.id.clone(),
-        name: client.name.clone(),
+        id: safe_client_token_id_label(&client.id),
+        name: safe_client_token_name_label(&client.name),
         enabled: client.enabled,
     };
     if !client.enabled {
@@ -1179,11 +1179,18 @@ fn endpoint_family_next_step(reason_code: &str) -> EndpointFamilyAvailabilityNex
 }
 
 fn safe_reference_label(reference: &str) -> String {
+    safe_reference_label_value(reference).unwrap_or_else(|| "<redacted-reference>".to_string())
+}
+
+fn safe_reference_label_value(reference: &str) -> Option<String> {
+    if reference.chars().any(char::is_control) {
+        return None;
+    }
     let trimmed = reference.trim();
     if is_safe_reference_label(trimmed) {
-        trimmed.to_string()
+        Some(trimmed.to_string())
     } else {
-        "<redacted-reference>".to_string()
+        None
     }
 }
 
@@ -1200,6 +1207,14 @@ fn is_safe_reference_label(reference: &str) -> bool {
         && !reference.to_ascii_lowercase().contains("bearer")
         && !reference.to_ascii_lowercase().contains("sk-")
         && !reference.to_ascii_lowercase().contains("sk_")
+}
+
+fn safe_client_token_id_label(id: &str) -> String {
+    safe_reference_label_value(id).unwrap_or_else(|| "<redacted-client-token-id>".to_string())
+}
+
+fn safe_client_token_name_label(name: &str) -> String {
+    safe_reference_label_value(name).unwrap_or_else(|| "<redacted-client-token-name>".to_string())
 }
 
 fn safe_public_model_label(public_model: &str) -> String {

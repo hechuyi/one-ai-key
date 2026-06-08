@@ -416,8 +416,14 @@ fn sanitize_model_availability(value: &Value) -> Value {
         .and_then(Value::as_object)
         .map(|token| {
             serde_json::json!({
-                "id": token.get("id").and_then(Value::as_str),
-                "name": token.get("name").and_then(Value::as_str),
+                "id": token
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(safe_client_token_id_label),
+                "name": token
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(safe_client_token_name_label),
                 "enabled": token.get("enabled").and_then(Value::as_bool),
             })
         });
@@ -616,6 +622,9 @@ fn is_safe_reason_code(value: &str) -> bool {
 }
 
 fn safe_reference_label_value(reference: &str) -> Option<String> {
+    if reference.chars().any(char::is_control) {
+        return None;
+    }
     let trimmed = reference.trim();
     if !trimmed.is_empty()
         && trimmed.len() <= 128
@@ -633,6 +642,22 @@ fn safe_reference_label_value(reference: &str) -> Option<String> {
         Some(trimmed.to_string())
     } else {
         None
+    }
+}
+
+fn safe_client_token_id_label(id: &str) -> String {
+    if safe_reference_label_value(id).is_some() {
+        id.trim().to_string()
+    } else {
+        "<redacted-client-token-id>".to_string()
+    }
+}
+
+fn safe_client_token_name_label(name: &str) -> String {
+    if safe_reference_label_value(name).is_some() {
+        name.trim().to_string()
+    } else {
+        "<redacted-client-token-name>".to_string()
     }
 }
 
@@ -1377,6 +1402,11 @@ mod tests {
                 "unsafe_path": "/tmp/SHOULD_NOT_RENDER"
             },
             "next_action": "none",
+            "client_token": {
+                "id": "\tcontrol-client-id",
+                "name": "https://relay.example/tmp/private?secret=sk-SHOULD_NOT_RENDER\njoin-now",
+                "enabled": true
+            },
             "raw_token": "SHOULD_NOT_RENDER"
         });
 
@@ -1405,10 +1435,25 @@ mod tests {
         assert_eq!(report["next_action"]["safe_argv"], serde_json::json!([]));
         assert_eq!(report["availability"]["can_use"], true);
         assert_eq!(report["availability"]["blocking_domain"], "none");
+        assert_eq!(
+            report["availability"]["client_token"]["id"],
+            "<redacted-client-token-id>"
+        );
+        assert_eq!(
+            report["availability"]["client_token"]["name"],
+            "<redacted-client-token-name>"
+        );
+        assert_eq!(report["availability"]["client_token"]["enabled"], true);
         assert_eq!(report["selected_target"], serde_json::Value::Null);
         assert_eq!(report["route_kind"], "explicit_model_route");
         assert_eq!(report["registry_generation"], 5);
         assert!(!rendered.contains("SHOULD_NOT_RENDER"));
+        assert!(!rendered.contains("secret="));
+        assert!(!rendered.contains("https://relay.example"));
+        assert!(!rendered.contains("/tmp/private"));
+        assert!(!rendered.contains("sk-SHOULD_NOT_RENDER"));
+        assert!(!rendered.contains("control-client-id"));
+        assert!(!rendered.contains("join-now"));
         assert!(!rendered.contains("/tmp/"));
         assert!(!rendered.contains("raw_secret"));
     }
