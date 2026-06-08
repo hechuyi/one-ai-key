@@ -1538,6 +1538,36 @@ mod tests {
     }
 
     #[test]
+    fn retry_gate_rejects_generic_endpoint_family() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let now = std::time::Instant::now();
+        let mut snapshot = snapshot_for(&selected);
+        snapshot.endpoint = EndpointKind::Generic;
+        snapshot.route_target_available = false;
+        snapshot.effective_deadline = Some(
+            now + std::time::Duration::from_millis(CONSERVATIVE_RETRY_BUDGET.as_millis() as u64),
+        );
+
+        let result = transition_after_failure(TransitionInput {
+            snapshot: &snapshot,
+            failure: retryable_5xx_provider_failure(),
+            failure_source: FailureSource::UpstreamTransaction,
+            now,
+            next_attempt_budget: Some(std::time::Duration::from_millis(50)),
+            policy: policy(),
+        });
+
+        assert_eq!(
+            result.retry,
+            RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::FailureNotRetryable,
+            }
+        );
+        assert_eq!(result.duplicate_charge_risk, DuplicateChargeRisk::None);
+    }
+
+    #[test]
     fn retry_gate_denies_named_channel_selection() {
         let mut pool = pool();
         let selected = pool.select().unwrap();

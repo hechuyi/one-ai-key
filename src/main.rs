@@ -25825,6 +25825,76 @@ pools:
     }
 
     #[tokio::test]
+    async fn v1_models_is_local_catalog_and_not_m3_retry_candidate() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_for_handler = calls.clone();
+        let upstream = Router::new().route(
+            "/v1/models",
+            get(move || {
+                let calls = calls_for_handler.clone();
+                async move {
+                    let hit = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if hit == 1 {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "upstream_unavailable",
+                                    "message": "provider unavailable"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "object": "list",
+                        "data": [
+                            {"id": "unexpected-upstream-model", "object": "model"}
+                        ]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let mut config = test_config_with_api_base(&api_base);
+        config.model_routes = HashMap::from([priority_route("gpt-public", ["test"])]);
+        let state = AppState::new(config.resolve().unwrap()).unwrap();
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/models")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["data"][0]["id"], "gpt-public");
+
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned");
+        let events = telemetry.snapshot();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RoutingTelemetry::UpstreamFailureObserved { .. })),
+            "/v1/models local catalog must not enter upstream failure transition or M3 retry"
+        );
+        let counters = telemetry.retry_pressure_snapshot();
+        assert_eq!(counters.by_directive.retry_same_target, 0);
+    }
+
+    #[tokio::test]
     async fn v1_models_ignores_request_body_limit_when_returning_compiled_catalog() {
         let api_base = spawn_upstream(Router::new()).await;
         let mut config = test_config_with_api_base(&api_base);
@@ -32261,6 +32331,87 @@ model_routes:
         }
     }
 
+    #[tokio::test]
+    async fn streaming_transient_5xx_does_not_retry_same_target() {
+        let upstream_hits = Arc::new(AtomicU64::new(0));
+        let upstream_hits_for_handler = upstream_hits.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let upstream_hits = upstream_hits_for_handler.clone();
+                async move {
+                    let hit = upstream_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if hit == 1 {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "upstream_unavailable",
+                                    "message": "provider unavailable"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "id": "unexpected",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "unexpected-retry"}}
+                        ]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state = test_state_with_api_base(&api_base);
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","messages":[{"role":"user","content":"ok"}],"stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned");
+        let events = telemetry.snapshot();
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    RoutingTelemetry::UpstreamFailureObserved { failure, .. }
+                        if failure.directive == "return_error"
+                            && failure.retry_decision == "return_current_error"
+                            && failure.denial_reason.as_deref()
+                                == Some("streaming_not_retryable")
+                            && failure.failure_kind == "provider_unavailable"
+                            && failure.failure_scope == "channel"
+                            && failure.status == Some(503)
+                            && failure.duplicate_charge_risk == "none"
+                )
+            }),
+            "streaming transient 5xx must record a stable retry denial"
+        );
+        let counters = telemetry.retry_pressure_snapshot();
+        assert_eq!(counters.by_directive.retry_same_target, 0);
+    }
+
     async fn assert_m3_ineligible_request_does_not_retry(
         app_uri: &'static str,
         upstream_path: &'static str,
@@ -33376,7 +33527,7 @@ model_routes:
     }
 
     #[tokio::test]
-    async fn chat_provider_cooldown_single_route_target_is_soft_last_resort() {
+    async fn last_resort_provider_cooling_admission_is_not_same_request_retry() {
         let upstream_hits = Arc::new(AtomicU64::new(0));
         let upstream_hits_for_handler = upstream_hits.clone();
         let upstream = Router::new().route(
@@ -33505,7 +33656,7 @@ model_routes:
             ChannelRouteState::ProviderCoolingDown
         );
 
-        let second = app(state)
+        let second = app(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -33528,6 +33679,25 @@ model_routes:
             value["choices"][0]["message"]["content"].as_str(),
             Some("chat-ok")
         );
+
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned");
+        let events = telemetry.snapshot();
+        assert!(
+            !events.iter().any(|event| {
+                matches!(
+                    event,
+                    RoutingTelemetry::UpstreamFailureObserved { failure, .. }
+                        if failure.directive == "retry_same_target"
+                            || failure.retry_decision == "retry_same_target"
+                )
+            }),
+            "soft last-resort admission must remain a first attempt, not a same-request retry"
+        );
+        let counters = telemetry.retry_pressure_snapshot();
+        assert_eq!(counters.by_directive.retry_same_target, 0);
     }
 
     #[tokio::test]

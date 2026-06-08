@@ -26,6 +26,14 @@ fn assert_contains_all(source: &str, context: &str, expected: &[&str]) {
 #[test]
 fn existing_runtime_tests_cover_pre_output_retry_and_retry_denials() {
     let main = read_repo_file("src/main.rs");
+    let ineligible_endpoint_contract = format!(
+        "{}\n{}",
+        test_body(
+            &main,
+            "m3_ineligible_endpoint_families_and_named_pool_do_not_retry",
+        ),
+        test_body(&main, "assert_m3_ineligible_request_does_not_retry"),
+    );
 
     assert_contains_all(
         test_body(
@@ -46,10 +54,7 @@ fn existing_runtime_tests_cover_pre_output_retry_and_retry_denials() {
     );
 
     assert_contains_all(
-        test_body(
-            &main,
-            "m3_ineligible_endpoint_families_and_named_pool_do_not_retry",
-        ),
+        &ineligible_endpoint_contract,
         "M3 ineligible endpoint and named-pool retry denial characterization",
         &[
             "\"/v1/embeddings\"",
@@ -173,6 +178,16 @@ fn existing_transition_tests_cover_stable_denial_and_duplicate_charge_codes() {
     );
 
     assert_contains_all(
+        test_body(&routing, "retry_gate_rejects_generic_endpoint_family"),
+        "M3 generic endpoint retry denial boundary",
+        &[
+            "EndpointKind::Generic",
+            "FailureNotRetryable",
+            "DuplicateChargeRisk::None",
+        ],
+    );
+
+    assert_contains_all(
         test_body(&routing, "retry_gate_denies_named_channel_selection"),
         "M3 named-pool retry denial boundary",
         &["SelectionReason::NamedChannel", "FailureNotRetryable"],
@@ -203,5 +218,79 @@ fn existing_transition_tests_cover_stable_denial_and_duplicate_charge_codes() {
         &failure_observer,
         "stable retry denial telemetry codes",
         &["\"streaming_not_retryable\"", "\"partial_output_started\""],
+    );
+}
+
+#[test]
+fn stage1_task5_m3_retry_non_expansion_contract_is_explicit() {
+    let main = read_repo_file("src/main.rs");
+    let routing = read_repo_file("src/routing.rs");
+
+    assert_contains_all(
+        test_body(
+            &main,
+            "last_resort_provider_cooling_admission_is_not_same_request_retry",
+        ),
+        "soft last-resort admission is first-attempt characterization",
+        &[
+            "ProviderCoolingDown",
+            "upstream_hits.load(Ordering::SeqCst), 2",
+            "retry_same_target",
+            "counters.by_directive.retry_same_target, 0",
+        ],
+    );
+
+    assert_contains_all(
+        test_body(&main, "streaming_transient_5xx_does_not_retry_same_target"),
+        "streaming transient 5xx retry denial characterization",
+        &[
+            "\"stream\":true",
+            "StatusCode::SERVICE_UNAVAILABLE",
+            "upstream_hits.load(Ordering::SeqCst), 1",
+            "streaming_not_retryable",
+            "counters.by_directive.retry_same_target, 0",
+        ],
+    );
+
+    assert_contains_all(
+        test_body(
+            &main,
+            "v1_models_is_local_catalog_and_not_m3_retry_candidate",
+        ),
+        "/v1/models local catalog retry exclusion characterization",
+        &[
+            "\"/v1/models\"",
+            "calls.load(Ordering::SeqCst), 0",
+            "UpstreamFailureObserved",
+            "counters.by_directive.retry_same_target, 0",
+        ],
+    );
+
+    assert_contains_all(
+        test_body(
+            &routing,
+            "guarded_success_envelope_does_not_retry_same_target",
+        ),
+        "guarded success envelope retry denial characterization",
+        &[
+            "FailureSource::GuardedSuccessEnvelope",
+            "ProviderUnavailable",
+            "FailureNotRetryable",
+        ],
+    );
+
+    assert_contains_all(
+        test_body(
+            &main,
+            "response_filter_precommit_channel_cooldown_returns_error_without_route_fallback",
+        ),
+        "response filter precommit retry denial characterization",
+        &[
+            "response_filter_precommit",
+            "fallback_hits.load(Ordering::SeqCst), 0",
+            "failure_not_retryable",
+            "duplicate_charge_risk",
+            "none",
+        ],
     );
 }
