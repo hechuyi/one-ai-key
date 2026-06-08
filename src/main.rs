@@ -24328,6 +24328,73 @@ pools:
     }
 
     #[tokio::test]
+    async fn routing_telemetry_exports_failure_transition_summaries_for_diagnosis() {
+        let state = test_state();
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::UpstreamFailureObserved {
+                request_id: "req_diagnosis_summary".to_string(),
+                channel_id: "test".to_string(),
+                failure: Box::new(UpstreamFailureTelemetry {
+                    public_model: Some("gpt-test".to_string()),
+                    credential_id_hash: "safe-credential-hash".to_string(),
+                    attempt: 1,
+                    failure_source: "upstream_transaction".to_string(),
+                    failure_kind: "provider_unavailable".to_string(),
+                    failure_scope: "channel".to_string(),
+                    retryable: true,
+                    confidence: "high".to_string(),
+                    status: Some(503),
+                    classifier_id: "test-classifier".to_string(),
+                    classifier_version: "1".to_string(),
+                    adaptation_rule_id: None,
+                    retry_after_source: None,
+                    cooldown_seconds: None,
+                    directive: "retry_route_target".to_string(),
+                    denial_reason: None,
+                    duplicate_charge_risk: "unknown".to_string(),
+                    effective_deadline_remaining_ms: Some(2500),
+                    retry_pressure_accounted: true,
+                    retry_decision: "retry_route_target".to_string(),
+                    retry_decision_reason: Some("route_target_retry_allowed".to_string()),
+                }),
+            });
+        state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .push(RoutingTelemetry::ChannelHealthTransitionApplied {
+                request_id: "req_diagnosis_summary".to_string(),
+                channel_id: "test".to_string(),
+                state: "degraded".to_string(),
+                reason: "upstream_provider_unavailable".to_string(),
+            });
+
+        let body = management_response_json(&app(state), "/management/routing-telemetry").await;
+        let summaries = body["failure_transition_summaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary["request_id"], "req_diagnosis_summary");
+        assert_eq!(summary["channel_id"], "test");
+        assert_eq!(summary["public_model"], "gpt-test");
+        assert_eq!(summary["failure_kind"], "provider_unavailable");
+        assert_eq!(summary["failure_scope"], "channel");
+        assert_eq!(
+            summary["transition_action"],
+            "mark_provider_account_channel_degraded"
+        );
+        assert_eq!(summary["resulting_state"], "degraded");
+        assert_eq!(summary["retry_decision"], "retry_route_target");
+        assert_eq!(
+            summary["retry_decision_reason"],
+            "route_target_retry_allowed"
+        );
+        assert_eq!(body["events"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn management_routing_telemetry_sanitizes_internal_credential_and_rule_ids() {
         let state = test_state();
         state
