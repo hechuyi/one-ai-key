@@ -48,20 +48,6 @@ fn render_route_explain_json(preview: &Value) -> String {
 }
 
 fn sanitized_route_explain_report(preview: &Value) -> Value {
-    let has_selected_target = preview
-        .get("selected_target")
-        .is_some_and(|target| !target.is_null());
-    let status = if has_selected_target { "ok" } else { "blocked" };
-    let reason_code = if has_selected_target {
-        "route_candidate_selected"
-    } else {
-        "no_route_candidate"
-    };
-    let reason = if has_selected_target {
-        "A runtime route candidate is selected."
-    } else {
-        "No runtime route candidate is selected for the requested public model."
-    };
     let effect = crate::cli_effects::runtime_readonly_effect();
     let runtime_reload =
         crate::cli_commands::runtime_reload_projection::summarize_runtime_reload_projection(
@@ -81,6 +67,16 @@ fn sanitized_route_explain_report(preview: &Value) -> Value {
         .unwrap_or_default();
     let capability_status =
         crate::cli_report::endpoint_capability_status_from_candidates(&candidates);
+    let admission_summary = sanitize_admission_summary(preview.get("admission_summary"));
+    let status = admission_summary
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let reason_code = admission_summary
+        .get("reason_code")
+        .and_then(Value::as_str)
+        .unwrap_or("admission_summary_missing");
+    let reason = route_admission_reason(status, reason_code);
     let data = serde_json::json!({
         "command": "route explain",
         "active_registry_generation": runtime_reload.active_registry_generation,
@@ -98,12 +94,13 @@ fn sanitized_route_explain_report(preview: &Value) -> Value {
         "policy_summary": sanitize_policy_summary(preview.get("policy_summary")),
         "client_token": sanitize_client_token(preview.get("client_token")),
         "selected_target": sanitize_target(preview.get("selected_target")),
+        "admission_summary": admission_summary,
         "next_action": route_next_action(status, preview),
         "candidates": candidates,
     });
     envelope_with_legacy_fields(
         status,
-        reason,
+        &reason,
         reason_code,
         effect,
         serde_json::json!({
@@ -118,12 +115,29 @@ fn sanitized_route_explain_report(preview: &Value) -> Value {
     )
 }
 
+fn route_admission_reason(status: &str, reason_code: &str) -> String {
+    match status {
+        "available" => "Backend route admission projection reports an available route.".to_string(),
+        "last_resort" => {
+            format!(
+                "Backend route admission projection reports last-resort admission: {reason_code}."
+            )
+        }
+        "unavailable" => {
+            format!(
+                "Backend route admission projection reports admission unavailable: {reason_code}."
+            )
+        }
+        _ => "Backend route admission projection is unavailable.".to_string(),
+    }
+}
+
 fn route_next_action(status: &str, preview: &Value) -> Value {
     let model = preview
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("<unknown>");
-    if status == "ok" {
+    if matches!(status, "available" | "last_resort") {
         serde_json::json!({
             "summary": "A runtime route candidate is selected. No repair action is required by route explain.",
             "template_id": "no_action_required",
@@ -140,6 +154,67 @@ fn route_next_action(status: &str, preview: &Value) -> Value {
             "requires_confirmation": false,
         })
     }
+}
+
+fn sanitize_admission_summary(summary: Option<&Value>) -> Value {
+    let Some(summary) = summary.and_then(Value::as_object) else {
+        return serde_json::json!({
+            "status": "unknown",
+            "reason_code": "admission_summary_missing",
+            "selected_target": Value::Null,
+            "candidate_count": Value::Null,
+            "included_count": Value::Null,
+            "blocked_count": Value::Null,
+            "soft_suppressed_count": Value::Null,
+            "hard_blocked_count": Value::Null,
+            "last_resort_used": false,
+            "last_resort_reason": Value::Null,
+        });
+    };
+
+    serde_json::json!({
+        "status": safe_admission_code(summary.get("status")),
+        "reason_code": safe_admission_code(summary.get("reason_code")),
+        "selected_target": sanitize_target(summary.get("selected_target")),
+        "candidate_count": summary.get("candidate_count").and_then(Value::as_u64),
+        "included_count": summary.get("included_count").and_then(Value::as_u64),
+        "blocked_count": summary.get("blocked_count").and_then(Value::as_u64),
+        "soft_suppressed_count": summary
+            .get("soft_suppressed_count")
+            .and_then(Value::as_u64),
+        "hard_blocked_count": summary
+            .get("hard_blocked_count")
+            .and_then(Value::as_u64),
+        "last_resort_used": summary
+            .get("last_resort_used")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "last_resort_reason": safe_optional_admission_code(summary.get("last_resort_reason")),
+    })
+}
+
+fn safe_admission_code(value: Option<&Value>) -> Value {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| safe_admission_code_str(value))
+        .map(Value::from)
+        .unwrap_or_else(|| Value::from("unknown"))
+}
+
+fn safe_optional_admission_code(value: Option<&Value>) -> Value {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| safe_admission_code_str(value))
+        .map(Value::from)
+        .unwrap_or(Value::Null)
+}
+
+fn safe_admission_code_str(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn envelope_with_legacy_fields(
@@ -292,6 +367,7 @@ fn render_route_explain_table_from_report(report: &Value) -> String {
         "capability_status",
         report.get("capability_status"),
     );
+    append_admission_summary_table_fields(&mut output, report.get("admission_summary"));
 
     if let Some(route_kind) = report.get("route_kind").and_then(Value::as_str) {
         output.push_str(&format!("route_kind: {}\n", display_value(route_kind)));
@@ -412,6 +488,56 @@ fn render_route_explain_table_from_report(report: &Value) -> String {
     output
 }
 
+fn append_admission_summary_table_fields(output: &mut String, admission_summary: Option<&Value>) {
+    let Some(admission_summary) = admission_summary else {
+        return;
+    };
+    crate::cli_report::push_table_field(
+        output,
+        "admission.status",
+        admission_summary.get("status"),
+    );
+    crate::cli_report::push_table_field(
+        output,
+        "admission.reason_code",
+        admission_summary.get("reason_code"),
+    );
+    let selected = admission_summary.get("selected_target");
+    let selected_channel = selected
+        .and_then(|target| target.get("channel_id"))
+        .and_then(Value::as_str)
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    crate::cli_report::push_table_field(
+        output,
+        "admission.selected_target",
+        Some(&selected_channel),
+    );
+    if let Some(plan_position) = selected
+        .and_then(|target| target.get("plan_position"))
+        .and_then(Value::as_u64)
+    {
+        output.push_str(&format!(
+            "admission.selected_plan_position: {plan_position}\n"
+        ));
+    }
+    for field in [
+        "candidate_count",
+        "included_count",
+        "blocked_count",
+        "soft_suppressed_count",
+        "hard_blocked_count",
+        "last_resort_used",
+        "last_resort_reason",
+    ] {
+        crate::cli_report::push_table_field(
+            output,
+            &format!("admission.{field}"),
+            admission_summary.get(field),
+        );
+    }
+}
+
 fn credential_summary(credentials: &Value) -> String {
     let available = credentials
         .get("available")
@@ -468,6 +594,18 @@ mod tests {
                 "channel_id": "relay-a",
                 "plan_position": 0
             },
+            "admission_summary": {
+                "status": "available",
+                "reason_code": "available",
+                "selected_target": {"channel_id": "relay-a", "plan_position": 0},
+                "candidate_count": 2,
+                "included_count": 1,
+                "blocked_count": 1,
+                "soft_suppressed_count": 0,
+                "hard_blocked_count": 1,
+                "last_resort_used": false,
+                "last_resort_reason": null
+            },
             "candidates": [
                 {
                     "target_index": 0,
@@ -506,14 +644,20 @@ mod tests {
             super::render_route_explain_report(&preview, crate::cli_report::OutputFormat::Table);
 
         assert!(rendered.contains("Route plan for gpt-4o"));
-        assert!(rendered.contains("status: ok"));
-        assert!(rendered.contains("reason_code: route_candidate_selected"));
+        assert!(rendered.contains("status: available"));
+        assert!(rendered.contains("reason_code: available"));
         assert!(rendered.contains("side_effect_class: runtime_readonly"));
         assert!(rendered.contains("effect.reads_management_runtime: true"));
         assert!(rendered.contains("scope.model: gpt-4o"));
         assert!(rendered.contains("scope.client_token_ref: local-client"));
         assert!(rendered.contains("next_action:"));
         assert!(rendered.contains("next_action.safe_argv: []"));
+        assert!(rendered.contains("admission.status: available"));
+        assert!(rendered.contains("admission.reason_code: available"));
+        assert!(rendered.contains("admission.candidate_count: 2"));
+        assert!(rendered.contains("admission.included_count: 1"));
+        assert!(rendered.contains("admission.blocked_count: 1"));
+        assert!(rendered.contains("admission.hard_blocked_count: 1"));
         assert!(rendered.contains("selected_target: relay-a"));
         assert!(rendered.contains("selected_plan_position: 0"));
         assert!(rendered.contains("route_target_retry_enabled: true"));
@@ -543,6 +687,23 @@ mod tests {
                 "plan_position": 0,
                 "raw_key": "RAW_SECRET_SHOULD_NOT_APPEAR"
             },
+            "admission_summary": {
+                "status": "available",
+                "reason_code": "available",
+                "selected_target": {
+                    "channel_id": "relay-a",
+                    "plan_position": 0,
+                    "raw_key": "RAW_SECRET_SHOULD_NOT_APPEAR"
+                },
+                "candidate_count": 1,
+                "included_count": 1,
+                "blocked_count": 0,
+                "soft_suppressed_count": 0,
+                "hard_blocked_count": 0,
+                "last_resort_used": false,
+                "last_resort_reason": null,
+                "raw_body": "RAW_SECRET_SHOULD_NOT_APPEAR"
+            },
             "candidates": [{
                 "channel_id": "relay-a",
                 "upstream_model": "provider/gpt-4o",
@@ -564,8 +725,13 @@ mod tests {
         let report: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(report["reload_diff_status"], "unknown");
-        assert!(rendered.contains("\"status\": \"ok\""));
-        assert!(rendered.contains("\"reason_code\": \"route_candidate_selected\""));
+        assert_eq!(report["status"], "available");
+        assert_eq!(report["reason_code"], "available");
+        assert_eq!(report["admission_summary"]["status"], "available");
+        assert_eq!(report["admission_summary"]["reason_code"], "available");
+        assert_eq!(report["admission_summary"]["candidate_count"], 1);
+        assert_eq!(report["admission_summary"]["included_count"], 1);
+        assert_eq!(report["admission_summary"]["blocked_count"], 0);
         assert_eq!(report["side_effect_class"], "runtime_readonly");
         assert_eq!(report["effect_vector"]["reads_management_runtime"], true);
         assert_eq!(report["window"], serde_json::Value::Null);
@@ -584,6 +750,81 @@ mod tests {
         assert!(!rendered.contains("RAW_SECRET_SHOULD_NOT_APPEAR"));
         assert!(!rendered.contains("secret-token"));
         assert!(!rendered.contains("fingerprint"));
+    }
+
+    #[test]
+    fn route_explain_admission_summary_uses_backend_projection_without_reclassification() {
+        let preview = json!({
+            "model": "gpt-4o",
+            "selected_target": {"channel_id": "relay-a", "plan_position": 0},
+            "admission_summary": {
+                "status": "last_resort",
+                "reason_code": "provider_cooling_down_last_resort",
+                "selected_target": {"channel_id": "relay-a", "plan_position": 0},
+                "candidate_count": 3,
+                "included_count": 1,
+                "blocked_count": 2,
+                "soft_suppressed_count": 1,
+                "hard_blocked_count": 1,
+                "last_resort_used": true,
+                "last_resort_reason": "provider_cooling_down_last_resort"
+            },
+            "candidates": [{
+                "channel_id": "relay-a",
+                "included": true,
+                "selected": true,
+                "target_enabled": true,
+                "plan_position": 0,
+                "reasons": ["provider_cooling_down_last_resort"],
+                "health": {"kind": "degraded", "generation": 3},
+                "credentials": {"available": 1, "expired": 0}
+            }]
+        });
+
+        let rendered_json =
+            super::render_route_explain_report(&preview, crate::cli_report::OutputFormat::Json);
+        let report: serde_json::Value = serde_json::from_str(&rendered_json).unwrap();
+
+        assert_eq!(report["status"], "last_resort");
+        assert_eq!(report["reason_code"], "provider_cooling_down_last_resort");
+        assert_eq!(report["admission_summary"]["status"], "last_resort");
+        assert_eq!(
+            report["admission_summary"]["reason_code"],
+            "provider_cooling_down_last_resort"
+        );
+        assert_eq!(
+            report["admission_summary"]["selected_target"]["channel_id"],
+            "relay-a"
+        );
+        assert_eq!(report["admission_summary"]["candidate_count"], 3);
+        assert_eq!(report["admission_summary"]["included_count"], 1);
+        assert_eq!(report["admission_summary"]["blocked_count"], 2);
+        assert_eq!(report["admission_summary"]["soft_suppressed_count"], 1);
+        assert_eq!(report["admission_summary"]["hard_blocked_count"], 1);
+        assert_eq!(report["admission_summary"]["last_resort_used"], true);
+        assert_eq!(
+            report["admission_summary"]["last_resort_reason"],
+            "provider_cooling_down_last_resort"
+        );
+        assert_ne!(report["status"], "ok");
+        assert_ne!(report["reason_code"], "route_candidate_selected");
+
+        let rendered_table =
+            super::render_route_explain_report(&preview, crate::cli_report::OutputFormat::Table);
+        assert!(rendered_table.contains("status: last_resort"));
+        assert!(rendered_table.contains("reason_code: provider_cooling_down_last_resort"));
+        assert!(rendered_table.contains("admission.status: last_resort"));
+        assert!(rendered_table.contains("admission.reason_code: provider_cooling_down_last_resort"));
+        assert!(rendered_table.contains("admission.selected_target: relay-a"));
+        assert!(rendered_table.contains("admission.selected_plan_position: 0"));
+        assert!(rendered_table.contains("admission.candidate_count: 3"));
+        assert!(rendered_table.contains("admission.included_count: 1"));
+        assert!(rendered_table.contains("admission.blocked_count: 2"));
+        assert!(rendered_table.contains("admission.soft_suppressed_count: 1"));
+        assert!(rendered_table.contains("admission.hard_blocked_count: 1"));
+        assert!(rendered_table.contains("admission.last_resort_used: true"));
+        assert!(rendered_table
+            .contains("admission.last_resort_reason: provider_cooling_down_last_resort"));
     }
 
     #[test]
