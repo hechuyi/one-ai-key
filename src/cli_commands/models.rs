@@ -1702,9 +1702,7 @@ mod tests {
         );
 
         assert!(rendered.contains("availability.blocking_domain: endpoint_family"));
-        assert!(rendered.contains(
-            "availability.evidence_source: management_model_availability"
-        ));
+        assert!(rendered.contains("availability.evidence_source: management_model_availability"));
         assert!(rendered.contains("availability.endpoint_family: embeddings"));
         assert!(!rendered.contains("raw_secret"));
         assert!(!rendered.contains("SHOULD_NOT_RENDER"));
