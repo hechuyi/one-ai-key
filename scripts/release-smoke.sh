@@ -254,6 +254,19 @@ export ONE_AI_KEY_MANAGEMENT_TOKEN="${MANAGEMENT_TOKEN}"
 MANAGEMENT_URL="http://127.0.0.1:${SERVICE_PORT}"
 COMMON=(--management-url "${MANAGEMENT_URL}" --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN)
 MANAGEMENT_REPORTS=()
+EXPECTED_MANAGEMENT_REPORTS=(
+  "doctor.json"
+  "client-tokens-list.json"
+  "models-list.json"
+  "models-explain.json"
+  "route-explain.json"
+  "keys-stats.json"
+  "failures-tail.json"
+  "reload-status.json"
+  "reload-diff.json"
+  "reload-apply-dry-run.json"
+  "negative-management-url.txt"
+)
 
 capture_management_report() {
   local output_path=$1
@@ -265,18 +278,39 @@ capture_management_report() {
 assert_bounded_evidence() {
   local report_path=$1
   local max_items=8
-  local truncated=false
-  jq -e --argjson max_items "${max_items}" --argjson truncated "${truncated}" '
+  jq -e --argjson max_items "${max_items}" '
     (.evidence | type == "object")
     and (.evidence.candidate_reason_codes | type == "array" and length <= $max_items)
-    and (.evidence.candidate_limit | type == "number")
-    and (.evidence.endpoint_family_target_count | type == "number")
-    and (.evidence.preview_candidate_count | type == "number")
-    and ($truncated == false)
+    and (.evidence.candidate_limit | type == "number" and .evidence.candidate_limit >= 0)
+    and (.evidence.route_target_count | type == "number" and .evidence.route_target_count >= 0)
+    and (.evidence.endpoint_family_target_count | type == "number" and .evidence.endpoint_family_target_count >= 0)
+    and (.evidence.unsupported_target_count | type == "number" and .evidence.unsupported_target_count >= 0)
+    and (.evidence.unknown_or_missing_target_count | type == "number" and .evidence.unknown_or_missing_target_count >= 0)
+    and (.evidence.preview_candidate_count | type == "number" and .evidence.preview_candidate_count >= 0)
   ' "${report_path}" >/dev/null
 }
 
+assert_expected_management_reports_captured() {
+  if [[ "${#MANAGEMENT_REPORTS[@]}" -ne "${#EXPECTED_MANAGEMENT_REPORTS[@]}" ]]; then
+    printf 'error: management report list did not match expected captured reports\n' >&2
+    exit 1
+  fi
+  local index
+  for index in "${!EXPECTED_MANAGEMENT_REPORTS[@]}"; do
+    if [[ "${MANAGEMENT_REPORTS[$index]}" != "${EXPECTED_MANAGEMENT_REPORTS[$index]}" ]]; then
+      printf 'error: management report list did not match expected captured reports\n' >&2
+      exit 1
+    fi
+  done
+}
+
 assert_no_management_report_leaks() {
+  if [[ "$#" -gt 0 ]]; then
+    :
+  else
+    printf 'error: no management reports were provided for leak scanning\n' >&2
+    exit 1
+  fi
   local raw_management_url="${MANAGEMENT_URL}/v1"
   local forbidden_literals=(
     "${CLIENT_TOKEN}"
@@ -293,6 +327,12 @@ assert_no_management_report_leaks() {
   local report
   local forbidden
   for report in "$@"; do
+    if [[ -s "${report}" ]]; then
+      :
+    else
+      printf 'error: management report is missing or empty: %s\n' "${report}" >&2
+      exit 1
+    fi
     for forbidden in "${forbidden_literals[@]}"; do
       if grep -Fq "${forbidden}" "${report}"; then
         printf 'error: management report %s leaked forbidden local value\n' "${report}" >&2
@@ -385,6 +425,7 @@ fi
 printf '%s\n' "${NEGATIVE_OUTPUT}" > negative-management-url.txt
 MANAGEMENT_REPORTS+=("negative-management-url.txt")
 
+assert_expected_management_reports_captured
 assert_no_management_report_leaks "${MANAGEMENT_REPORTS[@]}"
 
 printf 'release smoke passed for %s %s\n' "${PACKAGE_NAME}" "${VERSION}"

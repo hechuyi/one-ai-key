@@ -466,7 +466,24 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
 
     for required in [
         "MANAGEMENT_REPORTS=(",
+        "EXPECTED_MANAGEMENT_REPORTS=(",
+        "assert_expected_management_reports_captured",
         "assert_no_management_report_leaks",
+        "[[ \"$#\" -gt 0 ]]",
+        "[[ -s \"${report}\" ]]",
+        "management report list did not match expected captured reports",
+        "management report is missing or empty",
+        "doctor.json",
+        "client-tokens-list.json",
+        "models-list.json",
+        "models-explain.json",
+        "route-explain.json",
+        "keys-stats.json",
+        "failures-tail.json",
+        "reload-status.json",
+        "reload-diff.json",
+        "reload-apply-dry-run.json",
+        "negative-management-url.txt",
         "release-smoke-client-token",
         "release-smoke-management-token",
         "release-smoke-upstream-token",
@@ -481,11 +498,23 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
         "assert_bounded_evidence",
         "bounded_evidence",
         "max_items",
-        "truncated",
+        ".evidence.candidate_limit >= 0",
+        ".evidence.endpoint_family_target_count >= 0",
+        ".evidence.preview_candidate_count >= 0",
     ] {
         assert!(
             script.contains(required),
             "{path} must contain shared redaction/bounded-output guard `{required}`"
+        );
+    }
+    for forbidden in [
+        "local truncated=false",
+        r#"$truncated == false"#,
+        "--argjson truncated",
+    ] {
+        assert!(
+            !script.contains(forbidden),
+            "{path} must not contain constant bounded evidence assertion `{forbidden}`"
         );
     }
 }
