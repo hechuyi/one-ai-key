@@ -163,6 +163,7 @@ enum KeysCommandArgs {
     Import(KeysImportArgs),
     Probe(KeysProbeArgs),
     Disable(KeysDisableArgs),
+    Restore(KeysRestoreArgs),
     ProbeApply {
         #[command(subcommand)]
         command: KeysProbeApplyCommandArgs,
@@ -428,6 +429,25 @@ struct KeysProbeArgs {
     long_about = "Disable exactly one credential by non-secret credential_ref. Side-effect class: runtime_readonly with --dry-run, management_write with --yes. Calls upstreams: no. Confirmed disable mutates credential lifecycle state through management."
 )]
 struct KeysDisableArgs {
+    #[arg(long = "credential-set")]
+    credential_set_id: String,
+    #[arg(long = "credential-ref")]
+    credential_ref: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long, conflicts_with = "yes")]
+    dry_run: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long, value_enum, default_value_t = crate::cli_report::OutputFormat::Table)]
+    output: crate::cli_report::OutputFormat,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    long_about = "Restore exactly one credential by non-secret credential_ref. Side-effect class: offline_readonly with --dry-run, management_write with --yes. Calls upstreams: no. Confirmed restore mutates credential lifecycle state through management."
+)]
+struct KeysRestoreArgs {
     #[arg(long = "credential-set")]
     credential_set_id: String,
     #[arg(long = "credential-ref")]
@@ -763,6 +783,24 @@ where
                     crate::cli_commands::keys::KeysDisableMode::Apply
                 } else {
                     crate::cli_commands::keys::KeysDisableMode::NeedsConfirmation
+                },
+                output: args.output,
+            },
+        )),
+        Some(CliCommand::Keys {
+            command: KeysCommandArgs::Restore(args),
+        }) => CliAction::Keys(crate::cli_commands::keys::KeysCommand::Restore(
+            crate::cli_commands::keys::KeysRestoreOptions {
+                connection: operator_connection_options,
+                credential_set_id: args.credential_set_id,
+                credential_ref: args.credential_ref,
+                reason: args.reason,
+                mode: if args.dry_run {
+                    crate::cli_commands::keys::KeysRestoreMode::DryRun
+                } else if args.yes {
+                    crate::cli_commands::keys::KeysRestoreMode::Apply
+                } else {
+                    crate::cli_commands::keys::KeysRestoreMode::NeedsConfirmation
                 },
                 output: args.output,
             },
@@ -1966,6 +2004,115 @@ mod tests {
             "cr:v1:pos:0",
             "--reason",
             "operator verified bad key",
+            "--dry-run",
+            "--yes",
+        ]);
+
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn keys_restore_parse_supports_dry_run_confirmation_and_apply_modes() {
+        let dry_run = parse_action_from([
+            "one-ai-key",
+            "--management-url",
+            "https://router.example",
+            "--management-token-env",
+            "ONE_AI_KEY_MANAGEMENT_TOKEN",
+            "keys",
+            "restore",
+            "--credential-set",
+            "relay-credentials",
+            "--credential-ref",
+            "cr:v1:pos:0",
+            "--reason",
+            "operator verified recovered credential",
+            "--dry-run",
+            "--output",
+            "json",
+        ])
+        .expect("keys restore dry-run should parse");
+
+        assert_eq!(
+            dry_run,
+            CliAction::Keys(crate::cli_commands::keys::KeysCommand::Restore(
+                crate::cli_commands::keys::KeysRestoreOptions {
+                    connection: OperatorConnectionOptions {
+                        management_url: Some("https://router.example".to_string()),
+                        deprecated_base_url: None,
+                        management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                        management_token_stdin: false,
+                        timeout_seconds: 10,
+                    },
+                    credential_set_id: "relay-credentials".to_string(),
+                    credential_ref: "cr:v1:pos:0".to_string(),
+                    reason: "operator verified recovered credential".to_string(),
+                    mode: crate::cli_commands::keys::KeysRestoreMode::DryRun,
+                    output: crate::cli_report::OutputFormat::Json,
+                }
+            ))
+        );
+
+        let needs_confirmation = parse_action_from([
+            "one-ai-key",
+            "keys",
+            "restore",
+            "--credential-set",
+            "relay-credentials",
+            "--credential-ref",
+            "cr:v1:pos:0",
+            "--reason",
+            "operator verified recovered credential",
+        ])
+        .expect("keys restore should parse before confirmation validation");
+
+        assert!(matches!(
+            needs_confirmation,
+            CliAction::Keys(crate::cli_commands::keys::KeysCommand::Restore(
+                crate::cli_commands::keys::KeysRestoreOptions {
+                    mode: crate::cli_commands::keys::KeysRestoreMode::NeedsConfirmation,
+                    ..
+                }
+            ))
+        ));
+
+        let apply = parse_action_from([
+            "one-ai-key",
+            "keys",
+            "restore",
+            "--credential-set",
+            "relay-credentials",
+            "--credential-ref",
+            "cr:v1:pos:0",
+            "--reason",
+            "operator verified recovered credential",
+            "--yes",
+        ])
+        .expect("keys restore apply should parse");
+
+        assert!(matches!(
+            apply,
+            CliAction::Keys(crate::cli_commands::keys::KeysCommand::Restore(
+                crate::cli_commands::keys::KeysRestoreOptions {
+                    mode: crate::cli_commands::keys::KeysRestoreMode::Apply,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn keys_restore_rejects_dry_run_yes_combination() {
+        let parsed = parse_action_from([
+            "one-ai-key",
+            "keys",
+            "restore",
+            "--credential-set",
+            "relay-credentials",
+            "--credential-ref",
+            "cr:v1:pos:0",
+            "--reason",
+            "operator verified recovered credential",
             "--dry-run",
             "--yes",
         ]);

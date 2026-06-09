@@ -13,6 +13,7 @@ pub enum KeysCommand {
     Import(KeysImportOptions),
     Probe(KeysProbeOptions),
     Disable(KeysDisableOptions),
+    Restore(KeysRestoreOptions),
     ProbeApply(KeysProbeApplyCommand),
 }
 
@@ -111,6 +112,23 @@ pub enum KeysDisableMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeysRestoreOptions {
+    pub connection: crate::cli::OperatorConnectionOptions,
+    pub credential_set_id: String,
+    pub credential_ref: String,
+    pub reason: String,
+    pub mode: KeysRestoreMode,
+    pub output: crate::cli_report::OutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysRestoreMode {
+    DryRun,
+    NeedsConfirmation,
+    Apply,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeysProbeApplyCommand {
     Plan(KeysProbeApplyPlanOptions),
     Apply(KeysProbeApplyApplyOptions),
@@ -164,6 +182,11 @@ struct DisableCredentialRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct RestoreCredentialRequest {
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
 struct ApplyLatestProbeRequest {
     probe_result_ref: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,6 +203,7 @@ pub async fn run(
         KeysCommand::Import(options) => run_import(options).await,
         KeysCommand::Probe(options) => run_probe(options).await,
         KeysCommand::Disable(options) => run_disable(options).await,
+        KeysCommand::Restore(options) => run_restore(options).await,
         KeysCommand::ProbeApply(command) => run_probe_apply(command).await,
     }
 }
@@ -327,6 +351,21 @@ pub async fn run_disable(
     }
 }
 
+pub async fn run_restore(
+    options: KeysRestoreOptions,
+) -> Result<String, crate::operator_client::OperatorClientError> {
+    match options.mode {
+        KeysRestoreMode::DryRun => Ok(render_keys_restore_dry_run_report(&options)),
+        KeysRestoreMode::NeedsConfirmation => {
+            Err(crate::operator_client::OperatorClientError::new(
+                "confirmation_required",
+                "keys restore requires --yes or interactive confirmation",
+            ))
+        }
+        KeysRestoreMode::Apply => run_confirmed_restore(options).await,
+    }
+}
+
 pub async fn run_probe_apply(
     command: KeysProbeApplyCommand,
 ) -> Result<String, crate::operator_client::OperatorClientError> {
@@ -468,6 +507,24 @@ async fn run_confirmed_disable(
     Ok(render_keys_disable_apply_report(&options, &response))
 }
 
+async fn run_confirmed_restore(
+    options: KeysRestoreOptions,
+) -> Result<String, crate::operator_client::OperatorClientError> {
+    let client = crate::cli_commands::operator_client_from_connection(&options.connection)?;
+    let response = client
+        .post_json(
+            crate::operator_client::ManagementMutationEndpoint::CredentialSetCredentialRestore {
+                credential_set_id: options.credential_set_id.clone(),
+                credential_ref: options.credential_ref.clone(),
+            },
+            &RestoreCredentialRequest {
+                reason: options.reason.clone(),
+            },
+        )
+        .await?;
+    Ok(render_keys_restore_apply_report(&options, &response))
+}
+
 async fn run_confirmed_import(
     options: KeysImportOptions,
 ) -> Result<String, crate::operator_client::OperatorClientError> {
@@ -575,6 +632,7 @@ fn render_sanitized_keys_report(report: &Value, output: crate::cli_report::Outpu
                 Some("keys import") => render_keys_import_table(report),
                 Some("keys probe") => render_keys_probe_table(report),
                 Some("keys disable") => render_keys_disable_table(report),
+                Some("keys restore") => render_keys_restore_table(report),
                 Some("keys replacement-plan") => render_keys_replacement_plan_table(report),
                 Some("keys probe-apply plan") | Some("keys probe-apply apply") => {
                     render_keys_probe_apply_table(report)
@@ -719,12 +777,114 @@ fn render_keys_disable_apply_report(options: &KeysDisableOptions, response: &Val
     render_sanitized_keys_report(&report, options.output)
 }
 
+pub fn render_keys_restore_dry_run_report(options: &KeysRestoreOptions) -> String {
+    let credential_ref = normalize_credential_ref(&options.credential_ref);
+    let status = if credential_ref.is_some() {
+        "dry_run"
+    } else {
+        "blocked"
+    };
+    let reason_code = if credential_ref.is_some() {
+        "keys_restore_plan"
+    } else {
+        "credential_ref_invalid"
+    };
+    let report = keys_restore_report_envelope(
+        status,
+        reason_code,
+        "Credential restore plan was built without mutating management state.",
+        keys_restore_effect_for_mode(KeysRestoreMode::DryRun),
+        options,
+        serde_json::json!({
+            "command": "keys restore",
+            "credential_ref": credential_ref,
+            "reason_configured": safe_disable_reason(&options.reason).is_some(),
+            "mutating_restore_sent": false,
+            "upstream_request_sent": false,
+            "automatic_rollback": false,
+            "recovery_path": "confirmed restore mutates credential lifecycle state through management",
+        }),
+        if credential_ref.is_some() {
+            keys_restore_next_action(options)
+        } else {
+            keys_restore_blocked_next_action(
+                "Credential restore requires a non-secret credential_ref.",
+            )
+        },
+    );
+    render_sanitized_keys_report(&report, options.output)
+}
+
+fn render_keys_restore_apply_report(options: &KeysRestoreOptions, response: &Value) -> String {
+    let report = keys_restore_report_envelope(
+        "ok",
+        "keys_restore_applied",
+        "Credential restore was applied through management and the response was redacted for CLI output.",
+        keys_restore_effect_for_mode(KeysRestoreMode::Apply),
+        options,
+        serde_json::json!({
+            "command": "keys restore",
+            "credential_ref": response
+                .get("credential_ref")
+                .and_then(Value::as_str)
+                .and_then(normalize_credential_ref)
+                .or_else(|| normalize_credential_ref(&options.credential_ref)),
+            "channel_id": response
+                .get("channel_id")
+                .and_then(Value::as_str)
+                .and_then(safe_local_id),
+            "selector_generation": response.get("selector_generation").and_then(Value::as_u64),
+            "state_kind": response
+                .get("state")
+                .and_then(|state| state.get("kind"))
+                .and_then(Value::as_str)
+                .and_then(safe_local_id),
+            "reason_configured": safe_disable_reason(&options.reason).is_some(),
+            "mutating_restore_sent": true,
+            "upstream_request_sent": false,
+            "automatic_rollback": false,
+            "recovery_path": "review credential-set state after restoring this credential",
+        }),
+        serde_json::json!({
+            "summary": "Review credential-set serving state after restoring the credential.",
+            "safe_argv": keys_stats_argv(Some(&options.credential_set_id), true),
+            "side_effect_class": "runtime_readonly",
+            "requires_confirmation": false,
+        }),
+    );
+    render_sanitized_keys_report(&report, options.output)
+}
+
 fn keys_disable_report_envelope(
     status: &'static str,
     reason_code: &'static str,
     reason: &'static str,
     effect: crate::cli_effects::CommandEffect,
     options: &KeysDisableOptions,
+    data: Value,
+    next_action: Value,
+) -> Value {
+    crate::cli_report::report_envelope_with_legacy_fields(crate::cli_report::ReportEnvelope {
+        status,
+        reason,
+        reason_code,
+        effect,
+        scope: serde_json::json!({
+            "credential_set_id": safe_local_id(&options.credential_set_id),
+            "credential_ref": normalize_credential_ref(&options.credential_ref),
+        }),
+        window: Value::Null,
+        next_action,
+        data,
+    })
+}
+
+fn keys_restore_report_envelope(
+    status: &'static str,
+    reason_code: &'static str,
+    reason: &'static str,
+    effect: crate::cli_effects::CommandEffect,
+    options: &KeysRestoreOptions,
     data: Value,
     next_action: Value,
 ) -> Value {
@@ -750,6 +910,25 @@ fn keys_disable_effect_for_mode(mode: KeysDisableMode) -> crate::cli_effects::Co
             effect_vector: crate::cli_effects::EffectVector::default(),
         },
         KeysDisableMode::NeedsConfirmation | KeysDisableMode::Apply => {
+            crate::cli_effects::CommandEffect {
+                side_effect_class: crate::cli_effects::SideEffectClass::ManagementWrite,
+                effect_vector: crate::cli_effects::EffectVector {
+                    writes_management_store: true,
+                    mutates_runtime: true,
+                    ..crate::cli_effects::EffectVector::default()
+                },
+            }
+        }
+    }
+}
+
+fn keys_restore_effect_for_mode(mode: KeysRestoreMode) -> crate::cli_effects::CommandEffect {
+    match mode {
+        KeysRestoreMode::DryRun => crate::cli_effects::CommandEffect {
+            side_effect_class: crate::cli_effects::SideEffectClass::OfflineReadonly,
+            effect_vector: crate::cli_effects::EffectVector::default(),
+        },
+        KeysRestoreMode::NeedsConfirmation | KeysRestoreMode::Apply => {
             crate::cli_effects::CommandEffect {
                 side_effect_class: crate::cli_effects::SideEffectClass::ManagementWrite,
                 effect_vector: crate::cli_effects::EffectVector {
@@ -807,17 +986,62 @@ fn keys_disable_apply_argv(options: &KeysDisableOptions) -> Value {
     ])
 }
 
+fn keys_restore_next_action(options: &KeysRestoreOptions) -> Value {
+    serde_json::json!({
+        "summary": "Re-run with explicit confirmation to restore this single credential.",
+        "safe_argv": keys_restore_apply_argv(options),
+        "side_effect_class": "management_write",
+        "requires_confirmation": true,
+        "automatic_rollback": false,
+        "recovery_path": "review keys stats after confirmed restore",
+    })
+}
+
+fn keys_restore_blocked_next_action(summary: &str) -> Value {
+    serde_json::json!({
+        "summary": summary,
+        "safe_argv": Value::Null,
+        "side_effect_class": Value::Null,
+        "requires_confirmation": false,
+        "automatic_rollback": false,
+    })
+}
+
+fn keys_restore_apply_argv(options: &KeysRestoreOptions) -> Value {
+    let Some(credential_set_id) = safe_local_id(&options.credential_set_id) else {
+        return Value::Null;
+    };
+    let Some(credential_ref) = normalize_credential_ref(&options.credential_ref) else {
+        return Value::Null;
+    };
+    let Some(reason) = safe_disable_reason(&options.reason) else {
+        return Value::Null;
+    };
+    serde_json::json!([
+        "one-ai-key",
+        "keys",
+        "restore",
+        "--credential-set",
+        credential_set_id,
+        "--credential-ref",
+        credential_ref,
+        "--reason",
+        reason,
+        "--yes"
+    ])
+}
+
 fn safe_disable_reason(reason: &str) -> Option<&str> {
     let trimmed = reason.trim();
     if trimmed.is_empty() || trimmed.len() > 160 {
         return None;
     }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('~') {
+        return None;
+    }
     if !trimmed.bytes().all(|byte| {
         byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b' ' | b'.' | b',' | b':' | b'_' | b'-' | b'/' | b'(' | b')'
-            )
+            || matches!(byte, b' ' | b'.' | b',' | b':' | b'_' | b'-' | b'(' | b')')
     }) {
         return None;
     }
@@ -825,6 +1049,11 @@ fn safe_disable_reason(reason: &str) -> Option<&str> {
     if lower.contains("sk-")
         || lower.contains("http")
         || lower.contains("://")
+        || lower.contains("fingerprint")
+        || lower.contains("token_hash")
+        || lower.contains("raw_request")
+        || lower.contains("raw_response")
+        || lower.contains("raw body")
         || looks_like_jwt(trimmed)
         || contains_instruction_marker(&lower)
     {
@@ -2663,6 +2892,26 @@ fn render_keys_disable_table(report: &Value) -> String {
     output
 }
 
+fn render_keys_restore_table(report: &Value) -> String {
+    let mut output = String::new();
+    output.push_str("keys restore\n");
+    crate::cli_report::append_report_envelope_table_fields(&mut output, report);
+    for field in [
+        "credential_ref",
+        "channel_id",
+        "selector_generation",
+        "state_kind",
+        "reason_configured",
+        "mutating_restore_sent",
+        "upstream_request_sent",
+        "automatic_rollback",
+        "recovery_path",
+    ] {
+        crate::cli_report::push_table_field(&mut output, field, report.get(field));
+    }
+    output
+}
+
 fn render_keys_probe_apply_table(report: &Value) -> String {
     let mut output = String::new();
     output.push_str("keys probe-apply\n");
@@ -3453,6 +3702,221 @@ mod tests {
             !rendered.contains("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
         assert!(!rendered.contains("/tmp/raw-disable-source.keys"));
+    }
+
+    #[test]
+    fn keys_restore_dry_run_reports_local_plan_without_secret_output() {
+        let rendered = super::render_keys_restore_dry_run_report(&super::KeysRestoreOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some("https://router.example".to_string()),
+                deprecated_base_url: None,
+                management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            credential_set_id: "relay-credentials".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+            reason: "operator verified recovered credential".to_string(),
+            mode: super::KeysRestoreMode::DryRun,
+            output: crate::cli_report::OutputFormat::Json,
+        });
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "dry_run");
+        assert_eq!(report["reason_code"], "keys_restore_plan");
+        assert_eq!(report["side_effect_class"], "offline_readonly");
+        assert_eq!(report["effect_vector"]["writes_management_store"], false);
+        assert_eq!(report["effect_vector"]["calls_upstream"], false);
+        assert_eq!(report["effect_vector"]["mutates_runtime"], false);
+        assert_eq!(report["scope"]["credential_set_id"], "relay-credentials");
+        assert_eq!(report["scope"]["credential_ref"], "cr:v1:pos:0");
+        assert_eq!(report["data"]["command"], "keys restore");
+        assert_eq!(report["data"]["credential_ref"], "cr:v1:pos:0");
+        assert_eq!(report["data"]["reason_configured"], true);
+        assert_eq!(report["data"]["mutating_restore_sent"], false);
+        assert_eq!(report["data"]["upstream_request_sent"], false);
+        assert_eq!(report["data"]["automatic_rollback"], false);
+        assert_eq!(report["next_action"]["requires_confirmation"], true);
+        assert_eq!(
+            report["next_action"]["side_effect_class"],
+            "management_write"
+        );
+        assert_eq!(
+            report["next_action"]["safe_argv"],
+            json!([
+                "one-ai-key",
+                "keys",
+                "restore",
+                "--credential-set",
+                "relay-credentials",
+                "--credential-ref",
+                "cr:v1:pos:0",
+                "--reason",
+                "operator verified recovered credential",
+                "--yes"
+            ])
+        );
+        assert!(!rendered.contains("sk-"));
+        assert!(!rendered.contains("token_hash"));
+    }
+
+    #[test]
+    fn keys_restore_dry_run_redacts_private_path_reason_from_next_action() {
+        let private_reason = "/Users/rtoc/private/key.txt";
+        let rendered = super::render_keys_restore_dry_run_report(&super::KeysRestoreOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some("https://router.example".to_string()),
+                deprecated_base_url: None,
+                management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            credential_set_id: "relay-credentials".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+            reason: private_reason.to_string(),
+            mode: super::KeysRestoreMode::DryRun,
+            output: crate::cli_report::OutputFormat::Json,
+        });
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "dry_run");
+        assert_eq!(report["data"]["reason_configured"], false);
+        assert_eq!(report["next_action"]["safe_argv"], Value::Null);
+        assert!(!rendered.contains(private_reason));
+        assert!(!rendered.contains("/Users/rtoc"));
+        assert!(!rendered.contains("key.txt"));
+    }
+
+    #[tokio::test]
+    async fn keys_restore_dry_run_does_not_call_restore_endpoint_or_require_token() {
+        let restore_called = Arc::new(AtomicBool::new(false));
+        let route_called = Arc::clone(&restore_called);
+        let router = Router::new().route(
+            "/management/credential-sets/relay-credentials/credentials/:credential_ref/restore",
+            post(move |Json(_body): Json<Value>| {
+                let route_called = Arc::clone(&route_called);
+                async move {
+                    route_called.store(true, Ordering::SeqCst);
+                    Json(json!({"unexpected": true}))
+                }
+            }),
+        );
+        let management_url = spawn_management_fixture(router).await;
+
+        let rendered = super::run(super::KeysCommand::Restore(super::KeysRestoreOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some(management_url),
+                deprecated_base_url: None,
+                management_token_env: None,
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            credential_set_id: "relay-credentials".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+            reason: "operator verified recovered credential".to_string(),
+            mode: super::KeysRestoreMode::DryRun,
+            output: crate::cli_report::OutputFormat::Json,
+        }))
+        .await
+        .unwrap();
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "dry_run");
+        assert_eq!(report["data"]["mutating_restore_sent"], false);
+        assert!(!restore_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn keys_restore_confirmed_posts_restore_request_and_sanitizes_response() {
+        let captured_body = Arc::new(Mutex::new(None::<Value>));
+        let route_body = Arc::clone(&captured_body);
+        let router = Router::new().route(
+            "/management/credential-sets/relay-credentials/credentials/:credential_ref/restore",
+            post(move |Json(body): Json<Value>| {
+                let route_body = Arc::clone(&route_body);
+                async move {
+                    *route_body.lock().unwrap() = Some(body);
+                    Json(json!({
+                        "credential_set_id": "relay-credentials",
+                        "credential_ref": "cr:v1:pos:0",
+                        "credential_id": "internal-derived-id",
+                        "channel_id": "relay-channel",
+                        "selector_generation": 13,
+                        "state": {"kind": "active", "reason": "operator verified recovered credential"},
+                        "credential": {
+                            "id": "internal-derived-id",
+                            "fingerprint": "fingerprint-fixture",
+                            "state": {"kind": "active", "reason": "operator verified recovered credential"}
+                        },
+                        "raw_request_body": "request-body-fixture",
+                        "raw_response_body": "response-body-fixture",
+                        "raw_key": "RESTORE_RAW_SECRET",
+                        "token_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "source_path": "/tmp/raw-restore-source.keys"
+                    }))
+                }
+            }),
+        );
+        let management_url = spawn_management_fixture(router).await;
+        let env_name = format!("ONE_AI_KEY_TEST_RESTORE_POST_TOKEN_{}", std::process::id());
+        std::env::set_var(&env_name, "opaque-management-fixture");
+
+        let rendered = super::run(super::KeysCommand::Restore(super::KeysRestoreOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some(management_url),
+                deprecated_base_url: None,
+                management_token_env: Some(env_name.clone()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            credential_set_id: "relay-credentials".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+            reason: "operator verified recovered credential".to_string(),
+            mode: super::KeysRestoreMode::Apply,
+            output: crate::cli_report::OutputFormat::Json,
+        }))
+        .await
+        .unwrap();
+        std::env::remove_var(env_name);
+        let body = captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("restore endpoint should receive a body");
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(body["reason"], "operator verified recovered credential");
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["reason_code"], "keys_restore_applied");
+        assert_eq!(report["side_effect_class"], "management_write");
+        assert_eq!(report["data"]["command"], "keys restore");
+        assert_eq!(report["data"]["credential_ref"], "cr:v1:pos:0");
+        assert_eq!(report["data"]["channel_id"], "relay-channel");
+        assert_eq!(report["data"]["state_kind"], "active");
+        assert_eq!(report["data"]["selector_generation"], 13);
+        assert_eq!(report["data"]["mutating_restore_sent"], true);
+        assert_eq!(report["data"]["upstream_request_sent"], false);
+        assert_eq!(report["next_action"]["requires_confirmation"], false);
+        assert_eq!(
+            report["next_action"]["safe_argv"],
+            json!([
+                "one-ai-key",
+                "keys",
+                "stats",
+                "--credential-set",
+                "relay-credentials",
+                "--include-credential-refs"
+            ])
+        );
+        assert!(!rendered.contains("internal-derived-id"));
+        assert!(!rendered.contains("fingerprint-fixture"));
+        assert!(!rendered.contains("request-body-fixture"));
+        assert!(!rendered.contains("response-body-fixture"));
+        assert!(!rendered.contains("RESTORE_RAW_SECRET"));
+        assert!(
+            !rendered.contains("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert!(!rendered.contains("/tmp/raw-restore-source.keys"));
     }
 
     #[test]

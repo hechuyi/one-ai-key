@@ -429,6 +429,10 @@ pub enum ManagementMutationEndpoint {
         credential_set_id: String,
         credential_ref: String,
     },
+    CredentialSetCredentialRestore {
+        credential_set_id: String,
+        credential_ref: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,6 +622,17 @@ impl ManagementMutationEndpoint {
                     credential_set_path(credential_set_id, "credentials")?,
                     safe_credential_ref_path_segment(credential_ref)?
                 ) + "/disable",
+                Vec::new(),
+            ),
+            Self::CredentialSetCredentialRestore {
+                credential_set_id,
+                credential_ref,
+            } => EndpointRequest::new(
+                format!(
+                    "{}/{}",
+                    credential_set_path(credential_set_id, "credentials")?,
+                    safe_credential_ref_path_segment(credential_ref)?
+                ) + "/restore",
                 Vec::new(),
             ),
         };
@@ -965,7 +980,10 @@ pub fn is_management_mutation_path(method: Method, path: &str) -> bool {
         && ((parts.len() == 6 && parts[5] == "import")
             || (parts.len() == 7
                 && safe_credential_ref_path_segment(parts[5]).is_ok()
-                && matches!(parts[6], "probe" | "apply-latest-probe" | "disable")))
+                && matches!(
+                    parts[6],
+                    "probe" | "apply-latest-probe" | "disable" | "restore"
+                )))
 }
 
 fn credential_set_readonly_path(path: &str) -> bool {
@@ -1442,6 +1460,45 @@ mod tests {
         assert!(!is_readonly_management_path(
             Method::Post,
             "/management/credential-sets/relay_keys/credentials/cr:v1:pos:0/disable"
+        ));
+    }
+
+    #[test]
+    fn keys_restore_path_typed_mutation_endpoint_builds_restore_path_with_credential_ref() {
+        let restore = ManagementMutationEndpoint::CredentialSetCredentialRestore {
+            credential_set_id: "relay_keys".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+        }
+        .test_request_parts()
+        .expect("credential restore mutation endpoint should build");
+
+        assert_eq!(
+            restore,
+            (
+                "/management/credential-sets/relay_keys/credentials/cr:v1:pos:0/restore"
+                    .to_string(),
+                Vec::new()
+            )
+        );
+        assert!(is_management_mutation_path(
+            Method::Post,
+            "/management/credential-sets/relay_keys/credentials/cr:v1:pos:0/restore"
+        ));
+        assert!(!is_management_mutation_path(
+            Method::Post,
+            "/management/credential-sets/relay_keys/credentials/internal-id/restore"
+        ));
+        assert!(!is_management_mutation_path(
+            Method::Post,
+            "/management/credential-sets/relay_keys/credentials/raw-backend-id/restore"
+        ));
+        assert!(!is_readonly_management_path(
+            Method::Get,
+            "/management/credential-sets/relay_keys/credentials/cr:v1:pos:0/restore"
+        ));
+        assert!(!is_readonly_management_path(
+            Method::Post,
+            "/management/credential-sets/relay_keys/credentials/cr:v1:pos:0/restore"
         ));
     }
 
