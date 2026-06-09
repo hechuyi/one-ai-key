@@ -1071,6 +1071,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::{
         collections::HashMap,
+        ffi::OsString,
         fs,
         net::{IpAddr, SocketAddr},
         path::PathBuf,
@@ -8381,6 +8382,29 @@ pools:
         format!("http://{addr}/v1")
     }
 
+    async fn spawn_management_router(router: Router) -> TestServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        TestServer {
+            url: format!("http://{addr}"),
+            handle,
+        }
+    }
+
+    struct TestServer {
+        url: String,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
     fn test_state() -> AppState {
         test_state_with_api_base("https://example.com/v1")
     }
@@ -9098,6 +9122,57 @@ pools:
             .collect()
     }
 
+    async fn models_explain_cli_report(app: Router, model: &str, client_token_ref: &str) -> Value {
+        let management_server = spawn_management_router(app).await;
+        let env_suffix = TEMP_KEYS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let env_name = format!(
+            "ONE_AI_KEY_TEST_MODELS_EXPLAIN_{}_{}",
+            std::process::id(),
+            env_suffix
+        );
+        let _env_guard = EnvVarGuard::set(env_name.clone(), OsString::from(fixture_admin_token()));
+        let rendered = crate::cli_commands::models::run_explain(
+            crate::cli_commands::models::ModelsExplainOptions {
+                connection: crate::cli::OperatorConnectionOptions {
+                    management_url: Some(management_server.url.clone()),
+                    deprecated_base_url: None,
+                    management_token_env: Some(env_name.clone()),
+                    management_token_stdin: false,
+                    timeout_seconds: 10,
+                },
+                model: model.to_string(),
+                client_token_ref: Some(client_token_ref.to_string()),
+                endpoint_family: Some("chat_completions".to_string()),
+                output: crate::cli_report::OutputFormat::Json,
+            },
+        )
+        .await
+        .unwrap();
+        serde_json::from_str(&rendered).unwrap()
+    }
+
+    struct EnvVarGuard {
+        name: String,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: String, value: OsString) -> Self {
+            let previous = std::env::var_os(&name);
+            std::env::set_var(&name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(&self.name, value),
+                None => std::env::remove_var(&self.name),
+            }
+        }
+    }
+
     async fn latest_probe_result_ref(
         app: &Router,
         credential_set_id: &str,
@@ -9185,6 +9260,22 @@ pools:
         model_routes: HashMap<String, crate::config::ModelRouteConfig>,
         client_tokens: Vec<ClientTokenConfig>,
     ) -> (Router, PathBuf) {
+        registry_provider_fixture_with_client_tokens_and_default_pool(
+            channel_enabled,
+            event_log_path,
+            model_routes,
+            client_tokens,
+            Some("test".to_string()),
+        )
+    }
+
+    fn registry_provider_fixture_with_client_tokens_and_default_pool(
+        channel_enabled: bool,
+        event_log_path: Option<PathBuf>,
+        model_routes: HashMap<String, crate::config::ModelRouteConfig>,
+        client_tokens: Vec<ClientTokenConfig>,
+        default_pool: Option<String>,
+    ) -> (Router, PathBuf) {
         let keys_file = temp_keys_file("upstream-key\n");
         let credential_store_path = temp_sqlite_path("registry-provider-credentials");
         let registry_store_path = temp_sqlite_path("registry-provider");
@@ -9203,7 +9294,7 @@ pools:
             max_error_body_bytes: 1024,
             timeouts: TimeoutConfig::default(),
             routing: crate::config::RoutingConfig::default(),
-            default_pool: Some("test".to_string()),
+            default_pool,
             providers: HashMap::from([(
                 "relay".to_string(),
                 crate::config::ProviderConfig {
@@ -10472,27 +10563,29 @@ pools:
 
     #[tokio::test]
     async fn management_model_route_publication_is_invisible_until_reload_then_visible() {
-        let (app, _registry_store_path) = registry_provider_fixture_with_client_tokens(
-            true,
-            None,
-            HashMap::new(),
-            vec![
-                ClientTokenConfig {
-                    name: "test-client".to_string(),
-                    token: fixture_client_token(),
-                    enabled: true,
-                    allowed_model_groups: Vec::new(),
-                    allowed_channels: Vec::new(),
-                },
-                ClientTokenConfig {
-                    name: "restricted-client".to_string(),
-                    token: fixture_restricted_client_token(),
-                    enabled: true,
-                    allowed_model_groups: vec!["gpt-other-visible".to_string()],
-                    allowed_channels: Vec::new(),
-                },
-            ],
-        );
+        let (app, _registry_store_path) =
+            registry_provider_fixture_with_client_tokens_and_default_pool(
+                true,
+                None,
+                HashMap::new(),
+                vec![
+                    ClientTokenConfig {
+                        name: "test-client".to_string(),
+                        token: fixture_client_token(),
+                        enabled: true,
+                        allowed_model_groups: Vec::new(),
+                        allowed_channels: Vec::new(),
+                    },
+                    ClientTokenConfig {
+                        name: "restricted-client".to_string(),
+                        token: fixture_restricted_client_token(),
+                        enabled: true,
+                        allowed_model_groups: vec!["gpt-other-visible".to_string()],
+                        allowed_channels: Vec::new(),
+                    },
+                ],
+                None,
+            );
 
         let upsert = app
             .clone()
@@ -10533,7 +10626,8 @@ pools:
         assert_eq!(staged_runtime["staged_registry_version"], 2);
         assert_eq!(staged_runtime["runtime_reload_required"], true);
 
-        let staged_runtime_routes = management_response_json(&app, "/management/model-routes").await;
+        let staged_runtime_routes =
+            management_response_json(&app, "/management/model-routes").await;
         assert!(!staged_runtime_routes["routes"]
             .as_array()
             .unwrap()
@@ -10542,6 +10636,28 @@ pools:
 
         let before_models = v1_model_ids(&app, client_bearer()).await;
         assert!(!before_models.iter().any(|id| id == "gpt-stage-visible"));
+
+        let staged_models_explain =
+            models_explain_cli_report(app.clone(), "gpt-stage-visible", "test-client").await;
+        assert_eq!(staged_models_explain["model"], "gpt-stage-visible");
+        assert_eq!(staged_models_explain["client_token_ref"], "test-client");
+        assert_eq!(staged_models_explain["endpoint_family"], "chat_completions");
+        assert_eq!(staged_models_explain["can_use"], false);
+        assert_eq!(staged_models_explain["reason_code"], "model_missing");
+        assert_eq!(staged_models_explain["blocking_domain"], "model");
+        assert_eq!(staged_models_explain["active_registry_version"], 1);
+        assert_eq!(staged_models_explain["staged_registry_version"], 2);
+        assert_eq!(staged_models_explain["runtime_reload_required"], true);
+        assert_eq!(staged_models_explain["route_kind"], "no_route");
+        assert!(staged_models_explain["selected_target"].is_null());
+        assert!(staged_models_explain["candidates"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            staged_models_explain["availability"]["evidence"]["route_present"],
+            false
+        );
 
         let reload = app
             .clone()
@@ -10562,7 +10678,8 @@ pools:
         assert_eq!(active_runtime["staged_registry_version"], 2);
         assert_eq!(active_runtime["runtime_reload_required"], false);
 
-        let active_runtime_routes = management_response_json(&app, "/management/model-routes").await;
+        let active_runtime_routes =
+            management_response_json(&app, "/management/model-routes").await;
         assert!(active_runtime_routes["routes"]
             .as_array()
             .unwrap()
@@ -10581,11 +10698,39 @@ pools:
         let after_models = v1_model_ids(&app, client_bearer()).await;
         assert!(after_models.iter().any(|id| id == "gpt-stage-visible"));
 
+        let active_models_explain =
+            models_explain_cli_report(app.clone(), "gpt-stage-visible", "test-client").await;
+        assert_eq!(active_models_explain["status"], "ok");
+        assert_eq!(active_models_explain["can_use"], true);
+        assert_eq!(active_models_explain["reason_code"], "available");
+        assert_eq!(active_models_explain["blocking_domain"], "none");
+        assert_eq!(active_models_explain["model"], "gpt-stage-visible");
+        assert_eq!(active_models_explain["client_token_ref"], "test-client");
+        assert_eq!(active_models_explain["active_registry_version"], 2);
+        assert_eq!(active_models_explain["staged_registry_version"], 2);
+        assert_eq!(active_models_explain["runtime_reload_required"], false);
+        assert!(after_models
+            .iter()
+            .any(|id| id == active_models_explain["model"].as_str().unwrap()));
+
         let restricted_models =
             v1_model_ids(&app, bearer_for(fixture_restricted_client_token().as_str())).await;
-        assert!(!restricted_models
-            .iter()
-            .any(|id| id == "gpt-stage-visible"));
+        assert!(!restricted_models.iter().any(|id| id == "gpt-stage-visible"));
+
+        let restricted_models_explain =
+            models_explain_cli_report(app.clone(), "gpt-stage-visible", "restricted-client").await;
+        assert_eq!(restricted_models_explain["status"], "blocked");
+        assert_eq!(restricted_models_explain["can_use"], false);
+        assert_eq!(restricted_models_explain["reason_code"], "model_missing");
+        assert_eq!(restricted_models_explain["blocking_domain"], "model");
+        assert_eq!(
+            restricted_models_explain["availability"]["evidence"]["model_allowed"],
+            false
+        );
+        assert_eq!(
+            restricted_models_explain["availability"]["evidence"]["route_present"],
+            true
+        );
 
         let restricted_availability = management_response_json(
             &app,
@@ -10683,6 +10828,10 @@ pools:
 
         let events = management_response_json(&app, "/management/events").await;
         assert!(events["events"].as_array().unwrap().is_empty());
+        let runtime = management_response_json(&app, "/management/runtime").await;
+        assert_eq!(runtime["active_registry_version"], 1);
+        assert_eq!(runtime["staged_registry_version"], 1);
+        assert_eq!(runtime["runtime_reload_required"], false);
     }
 
     #[tokio::test]
@@ -10718,6 +10867,10 @@ pools:
 
         let events = management_response_json(&app, "/management/events").await;
         assert!(events["events"].as_array().unwrap().is_empty());
+        let runtime = management_response_json(&app, "/management/runtime").await;
+        assert_eq!(runtime["active_registry_version"], 1);
+        assert_eq!(runtime["staged_registry_version"], 1);
+        assert_eq!(runtime["runtime_reload_required"], false);
     }
 
     #[tokio::test]
@@ -21895,7 +22048,7 @@ pools:
                 "accounts".to_string(),
                 "channels".to_string(),
                 "credential_sets".to_string(),
-                "model_routes".to_string(),
+                "model_route".to_string(),
                 "policy_profiles".to_string(),
                 "providers".to_string(),
                 "routing_profiles".to_string(),
@@ -22038,7 +22191,7 @@ pools:
             .as_array()
             .unwrap()
             .iter()
-            .find(|section| section["resource_type"] == "model_routes")
+            .find(|section| section["resource_type"] == "model_route")
             .unwrap();
         assert_eq!(
             model_route_section["added"],
@@ -22112,7 +22265,7 @@ pools:
             .as_array()
             .unwrap()
             .iter()
-            .find(|section| section["resource_type"] == "model_routes")
+            .find(|section| section["resource_type"] == "model_route")
             .unwrap();
         assert_eq!(model_route_section["added"], serde_json::json!([]));
         assert_eq!(model_route_section["removed"], serde_json::json!([]));
@@ -22197,7 +22350,7 @@ pools:
             .as_array()
             .unwrap()
             .iter()
-            .find(|section| section["resource_type"] == "model_routes")
+            .find(|section| section["resource_type"] == "model_route")
             .unwrap();
         assert_eq!(model_route_section["changed"], serde_json::json!([]));
         assert_eq!(model_route_section["removed"], serde_json::json!([]));

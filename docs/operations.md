@@ -88,6 +88,10 @@ curl <public-gateway-base-url>/v1/models \
   -H 'Authorization: Bearer <client-token>'
 ```
 
+`/v1/models` is the compiled local public catalog from active runtime state. It
+does not aggregate upstream live `/v1/models` responses, and client traffic does
+not call provider catalogs to decide which public model ids exist.
+
 For local loopback checks, replace `<public-gateway-base-url>` with the service
 origin, for example `http://127.0.0.1:4101`.
 
@@ -119,6 +123,82 @@ The offline `check-config` visibility preview, authenticated `/v1/models`, and
 the `models explain` / `route explain` views should agree for the same generated
 config, public model id, and client-token reference.
 
+## Model Publication Workflow
+
+Model publication is an explicit local public-route workflow. It stages a
+public model route into the registry, then applies a separate runtime reload.
+It is not live upstream discovery, live catalog sync, provider creation, channel
+creation, credential creation, or client-token scope repair.
+
+Use this sequence for a new public model route:
+
+```bash
+one-ai-key models onboard-plan --channel <channel-id> \
+  --public-model <public-model-id> \
+  --upstream-model <upstream-model-id> \
+  --client-token-ref <client-token-ref> \
+  --endpoint-family chat_completions \
+  --dry-run
+
+one-ai-key models onboard-plan --channel <channel-id> \
+  --public-model <public-model-id> \
+  --upstream-model <upstream-model-id> \
+  --apply --dry-run
+
+one-ai-key models onboard-plan --channel <channel-id> \
+  --public-model <public-model-id> \
+  --upstream-model <upstream-model-id> \
+  --apply --expected-staged-registry-version <version> --yes
+
+one-ai-key reload diff
+
+one-ai-key reload apply --expected-staged-registry-version <version> --yes
+
+one-ai-key models explain --model <public-model-id> \
+  --client-token-ref <client-token-ref> \
+  --endpoint-family chat_completions
+
+curl <public-gateway-base-url>/v1/models \
+  -H 'Authorization: Bearer <client-token>'
+
+curl <public-gateway-base-url>/v1/chat/completions \
+  -H 'Authorization: Bearer <client-token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"<public-model-id>","messages":[{"role":"user","content":"ping"}]}'
+```
+
+The first `models onboard-plan --dry-run` is read-only. It projects route
+conflicts, the proposed route, optional endpoint-family evidence, optional
+client visibility, and reload-version context. It does not stage anything, call
+upstreams, or query a live catalog.
+
+`models onboard-plan --apply --dry-run` previews the staged-registry write
+without sending the mutation. The confirmed `models onboard-plan --apply
+--expected-staged-registry-version <version> --yes` requires an expected staged
+registry version from the current reload status or diff context. It writes only
+the staged registry route for an existing channel and returns the new staged
+registry version. It does not reload active runtime, change client-token scope,
+create a provider, create a channel, create a credential set, import keys, probe
+upstreams, discover models, or call upstream `/v1/models`.
+
+Run `reload diff` after the staged route write and inspect the typed redacted
+diff before runtime mutation. Then run `reload apply
+--expected-staged-registry-version <version> --yes` with the staged version that
+should become active. Reload apply is the step that changes the active runtime
+snapshot. Missing or stale expected-version preconditions fail closed.
+
+Client visibility has two surfaces. `models explain` is a diagnostic view for a
+specific public model id, client-token reference, and endpoint family.
+Authenticated `GET /v1/models` is the actual client catalog for the bearer token
+used by the caller. If the staged or active route exists but the client-token
+scope excludes it, reports explain the scope mismatch; they do not automatically
+edit the token, widen model groups, or repair channel scope.
+
+The final completion smoke should be local, mocked, or otherwise
+non-sensitive. It should prove one model-bearing client request can pass through
+the newly published public id without storing private prompts, raw tokens,
+upstream keys, private URLs, or provider payloads.
+
 ## Operator Command Boundaries
 
 All operator reports use a redacted envelope with status, stable reason code,
@@ -149,6 +229,13 @@ present, and reload-diff/version state. It does not publish the model, reload
 runtime state, mutate client-token scope, mutate registry/configuration, or
 call upstream discovery.
 
+`models onboard-plan --apply --dry-run` is the read-only preview of the
+staged-registry write. Confirmed `models onboard-plan --apply
+--expected-staged-registry-version <version> --yes` writes only the staged
+registry model route for an existing channel. It does not reload active runtime,
+mutate client-token scope, create providers, create channels, create
+credentials, probe upstreams, or call upstream `/v1/models`.
+
 Diagnosis recommendations stop at read-only commands. Diagnosis reports may
 recommend read-only reload investigation only: `reload status` or `reload diff`.
 `reload apply --dry-run` is an explicit operator reload-planning command, not a
@@ -158,8 +245,8 @@ Dry-run commands preview the intended effect and must leave write/upstream bits
 off: `init local --dry-run`, `keys import --credential-set <id> --source <path>
 --dry-run`, `keys probe --credential-set <id> --credential-ref <ref> --model
 <public-model> --dry-run`, `keys probe-apply apply --credential-set <id>
---credential-ref <ref> --dry-run`, `models onboard-plan --dry-run`, and `reload
-apply --dry-run`.
+--credential-ref <ref> --dry-run`, `models onboard-plan --dry-run`, `models
+onboard-plan --apply --dry-run`, and `reload apply --dry-run`.
 
 Upstream-touching commands are explicit. `keys probe --yes` probes one
 credential reference and may persist redacted probe evidence; it is not a
@@ -169,7 +256,8 @@ Mutating commands require `--yes` or interactive confirmation:
 `keys import --credential-set <id> --source <path> --yes`, `keys disable
 --credential-set <id> --credential-ref <ref> --reason <reason> --yes`, `keys
 probe-apply apply --credential-set <id> --credential-ref <ref>
---probe-result-ref <probe-ref> --yes`, and `reload apply
+--probe-result-ref <probe-ref> --yes`, `models onboard-plan --apply
+--expected-staged-registry-version <version> --yes`, and `reload apply
 --expected-staged-registry-version <version> --yes`. Each report must disclose
 whether it writes the management store, mutates active runtime state, or has no
 automatic rollback.
@@ -276,7 +364,9 @@ scripts/release-smoke.sh
 ```
 
 That smoke uses the extracted release binary, generated placeholder tokens, and
-a local mock upstream. It does not contact a deployment host.
+a local mock upstream. It is local, redacted, and operator-run. It does not
+contact a deployment host, use real upstream credentials, store private tokens
+or URLs, call upstream live catalogs, or require production endpoints.
 
 After an operator intentionally pins a deployment host to a GitHub Release asset
 and checksum, the operator may run a minimal deployment smoke against the public
@@ -284,3 +374,5 @@ base URL. The smoke should verify process liveness, authenticated management
 health, `/v1/models`, and one non-sensitive completion request using a test
 client token and a harmless prompt. Store only redacted status, reason codes,
 route names, model ids, release version, and checksum in the smoke record.
+Production smoke is not part of local CI, and scripts must not bake in private
+server paths, remote base URLs, raw tokens, or upstream keys as defaults.

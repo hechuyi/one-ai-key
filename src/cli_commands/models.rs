@@ -367,6 +367,16 @@ fn sanitized_models_explain_report(
         .and_then(|value| value.get("client_token_ref"))
         .and_then(Value::as_str)
         .or_else(|| client_token.get("name").and_then(Value::as_str));
+    let reload_drift = availability
+        .as_ref()
+        .and_then(|value| value.get("reload_drift"))
+        .filter(|value| !value.is_null())
+        .cloned();
+    let recent_failure_hint = availability
+        .as_ref()
+        .and_then(|value| value.get("recent_failure_hint"))
+        .filter(|value| !value.is_null())
+        .cloned();
     let next_action = availability
         .as_ref()
         .and_then(|value| value.get("next_step"))
@@ -394,6 +404,8 @@ fn sanitized_models_explain_report(
             .as_ref()
             .and_then(|value| value.get("evidence"))
             .cloned(),
+        "reload_drift": reload_drift,
+        "recent_failure_hint": recent_failure_hint,
         "route_kind": preview.get("route_kind").and_then(Value::as_str),
         "registry_generation": preview.get("registry_generation").and_then(Value::as_u64),
         "candidate_limit": preview.get("candidate_limit").and_then(Value::as_u64),
@@ -476,6 +488,8 @@ fn sanitize_model_availability(value: &Value) -> Value {
             .and_then(Value::as_str)
             .filter(|value| is_safe_reason_code(value)),
         "registry_generation": value.get("registry_generation").and_then(Value::as_u64),
+        "reload_drift": sanitize_availability_reload_drift(value.get("reload_drift")),
+        "recent_failure_hint": sanitize_recent_failure_hint(value.get("recent_failure_hint")),
         "evidence": sanitize_availability_evidence(value.get("evidence")),
         "next_step": next_step,
         "client_token": client_token,
@@ -504,7 +518,7 @@ fn sanitize_management_next_step(value: Option<&Value>) -> Option<Value> {
         .iter()
         .map(Value::as_str)
         .collect::<Option<Vec<_>>>()?;
-    if !is_allowed_management_next_step_argv(&safe_argv)
+    if !is_allowed_management_next_step_action(template_id, &safe_argv)
         || !safe_argv.iter().copied().all(is_safe_next_step_argv_arg)
     {
         return None;
@@ -547,6 +561,131 @@ fn safe_next_step_summary(summary: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+fn is_allowed_management_next_step_action(template_id: &str, argv: &[&str]) -> bool {
+    if argv.is_empty() {
+        return template_id == "no_action_required";
+    }
+    matches!(
+        (template_id, argv),
+        (
+            "models_explain",
+            [
+                "one-ai-key",
+                "models",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "--model",
+                "<public-model>"
+            ]
+        ) | (
+            "models_explain_visibility" | "models_explain_with_client_token_ref",
+            [
+                "one-ai-key",
+                "models",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "--model",
+                "<public-model>",
+                "--client-token-ref",
+                "<client-token-ref>"
+            ]
+        ) | (
+            "use_supported_endpoint_family",
+            [
+                "one-ai-key",
+                "models",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "--model",
+                "<public-model>",
+                "--endpoint-family",
+                "chat_completions"
+            ]
+        ) | (
+            "route_explain" | "management_route_projection",
+            [
+                "one-ai-key",
+                "route",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "<public-model>"
+            ]
+        ) | (
+            "failures_tail",
+            [
+                "one-ai-key",
+                "failures",
+                "tail",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "--last",
+                "50"
+            ]
+        ) | (
+            "failures_explain_request",
+            [
+                "one-ai-key",
+                "failures",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "<request-id>",
+                "--last",
+                "50"
+            ]
+        ) | (
+            "doctor",
+            [
+                "one-ai-key",
+                "doctor",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>"
+            ]
+        ) | (
+            "reload_status",
+            [
+                "one-ai-key",
+                "reload",
+                "status",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>"
+            ]
+        ) | (
+            "reload_diff",
+            [
+                "one-ai-key",
+                "reload",
+                "diff",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>"
+            ]
+        )
+    )
+}
+
+#[allow(dead_code)]
 fn is_allowed_management_next_step_argv(argv: &[&str]) -> bool {
     if argv.is_empty() {
         return true;
@@ -589,22 +728,6 @@ fn is_allowed_management_next_step_argv(argv: &[&str]) -> bool {
             "chat_completions"
         ] | [
             "one-ai-key",
-            "models",
-            "list",
-            "--management-url",
-            "<url>",
-            "--management-token-env",
-            "<env>"
-        ] | [
-            "one-ai-key",
-            "client-tokens",
-            "list",
-            "--management-url",
-            "<url>",
-            "--management-token-env",
-            "<env>"
-        ] | [
-            "one-ai-key",
             "route",
             "explain",
             "--management-url",
@@ -612,6 +735,50 @@ fn is_allowed_management_next_step_argv(argv: &[&str]) -> bool {
             "--management-token-env",
             "<env>",
             "<public-model>"
+        ] | [
+            "one-ai-key",
+            "failures",
+            "tail",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "--last",
+            "50"
+        ] | [
+            "one-ai-key",
+            "failures",
+            "explain",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "<request-id>",
+            "--last",
+            "50"
+        ] | [
+            "one-ai-key",
+            "doctor",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>"
+        ] | [
+            "one-ai-key",
+            "reload",
+            "status",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>"
+        ] | [
+            "one-ai-key",
+            "reload",
+            "diff",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>"
         ]
     )
 }
@@ -701,6 +868,98 @@ fn sanitize_availability_evidence(evidence: Option<&Value>) -> Value {
         );
     }
     Value::Object(sanitized)
+}
+
+fn sanitize_availability_reload_drift(reload_drift: Option<&Value>) -> Value {
+    let Some(reload_drift) = reload_drift.and_then(Value::as_object) else {
+        return Value::Null;
+    };
+    let status = reload_drift
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "current" | "drift" | "unknown"));
+    let reason_code = reload_drift
+        .get("reason_code")
+        .and_then(Value::as_str)
+        .filter(|value| is_safe_reason_code(value));
+    serde_json::json!({
+        "status": status,
+        "reason_code": reason_code,
+        "active_registry_generation": reload_drift
+            .get("active_registry_generation")
+            .and_then(Value::as_u64),
+        "active_registry_version": reload_drift
+            .get("active_registry_version")
+            .and_then(Value::as_u64),
+        "staged_registry_version": reload_drift
+            .get("staged_registry_version")
+            .and_then(Value::as_u64),
+        "runtime_reload_required": reload_drift
+            .get("runtime_reload_required")
+            .and_then(Value::as_bool),
+        "last_reload_at_unix_seconds": reload_drift
+            .get("last_reload_at_unix_seconds")
+            .and_then(Value::as_u64),
+        "last_reload_error_reason_code": reload_drift
+            .get("last_reload_error_reason_code")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_reason_code(value)),
+    })
+}
+
+fn sanitize_recent_failure_hint(recent_failure_hint: Option<&Value>) -> Value {
+    let Some(hint) = recent_failure_hint.and_then(Value::as_object) else {
+        return Value::Null;
+    };
+    let status = hint
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "none" | "present" | "unknown"));
+    let source = hint
+        .get("source")
+        .and_then(Value::as_str)
+        .filter(|value| *value == "routing_telemetry_bounded_window");
+    let reason_codes = hint
+        .get("reason_codes")
+        .and_then(Value::as_array)
+        .map(|reason_codes| {
+            reason_codes
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|value| is_safe_reason_code(value))
+                .take(8)
+                .map(Value::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let channel_ids = hint
+        .get("channel_ids")
+        .and_then(Value::as_array)
+        .map(|channel_ids| {
+            channel_ids
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| {
+                    safe_reference_label_value(value)
+                        .unwrap_or_else(|| "<redacted-channel-id>".to_string())
+                })
+                .take(8)
+                .map(Value::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "status": status,
+        "source": source,
+        "window_event_count": hint
+            .get("window_event_count")
+            .and_then(Value::as_u64),
+        "matched_event_count": hint
+            .get("matched_event_count")
+            .and_then(Value::as_u64),
+        "reason_codes": reason_codes,
+        "channel_ids": channel_ids,
+    })
 }
 
 fn is_safe_reason_code(value: &str) -> bool {
@@ -1111,6 +1370,46 @@ fn render_models_explain_table(
             "availability.endpoint_family",
             availability.get("endpoint_family"),
         );
+        if let Some(reload_drift) = availability
+            .get("reload_drift")
+            .filter(|value| !value.is_null())
+        {
+            crate::cli_report::push_table_field(
+                &mut output,
+                "availability.reload_drift.status",
+                reload_drift.get("status"),
+            );
+            crate::cli_report::push_table_field(
+                &mut output,
+                "availability.reload_drift.reason_code",
+                reload_drift.get("reason_code"),
+            );
+            crate::cli_report::push_table_field(
+                &mut output,
+                "availability.reload_drift.runtime_reload_required",
+                reload_drift.get("runtime_reload_required"),
+            );
+        }
+        if let Some(recent_failure_hint) = availability
+            .get("recent_failure_hint")
+            .filter(|value| !value.is_null())
+        {
+            crate::cli_report::push_table_field(
+                &mut output,
+                "availability.recent_failure_hint.status",
+                recent_failure_hint.get("status"),
+            );
+            crate::cli_report::push_table_field(
+                &mut output,
+                "availability.recent_failure_hint.reason_codes",
+                recent_failure_hint.get("reason_codes"),
+            );
+            crate::cli_report::push_table_field(
+                &mut output,
+                "availability.recent_failure_hint.matched_event_count",
+                recent_failure_hint.get("matched_event_count"),
+            );
+        }
     }
     let selected = report
         .get("selected_target")
@@ -1774,6 +2073,211 @@ mod tests {
             ])
         );
         assert_eq!(report["next_action"], report["availability"]["next_step"]);
+    }
+
+    #[test]
+    fn models_explain_management_next_step_rejects_list_actions_and_accepts_stage2_readonly() {
+        let preview = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "explicit_model_route",
+            "registry_generation": 5,
+            "client_token": {"name": "local-client"},
+            "selected_target": null,
+            "candidates": []
+        });
+        let availability_with_models_list = serde_json::json!({
+            "status": "unavailable",
+            "can_use": false,
+            "blocking_domain": "model",
+            "reason_code": "model_missing",
+            "endpoint_family": "chat_completions",
+            "model": "gpt-public",
+            "public_model": "gpt-public",
+            "client_token_ref": "local-client",
+            "next_step": {
+                "summary": "Do not surface legacy models list.",
+                "template_id": "models_list",
+                "safe_argv": ["one-ai-key", "models", "list", "--management-url", "<url>", "--management-token-env", "<env>"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            }
+        });
+        let rendered = super::render_models_explain_report_with_management_projection(
+            &preview,
+            None,
+            Some(&availability_with_models_list),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(report["availability"]["next_step"], serde_json::Value::Null);
+        assert_ne!(report["next_action"]["template_id"], "models_list");
+
+        let availability_with_client_tokens_list = serde_json::json!({
+            "status": "unavailable",
+            "can_use": false,
+            "blocking_domain": "client_token",
+            "reason_code": "token_unknown",
+            "endpoint_family": "chat_completions",
+            "model": "gpt-public",
+            "public_model": "gpt-public",
+            "client_token_ref": "local-client",
+            "next_step": {
+                "summary": "Do not surface legacy client token list.",
+                "template_id": "client_tokens_list",
+                "safe_argv": ["one-ai-key", "client-tokens", "list", "--management-url", "<url>", "--management-token-env", "<env>"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            }
+        });
+        let rendered = super::render_models_explain_report_with_management_projection(
+            &preview,
+            None,
+            Some(&availability_with_client_tokens_list),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(report["availability"]["next_step"], serde_json::Value::Null);
+        assert_ne!(report["next_action"]["template_id"], "client_tokens_list");
+
+        let availability_with_reload_status = serde_json::json!({
+            "status": "unavailable",
+            "can_use": false,
+            "blocking_domain": "runtime",
+            "reason_code": "runtime_unavailable",
+            "endpoint_family": "chat_completions",
+            "model": "gpt-public",
+            "public_model": "gpt-public",
+            "client_token_ref": "local-client",
+            "next_step": {
+                "summary": "Inspect read-only runtime reload status.",
+                "template_id": "reload_status",
+                "safe_argv": ["one-ai-key", "reload", "status", "--management-url", "<url>", "--management-token-env", "<env>"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            }
+        });
+        let rendered = super::render_models_explain_report_with_management_projection(
+            &preview,
+            None,
+            Some(&availability_with_reload_status),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(
+            report["availability"]["next_step"]["template_id"],
+            "reload_status"
+        );
+        assert_eq!(report["next_action"], report["availability"]["next_step"]);
+
+        let availability_with_mismatched_template = serde_json::json!({
+            "status": "unavailable",
+            "can_use": false,
+            "blocking_domain": "runtime",
+            "reason_code": "runtime_unavailable",
+            "endpoint_family": "chat_completions",
+            "model": "gpt-public",
+            "public_model": "gpt-public",
+            "client_token_ref": "local-client",
+            "next_step": {
+                "summary": "Inspect read-only runtime doctor projection.",
+                "template_id": "client_tokens_list",
+                "safe_argv": ["one-ai-key", "doctor", "--management-url", "<url>", "--management-token-env", "<env>"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            }
+        });
+        let rendered = super::render_models_explain_report_with_management_projection(
+            &preview,
+            None,
+            Some(&availability_with_mismatched_template),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(report["availability"]["next_step"], serde_json::Value::Null);
+        assert_ne!(report["next_action"]["template_id"], "client_tokens_list");
+    }
+
+    #[test]
+    fn models_explain_surfaces_management_reload_and_recent_failure_hint() {
+        let preview = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "explicit_model_route",
+            "registry_generation": 5,
+            "client_token": {"name": "local-client"},
+            "selected_target": null,
+            "candidates": []
+        });
+        let availability = serde_json::json!({
+            "status": "unavailable",
+            "can_use": false,
+            "blocking_domain": "target",
+            "reason_code": "no_usable_key_or_target",
+            "endpoint_family": "chat_completions",
+            "model": "gpt-public",
+            "public_model": "gpt-public",
+            "client_token_ref": "local-client",
+            "reload_drift": {
+                "status": "unknown",
+                "reason_code": "staged_registry_version_unavailable",
+                "active_registry_generation": 7,
+                "active_registry_version": null,
+                "staged_registry_version": null,
+                "runtime_reload_required": null,
+                "last_reload_at_unix_seconds": null,
+                "last_reload_error_reason_code": null
+            },
+            "recent_failure_hint": {
+                "status": "none",
+                "source": "routing_telemetry_bounded_window",
+                "window_event_count": 0,
+                "matched_event_count": 0,
+                "reason_codes": [],
+                "channel_ids": [],
+                "raw_upstream_text": "SHOULD_NOT_RENDER"
+            },
+            "next_step": {
+                "summary": "Inspect route candidates and admission details for this public model.",
+                "template_id": "route_explain",
+                "safe_argv": ["one-ai-key", "route", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "<public-model>"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            }
+        });
+
+        let rendered = super::render_models_explain_report_with_management_projection(
+            &preview,
+            None,
+            Some(&availability),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(report["reload_drift"]["status"], "unknown");
+        assert_eq!(
+            report["reload_drift"]["reason_code"],
+            "staged_registry_version_unavailable"
+        );
+        assert_eq!(report["recent_failure_hint"]["status"], "none");
+        assert_eq!(
+            report["recent_failure_hint"]["reason_codes"],
+            serde_json::json!([])
+        );
+        assert!(!rendered.contains("SHOULD_NOT_RENDER"));
+        assert!(!rendered.contains("raw_upstream_text"));
+
+        let table = super::render_models_explain_report_with_management_projection(
+            &preview,
+            None,
+            Some(&availability),
+            crate::cli_report::OutputFormat::Table,
+        );
+        assert!(table.contains("availability.reload_drift.status: unknown"));
+        assert!(table.contains(
+            "availability.reload_drift.reason_code: staged_registry_version_unavailable"
+        ));
+        assert!(table.contains("availability.recent_failure_hint.status: none"));
+        assert!(table.contains("availability.recent_failure_hint.reason_codes: []"));
+        assert!(!table.contains("SHOULD_NOT_RENDER"));
+        assert!(!table.contains("raw_upstream_text"));
     }
 
     #[test]

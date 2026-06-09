@@ -54,6 +54,7 @@ pub struct AppState {
     pub credential_store: CredentialStoreHandle,
     pub client_token_store: ClientTokenStoreHandle,
     pub registry_store: RegistryStoreHandle,
+    pub registry_mutation_lock: Arc<tokio::sync::Mutex<()>>,
     pub active_registry_version: Arc<StdRwLock<Option<u64>>>,
     pub runtime_reload_status: Arc<StdRwLock<RuntimeReloadStatus>>,
     pub registry_validation_bootstrap: Arc<RegistryDocument>,
@@ -657,6 +658,7 @@ impl AppState {
             credential_store,
             client_token_store,
             registry_store,
+            registry_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             active_registry_version: Arc::new(StdRwLock::new(active_registry_version)),
             runtime_reload_status: Arc::new(StdRwLock::new(RuntimeReloadStatus::default())),
             registry_validation_bootstrap: Arc::new(

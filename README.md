@@ -30,8 +30,8 @@ support bundle.
   rules instead of free-form upstream text matching.
 - Streams successful responses while keeping bounded pre-output guards for
   obvious upstream error envelopes and configured response-filter rejections.
-- Serves `/v1/models` from compiled local runtime state. It does not call
-  upstream `/v1/models` on the request path.
+- Serves `/v1/models` from the compiled local public catalog. It does not call
+  upstream `/v1/models` or aggregate live provider catalogs on the request path.
 - Provides redacted operator commands for `doctor`, `models`, `route`, `keys`,
   `failures`, and `reload`.
 
@@ -260,9 +260,42 @@ runtime reload, discovery, route preview, and lifecycle operations. They must
 not expose raw upstream keys, raw client tokens, raw request bodies, raw response
 bodies, absolute key-file paths, or token-like URL components.
 
-Model discovery is management-only and does not change client traffic by itself.
-Use sync planning/apply and runtime reload only when discovered models should be
-staged as explicit public routes.
+Model publication is an explicit public-route workflow. `/v1/models` is the
+compiled local public catalog from active runtime state; it is not a live
+aggregation of upstream `/v1/models`.
+
+The operator path is plan, stage, reload, then verify:
+
+```bash
+one-ai-key models onboard-plan --channel <channel-id> \
+  --public-model <public-model-id> \
+  --upstream-model <upstream-model-id> \
+  --client-token-ref <client-token-ref> \
+  --endpoint-family chat_completions \
+  --dry-run
+
+one-ai-key models onboard-plan --channel <channel-id> \
+  --public-model <public-model-id> \
+  --upstream-model <upstream-model-id> \
+  --apply --dry-run
+
+one-ai-key models onboard-plan --channel <channel-id> \
+  --public-model <public-model-id> \
+  --upstream-model <upstream-model-id> \
+  --apply --expected-staged-registry-version <version> --yes
+
+one-ai-key reload diff
+one-ai-key reload apply --expected-staged-registry-version <version> --yes
+```
+
+The apply step writes only the staged registry. It does not reload runtime,
+change client-token scope, create providers/channels/credentials, probe
+upstreams, or call a live catalog. After reload, verify with `models explain`,
+authenticated `GET /v1/models`, and one local mock or otherwise non-sensitive
+completion smoke. Detailed runbooks are in
+[docs/operations.md](docs/operations.md), with configuration semantics in
+[docs/configuration.md](docs/configuration.md) and release-smoke boundaries in
+[docs/release-build.md](docs/release-build.md).
 
 Use `one-ai-key doctor` as the first read-only runtime summary. By default it
 reads runtime management projections without writing local files, calling

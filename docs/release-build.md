@@ -96,8 +96,18 @@ management URL. The smoke exercises the canonical first diagnosis command,
 --endpoint-family chat_completions`, and verifies that it answers whether the
 client-token ref can use the model on that endpoint family with `can_use`,
 `blocking_domain`, `endpoint_family`, bounded evidence, and a safe next_action. It
-must not use `cargo run`, a source checkout binary, real upstream
-credentials, or a deployment host.
+must also exercise the Stage 3 model publication workflow: `models onboard-plan
+--dry-run`, `models onboard-plan --apply --dry-run`, confirmed `models
+onboard-plan --apply --expected-staged-registry-version <version> --yes`,
+`reload diff`, confirmed `reload apply --expected-staged-registry-version
+<version> --yes`, `models explain`, authenticated `/v1/models`, and one local
+mock completion through the newly published public model id.
+
+Release smoke is local, redacted, and operator-run. It must prove that
+`/v1/models` is served from the compiled local public catalog and that the
+publication workflow does not call upstream live `/v1/models`. It must not use
+`cargo run`, a source checkout binary, real upstream credentials, private
+deployment URLs, raw tokens, or a deployment host.
 
 ## Release Checklist
 
@@ -111,8 +121,10 @@ credentials, or a deployment host.
    its `.sha256` sidecar exist, and that the sidecar contains only the archive
    basename.
 6. Run `scripts/release-smoke.sh`; it must exercise the extracted artifact with
-   local placeholder tokens and a local mock upstream. Release and deployment
-   smoke remains local, redacted, and operator-run.
+   local placeholder tokens and a local mock upstream, including the explicit
+   model publication path from `models onboard-plan --dry-run` through confirmed
+   staged registry apply, `reload diff`, confirmed runtime reload, authenticated
+   `/v1/models`, and one local mock completion.
 7. Run `scripts/check-staged-denylist.sh`, then create the release commit and
    tag after checking that runtime state and generated artifacts are not staged.
 8. Upload the tarball and `.sha256` sidecar as GitHub Release assets.
@@ -124,9 +136,11 @@ credentials, or a deployment host.
     by the operator, record `deployment_pin_smoke: not_run_by_design`.
 11. When an operator separately updates a gateway or NixOS deployment, pin the
     GitHub Release tarball URL and exact `sha256`; do not build on the host.
-12. Optional deployment smoke belongs to that operator-run deployment action:
-    process liveness, authenticated management health, `/v1/models`, and one
-    harmless client completion through the public base URL.
+12. Optional production smoke belongs to that operator-run deployment action,
+    not to `scripts/local-ci.sh`: process liveness, authenticated management
+    health, `/v1/models`, and one harmless client completion through the public
+    base URL. Do not store private server URLs, raw tokens, upstream keys, or
+    default remote targets in local CI or release scripts.
 13. Deployment records must contain only redacted status, reason codes, route
     names, model ids, release version, asset URL, and checksum. Do not record
     raw tokens, upstream keys, request bodies, or response bodies.

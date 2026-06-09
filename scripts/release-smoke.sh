@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
 NIX_STORE_VOLUME=${ONE_AI_KEY_NIX_STORE_VOLUME:-one-ai-key-nix-amd64}
+CARGO_TARGET_VOLUME=${ONE_AI_KEY_CARGO_TARGET_VOLUME:-one-ai-key-cargo-target-amd64}
 
 if [[ "${1:-}" != "--inside-container" ]]; then
   if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
@@ -15,6 +16,8 @@ if [[ "${1:-}" != "--inside-container" ]]; then
       --platform linux/amd64 \
       -v "${REPO_ROOT}:/work" \
       -v "${NIX_STORE_VOLUME}:/nix" \
+      -v "${CARGO_TARGET_VOLUME}:/cargo-target" \
+      -e CARGO_TARGET_DIR=/cargo-target \
       -w /work \
       nixos/nix:latest \
       nix --extra-experimental-features "nix-command flakes" shell \
@@ -118,6 +121,7 @@ with socket.socket() as sock:
 PY
 )
 MOCK_UPSTREAM_URL="http://127.0.0.1:${MOCK_PORT}/v1"
+MOCK_UPSTREAM_EVENTS="${WORK_DIR}/mock-upstream-events.jsonl"
 RAW_BODY_TEXT="raw body text"
 
 cat > mock_upstream.py <<'PY'
@@ -126,6 +130,10 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class Handler(BaseHTTPRequestHandler):
+    def _log_event(self, method):
+        with open(sys.argv[2], "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"method": method, "path": self.path}) + "\n")
+
     def _send_json(self, payload, status=200):
         raw = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -135,6 +143,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_GET(self):
+        self._log_event("GET")
         if self.path == "/v1/models":
             self._send_json({"object": "list", "data": [{"id": "provider/gpt-example", "object": "model"}]})
             return
@@ -144,6 +153,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"error": {"code": "not_found"}}, status=404)
 
     def do_POST(self):
+        self._log_event("POST")
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else b"{}"
         try:
@@ -157,7 +167,7 @@ class Handler(BaseHTTPRequestHandler):
                 "model": request.get("model", "provider/gpt-example"),
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": "release smoke ok"},
+                    "message": {"role": "assistant", "content": "release smoke published model ok" if request.get("model") == "release-smoke-upstream-model" else "release smoke ok"},
                     "finish_reason": "stop"
                 }],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 3, "total_tokens": 4}
@@ -171,8 +181,32 @@ class Handler(BaseHTTPRequestHandler):
 ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
 PY
 
-python3 mock_upstream.py "${MOCK_PORT}" >mock-upstream.log 2>&1 &
+: > "${MOCK_UPSTREAM_EVENTS}"
+python3 mock_upstream.py "${MOCK_PORT}" "${MOCK_UPSTREAM_EVENTS}" >mock-upstream.log 2>&1 &
 MOCK_PID=$!
+
+mock_upstream_model_catalog_requests() {
+  python3 - <<'PY' "${MOCK_UPSTREAM_EVENTS}"
+import json
+import pathlib
+import sys
+from urllib.parse import urlsplit
+
+path = pathlib.Path(sys.argv[1])
+count = 0
+if path.exists():
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise SystemExit(f"failed to parse mock upstream event JSONL line {line_number}: {error}") from error
+        if not isinstance(event, dict) or not isinstance(event.get("method"), str) or not isinstance(event.get("path"), str):
+            raise SystemExit(f"mock upstream event missing string method/path on JSONL line {line_number}")
+        if event["method"] == "GET" and urlsplit(event["path"]).path == "/v1/models":
+            count += 1
+print(count)
+PY
+}
 
 python3 - <<'PY' "${SERVICE_PORT}" "${MOCK_UPSTREAM_URL}" "${CLIENT_TOKEN}" "${MANAGEMENT_TOKEN}" "config/local.yaml"
 import pathlib
@@ -193,6 +227,13 @@ printf '%s\n' "${UPSTREAM_TOKEN}" > data/relay.keys
   | tee check-config.json \
   | jq -e '.status == "ok" and .reason_code == "ok" and (.model_visibility_preview[] | select(.client_token_ref == "local-client") | .visible_models == ["gpt-example"])' >/dev/null
 
+export KEY_POOL_ROUTER_SQLITE_REGISTRY_STORE="${WORK_DIR}/registry-store.sqlite"
+UPSTREAM_MODELS_BEFORE_SERVICE=$(mock_upstream_model_catalog_requests)
+if [[ "${UPSTREAM_MODELS_BEFORE_SERVICE}" != "0" ]]; then
+  printf 'error: upstream /v1/models was called before service startup\n' >&2
+  exit 1
+fi
+
 "${BIN}" --config config/local.yaml serve >service.log 2>&1 &
 SERVICE_PID=$!
 
@@ -212,6 +253,11 @@ printf '%s\n' "${MODELS_JSON}" \
   | jq -e '.data | map(.id) == ["gpt-example"]' >/dev/null
 printf '%s\n' "${MODELS_JSON}" \
   | jq -e '["relay", "provider", "credential", "capabilit"] as $forbidden | tostring as $body | [$forbidden[] | select(. as $term | $body | contains($term))] | length == 0' >/dev/null
+UPSTREAM_MODELS_AFTER_AUTHENTICATED_MODELS=$(mock_upstream_model_catalog_requests)
+if [[ "${UPSTREAM_MODELS_AFTER_AUTHENTICATED_MODELS}" != "0" ]]; then
+  printf 'error: authenticated /v1/models called upstream /v1/models\n' >&2
+  exit 1
+fi
 
 curl -fsS "http://127.0.0.1:${SERVICE_PORT}/v1/chat/completions" \
   -H "Authorization: Bearer ${CLIENT_TOKEN}" \
@@ -265,6 +311,14 @@ EXPECTED_MANAGEMENT_REPORTS=(
   "reload-status.json"
   "reload-diff.json"
   "reload-apply-dry-run.json"
+  "models-onboard-plan.json"
+  "models-onboard-apply-dry-run.json"
+  "models-onboard-apply.json"
+  "reload-status-staged.json"
+  "models-explain-staged.json"
+  "reload-diff-staged.json"
+  "reload-apply.json"
+  "models-explain-published.json"
   "negative-management-url.txt"
 )
 
@@ -279,14 +333,21 @@ assert_bounded_evidence() {
   local report_path=$1
   local max_items=8
   jq -e --argjson max_items "${max_items}" '
-    (.evidence | type == "object")
-    and (.evidence.candidate_reason_codes | type == "array" and length <= $max_items)
-    and (.evidence.candidate_limit | type == "number" and .evidence.candidate_limit >= 0)
-    and (.evidence.route_target_count | type == "number" and .evidence.route_target_count >= 0)
-    and (.evidence.endpoint_family_target_count | type == "number" and .evidence.endpoint_family_target_count >= 0)
-    and (.evidence.unsupported_target_count | type == "number" and .evidence.unsupported_target_count >= 0)
-    and (.evidence.unknown_or_missing_target_count | type == "number" and .evidence.unknown_or_missing_target_count >= 0)
-    and (.evidence.preview_candidate_count | type == "number" and .evidence.preview_candidate_count >= 0)
+    ((.evidence | type) == "object")
+    and ((.evidence.candidate_reason_codes | type) == "array")
+    and ((.evidence.candidate_reason_codes | length) <= $max_items)
+    and ((.evidence.candidate_limit | type) == "number")
+    and (.evidence.candidate_limit >= 0)
+    and ((.evidence.route_target_count | type) == "number")
+    and (.evidence.route_target_count >= 0)
+    and ((.evidence.endpoint_family_target_count | type) == "number")
+    and (.evidence.endpoint_family_target_count >= 0)
+    and ((.evidence.unsupported_target_count | type) == "number")
+    and (.evidence.unsupported_target_count >= 0)
+    and ((.evidence.unknown_or_missing_target_count | type) == "number")
+    and (.evidence.unknown_or_missing_target_count >= 0)
+    and ((.evidence.preview_candidate_count | type) == "number")
+    and (.evidence.preview_candidate_count >= 0)
   ' "${report_path}" >/dev/null
 }
 
@@ -413,6 +474,155 @@ capture_management_report reload-diff.json reload diff --output json
 jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' reload-diff.json >/dev/null
 capture_management_report reload-apply-dry-run.json reload apply --dry-run --output json
 jq -e '.status == "planned" and .reason_code == "reload_apply_dry_run" and .side_effect_class and (.next_action.safe_argv | type == "array")' reload-apply-dry-run.json >/dev/null
+
+PUBLISHED_PUBLIC_MODEL="release-smoke-public-model"
+PUBLISHED_UPSTREAM_MODEL="release-smoke-upstream-model"
+PRE_ONBOARD_STAGED_REGISTRY_VERSION=$(jq -r '.staged_registry_version // .data.staged_registry_version // empty' reload-status.json)
+if [[ -z "${PRE_ONBOARD_STAGED_REGISTRY_VERSION}" || "${PRE_ONBOARD_STAGED_REGISTRY_VERSION}" == "null" ]]; then
+  printf 'error: reload status did not expose a staged registry version before model onboarding\n' >&2
+  exit 1
+fi
+capture_management_report models-onboard-plan.json models onboard-plan --channel relay --public-model "${PUBLISHED_PUBLIC_MODEL}" --upstream-model "${PUBLISHED_UPSTREAM_MODEL}" --client-token-ref local-client --endpoint-family chat_completions --dry-run --output json
+jq -e --arg published_public_model "${PUBLISHED_PUBLIC_MODEL}" --arg published_upstream_model "${PUBLISHED_UPSTREAM_MODEL}" '
+  .status == "dry_run"
+  and .reason_code == "models_onboard_plan_projected"
+  and .public_model == $published_public_model
+  and .upstream_model == $published_upstream_model
+  and .planning_only_no_visibility_change == true
+  and .client_visibility_changed == false
+  and .live_discovery_called == false
+  and .management_mutation_sent == false
+  and .runtime_reload_required == false
+  and .proposed_route.visibility_after_this_command == false
+  and .side_effect_class == "runtime_readonly"
+  and (.next_action.safe_argv | type == "array")
+' models-onboard-plan.json >/dev/null
+UPSTREAM_MODELS_AFTER_PLAN=$(mock_upstream_model_catalog_requests)
+if [[ "${UPSTREAM_MODELS_AFTER_PLAN}" != "${UPSTREAM_MODELS_AFTER_AUTHENTICATED_MODELS}" ]]; then
+  printf 'error: models onboard-plan dry-run called upstream /v1/models\n' >&2
+  exit 1
+fi
+
+capture_management_report models-onboard-apply-dry-run.json models onboard-plan --channel relay --public-model "${PUBLISHED_PUBLIC_MODEL}" --upstream-model "${PUBLISHED_UPSTREAM_MODEL}" --apply --dry-run --output json
+jq -e --arg published_public_model "${PUBLISHED_PUBLIC_MODEL}" --arg published_upstream_model "${PUBLISHED_UPSTREAM_MODEL}" '
+  .status == "dry_run"
+  and .reason_code == "models_onboard_apply_projected"
+  and .public_model == $published_public_model
+  and .upstream_model == $published_upstream_model
+  and .planning_only_no_visibility_change == true
+  and .client_visibility_changed == false
+  and .live_discovery_called == false
+  and .management_mutation_sent == false
+  and .mutating_reload_sent == false
+  and .staged_registry_version == null
+  and .runtime_reload_required == null
+  and .side_effect_class == "runtime_readonly"
+' models-onboard-apply-dry-run.json >/dev/null
+UPSTREAM_MODELS_AFTER_APPLY_DRY_RUN=$(mock_upstream_model_catalog_requests)
+if [[ "${UPSTREAM_MODELS_AFTER_APPLY_DRY_RUN}" != "${UPSTREAM_MODELS_AFTER_AUTHENTICATED_MODELS}" ]]; then
+  printf 'error: models onboard-plan apply dry-run called upstream /v1/models\n' >&2
+  exit 1
+fi
+
+capture_management_report models-onboard-apply.json models onboard-plan --channel relay --public-model "${PUBLISHED_PUBLIC_MODEL}" --upstream-model "${PUBLISHED_UPSTREAM_MODEL}" --apply --expected-staged-registry-version "${PRE_ONBOARD_STAGED_REGISTRY_VERSION}" --yes --output json
+jq -e --arg published_public_model "${PUBLISHED_PUBLIC_MODEL}" --arg published_upstream_model "${PUBLISHED_UPSTREAM_MODEL}" --argjson expected_version "${PRE_ONBOARD_STAGED_REGISTRY_VERSION}" '
+  .status == "ok"
+  and .reason_code == "models_onboard_apply_sent"
+  and .public_model == $published_public_model
+  and .upstream_model == $published_upstream_model
+  and .expected_staged_registry_version == $expected_version
+  and (.staged_registry_version | type == "number")
+  and .staged_registry_version > $expected_version
+  and .registry_version == .staged_registry_version
+  and .runtime_reload_required == true
+  and .applied_to_runtime == false
+  and .client_visibility_changed == false
+  and .management_mutation_sent == true
+  and .mutating_reload_sent == false
+  and .side_effect_class == "management_write"
+' models-onboard-apply.json >/dev/null
+STAGED_REGISTRY_VERSION=$(jq -r '.staged_registry_version' models-onboard-apply.json)
+
+MODELS_BEFORE_RELOAD=$(curl -fsS "http://127.0.0.1:${SERVICE_PORT}/v1/models" \
+  -H "Authorization: Bearer ${CLIENT_TOKEN}")
+printf '%s\n' "${MODELS_BEFORE_RELOAD}" \
+  | jq -e --arg published_public_model "${PUBLISHED_PUBLIC_MODEL}" '.data | map(.id) | index($published_public_model) == null' >/dev/null
+
+capture_management_report reload-status-staged.json reload status --output json
+jq -e --argjson staged_version "${STAGED_REGISTRY_VERSION}" '
+  .status == "pending_reload"
+  and .reason_code == "runtime_reload_required"
+  and .staged_registry_version == $staged_version
+  and .runtime_reload_required == true
+  and .staged_vs_runtime.active_matches_staged == false
+  and .staged_vs_runtime.reload_required_reason == "staged_registry_differs"
+  and .mutating_reload_sent == false
+  and .side_effect_class == "runtime_readonly"
+' reload-status-staged.json >/dev/null
+
+capture_management_report models-explain-staged.json models explain --model "${PUBLISHED_PUBLIC_MODEL}" --client-token-ref local-client --endpoint-family chat_completions --output json
+jq -e --arg published_public_model "${PUBLISHED_PUBLIC_MODEL}" --argjson staged_version "${STAGED_REGISTRY_VERSION}" '
+  .model == $published_public_model
+  and .client_token_ref == "local-client"
+  and .endpoint_family == "chat_completions"
+  and .staged_registry_version == $staged_version
+  and .runtime_reload_required == true
+  and .side_effect_class == "runtime_readonly"
+' models-explain-staged.json >/dev/null
+
+capture_management_report reload-diff-staged.json reload diff --output json
+jq -e --argjson staged_version "${STAGED_REGISTRY_VERSION}" '
+  .status == "ok"
+  and .reason_code == "reload_diff_available"
+  and .staged_registry_version == $staged_version
+  and .runtime_reload_required == true
+  and .mutating_reload_sent == false
+  and (.resource_changes | type == "array")
+  and (.budget.truncated == false)
+' reload-diff-staged.json >/dev/null
+
+capture_management_report reload-apply.json reload apply --yes --expected-staged-registry-version "${STAGED_REGISTRY_VERSION}" --output json
+jq -e --argjson staged_version "${STAGED_REGISTRY_VERSION}" '
+  .status == "ok"
+  and .reason_code == "runtime_reload_applied"
+  and .expected_staged_registry_version == $staged_version
+  and .mutating_reload_sent == true
+  and .precondition_supported == true
+  and .management_response.staged_registry_version == $staged_version
+  and .management_response.runtime_reload_required == false
+  and .side_effect_class == "management_write"
+' reload-apply.json >/dev/null
+
+capture_management_report models-explain-published.json models explain --model "${PUBLISHED_PUBLIC_MODEL}" --client-token-ref local-client --endpoint-family chat_completions --output json
+jq -e --arg published_public_model "${PUBLISHED_PUBLIC_MODEL}" --argjson staged_version "${STAGED_REGISTRY_VERSION}" '
+  .status == "ok"
+  and .can_use == true
+  and .reason_code == "available"
+  and .blocking_domain == "none"
+  and .model == $published_public_model
+  and .client_token_ref == "local-client"
+  and .endpoint_family == "chat_completions"
+  and .staged_registry_version == $staged_version
+  and .runtime_reload_required == false
+  and .side_effect_class == "runtime_readonly"
+' models-explain-published.json >/dev/null
+
+MODELS_AFTER_RELOAD=$(curl -fsS "http://127.0.0.1:${SERVICE_PORT}/v1/models" \
+  -H "Authorization: Bearer ${CLIENT_TOKEN}")
+printf '%s\n' "${MODELS_AFTER_RELOAD}" \
+  | jq -e --arg published_public_model "${PUBLISHED_PUBLIC_MODEL}" '.data | map(.id) | index($published_public_model) != null' >/dev/null
+
+curl -fsS "http://127.0.0.1:${SERVICE_PORT}/v1/chat/completions" \
+  -H "Authorization: Bearer ${CLIENT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"${PUBLISHED_PUBLIC_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
+  | jq -e '.choices[0].message.content == "release smoke published model ok"' >/dev/null
+
+UPSTREAM_MODELS_AFTER_WORKFLOW=$(mock_upstream_model_catalog_requests)
+if [[ "${UPSTREAM_MODELS_AFTER_WORKFLOW}" != "${UPSTREAM_MODELS_AFTER_AUTHENTICATED_MODELS}" ]]; then
+  printf 'error: model publication workflow called upstream /v1/models\n' >&2
+  exit 1
+fi
 
 set +e
 NEGATIVE_OUTPUT=$("${BIN}" --management-url "${MANAGEMENT_URL}/v1" --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN models list --output json 2>&1)

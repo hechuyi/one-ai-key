@@ -74,6 +74,29 @@ OpenAI-compatible requests that need model routing; those ids are checked
 against compiled `model_routes` and client-token scope. `default_routing_profile`
 provides the routing profile for channels that do not specify one.
 
+## Public Model Catalog
+
+Client-facing `/v1/models` is a compiled local public catalog. It is derived
+from active runtime registry state, explicit `model_routes`, and the bearer
+client token's model/channel scope. It is not a fan-out request to upstream
+providers, not an aggregation of upstream live `/v1/models`, and not a source of
+provider pricing, context-window, tool-support, or feature metadata.
+
+Model publication therefore happens by staging an explicit public route and then
+reloading runtime state. `models onboard-plan --dry-run` is read-only route
+planning. `models onboard-plan --apply --dry-run` previews the staged-registry
+write. Confirmed `models onboard-plan --apply
+--expected-staged-registry-version <version> --yes` writes only a staged
+`model_routes` entry for an existing channel; it does not change active runtime
+until a separate `reload apply --expected-staged-registry-version <version>
+--yes` succeeds.
+
+The onboard apply step does not edit `client_tokens`, create model groups,
+create providers, create accounts, create channels, create credential sets,
+import credentials, probe upstreams, discover upstream models, or call upstream
+`/v1/models`. If a client-token scope excludes the new route, diagnostics report
+the mismatch and leave the scope unchanged.
+
 ## Upstream Shortcuts
 
 `upstreams` is a concise authoring layer for common single-channel setups. It is
@@ -123,7 +146,7 @@ pools:
 Supported values for `chat_completions`, `responses`, and `embeddings` are
 `supported`, `unsupported`, and `unknown`. Supported values for `models` are
 `local_projection`, `unsupported`, and `unknown`; `local_projection` means the
-router serves client-facing `/v1/models` from its compiled public route catalog.
+router serves client-facing `/v1/models` from its compiled local public catalog.
 
 OpenAI-compatible upstream templates populate conservative defaults:
 `chat_completions: supported`, `responses: unknown`, `embeddings: unknown`, and
@@ -162,6 +185,13 @@ their raw token values.
 When SQLite-backed client-token storage is populated, that store is
 authoritative for mutable client-token scope. Editing YAML does not silently
 rewrite stored scope.
+
+`models explain` is a diagnostic projection over one public model id,
+client-token reference, and endpoint family. Authenticated `/v1/models` is the
+actual catalog a client sees with its bearer token. A scope mismatch is an
+explanation result, not an automatic repair path; operators must intentionally
+change token scope or model groups through the supported configuration/store
+workflow before expecting the route to appear for that client.
 
 ## Credential Sources
 

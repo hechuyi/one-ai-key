@@ -119,6 +119,7 @@ pub async fn apply_audited_staged_registry_mutation(
     command: RegistryCommand,
     audit: RegistryMutationAudit,
 ) -> Result<RegistryMutationStatus, ManagementServiceError> {
+    let _mutation_guard = state.registry_mutation_lock.lock().await;
     let expected_registry_version = state
         .registry_store
         .current_version()
@@ -218,6 +219,48 @@ pub async fn apply_staged_model_route_batch_for_state(
     .map_err(registry_store_error)
 }
 
+async fn preflight_staged_model_route_batch_for_state(
+    state: &AppState,
+    expected_registry_version: u64,
+    routes: &[(String, ModelRouteConfig)],
+) -> Result<(), ManagementServiceError> {
+    let current_registry_version = state
+        .registry_store
+        .current_version()
+        .await
+        .map_err(registry_store_error)?
+        .ok_or_else(|| {
+            ManagementServiceError::Conflict(
+                "registry persistence requires a writable registry store".to_string(),
+            )
+        })?;
+    if current_registry_version != expected_registry_version {
+        return Err(ManagementServiceError::Conflict(
+            "registry version changed during model discovery sync apply".to_string(),
+        ));
+    }
+
+    let mut staged_registry_document = state
+        .registry_store
+        .load_registry_for_validation()
+        .await
+        .map_err(registry_store_error)?
+        .ok_or_else(|| {
+            ManagementServiceError::Conflict(
+                "registry persistence requires a writable registry store".to_string(),
+            )
+        })?;
+    for (public_model, route) in routes {
+        staged_registry_document
+            .model_routes
+            .insert(public_model.clone(), route.clone());
+    }
+    staged_registry_validator((*state.registry_validation_bootstrap).clone())(
+        &staged_registry_document,
+    )
+    .map_err(registry_store_error)
+}
+
 pub async fn apply_audited_staged_model_route_batch_for_state(
     state: &AppState,
     actor: ManagementEventActor,
@@ -225,9 +268,12 @@ pub async fn apply_audited_staged_model_route_batch_for_state(
     routes: Vec<(String, ModelRouteConfig)>,
     audit: RegistryMutationAudit,
 ) -> Result<RegistryStoreCommit, ManagementServiceError> {
+    let _mutation_guard = state.registry_mutation_lock.lock().await;
+    preflight_staged_model_route_batch_for_state(state, expected_registry_version, &routes).await?;
+    record_registry_mutation_audit_event(state, actor, &audit, expected_registry_version + 1)
+        .await?;
     let commit =
         apply_staged_model_route_batch_for_state(state, expected_registry_version, routes).await?;
-    record_registry_mutation_audit_event(state, actor, &audit, commit.registry_version).await?;
     Ok(commit)
 }
 

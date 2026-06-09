@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use crate::{
     config::ResolvedClientToken,
     endpoint_capabilities::{EndpointCapabilitiesStatus, EndpointSupport},
+    events::{RoutingTelemetry, UpstreamFailureTelemetry},
     management_errors::ManagementServiceError,
     management_status::{
         add_key_pool_snapshot_counts, channel_health_status, channel_health_status_from_health,
@@ -701,6 +702,8 @@ pub struct EndpointFamilyAvailabilityExplain {
     pub client_token_ref: Option<String>,
     pub route_kind: &'static str,
     pub registry_generation: u64,
+    pub reload_drift: EndpointFamilyAvailabilityReloadDrift,
+    pub recent_failure_hint: EndpointFamilyAvailabilityRecentFailureHint,
     pub evidence: EndpointFamilyAvailabilityEvidence,
     pub next_step: EndpointFamilyAvailabilityNextStep,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -731,6 +734,28 @@ pub struct EndpointFamilyAvailabilityEvidence {
     pub selected_target_present: bool,
     pub candidate_limit: usize,
     pub candidate_reason_codes: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct EndpointFamilyAvailabilityReloadDrift {
+    pub status: &'static str,
+    pub reason_code: &'static str,
+    pub active_registry_generation: u64,
+    pub active_registry_version: Option<u64>,
+    pub staged_registry_version: Option<u64>,
+    pub runtime_reload_required: Option<bool>,
+    pub last_reload_at_unix_seconds: Option<u64>,
+    pub last_reload_error_reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EndpointFamilyAvailabilityRecentFailureHint {
+    pub status: &'static str,
+    pub source: &'static str,
+    pub window_event_count: usize,
+    pub matched_event_count: usize,
+    pub reason_codes: Vec<String>,
+    pub channel_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -798,20 +823,30 @@ pub async fn endpoint_family_availability_explain(
     let endpoint_capabilities =
         endpoint_capabilities_by_channel(state, route_context.registry_generation);
 
-    endpoint_family_availability_explain_from_parts(EndpointFamilyAvailabilityExplainInput {
-        client_tokens: &client_tokens,
-        client_token_ref,
-        endpoint_family,
-        public_model,
-        registry_generation: route_context.registry_generation,
-        model_allowed,
-        model_visible,
-        route_kind,
-        route,
-        channel_states: &channel_states,
-        endpoint_capabilities: &endpoint_capabilities,
-        candidate_limit: state.routing.max_route_candidates,
-    })
+    let mut explain =
+        endpoint_family_availability_explain_from_parts(EndpointFamilyAvailabilityExplainInput {
+            client_tokens: &client_tokens,
+            client_token_ref,
+            endpoint_family,
+            public_model,
+            registry_generation: route_context.registry_generation,
+            model_allowed,
+            model_visible,
+            route_kind,
+            route,
+            channel_states: &channel_states,
+            endpoint_capabilities: &endpoint_capabilities,
+            candidate_limit: state.routing.max_route_candidates,
+        });
+    let staged_registry_version = state.registry_store.current_version().await.ok().flatten();
+    explain.reload_drift = endpoint_family_reload_drift_from_state(
+        state,
+        route_context.registry_generation,
+        staged_registry_version,
+    );
+    explain.recent_failure_hint =
+        endpoint_family_recent_failure_hint_from_state(state, public_model, route);
+    explain
 }
 
 pub fn endpoint_family_availability_explain_from_parts(
@@ -1041,9 +1076,159 @@ fn endpoint_family_availability_explain_result(
         client_token_ref: input.client_token_ref.map(safe_reference_label),
         route_kind: input.route_kind,
         registry_generation: input.registry_generation,
+        reload_drift: endpoint_family_unknown_reload_drift(input.registry_generation),
+        recent_failure_hint: endpoint_family_no_recent_failure_hint(),
         evidence,
         next_step: endpoint_family_next_step(outcome.reason_code),
         client_token,
+    }
+}
+
+fn endpoint_family_reload_drift_from_state(
+    state: &AppState,
+    active_registry_generation: u64,
+    staged_registry_version: Option<u64>,
+) -> EndpointFamilyAvailabilityReloadDrift {
+    let active_registry_version = *state
+        .active_registry_version
+        .read()
+        .expect("active registry version lock poisoned");
+    let last_reload = state.runtime_reload_status_snapshot();
+    let runtime_reload_required =
+        staged_registry_version.map(|staged| Some(staged) != active_registry_version);
+    let (status, reason_code) = match runtime_reload_required {
+        Some(true) => ("drift", "staged_registry_differs"),
+        Some(false) => ("current", "active_registry_matches_staged"),
+        None => ("unknown", "staged_registry_version_unavailable"),
+    };
+    EndpointFamilyAvailabilityReloadDrift {
+        status,
+        reason_code,
+        active_registry_generation,
+        active_registry_version,
+        staged_registry_version,
+        runtime_reload_required,
+        last_reload_at_unix_seconds: last_reload.last_reload_at_unix_seconds,
+        last_reload_error_reason_code: last_reload
+            .last_reload_error_reason_code
+            .and_then(safe_reload_reason_code_label),
+    }
+}
+
+fn endpoint_family_unknown_reload_drift(
+    active_registry_generation: u64,
+) -> EndpointFamilyAvailabilityReloadDrift {
+    EndpointFamilyAvailabilityReloadDrift {
+        status: "unknown",
+        reason_code: "staged_registry_version_unavailable",
+        active_registry_generation,
+        active_registry_version: None,
+        staged_registry_version: None,
+        runtime_reload_required: None,
+        last_reload_at_unix_seconds: None,
+        last_reload_error_reason_code: None,
+    }
+}
+
+fn endpoint_family_no_recent_failure_hint() -> EndpointFamilyAvailabilityRecentFailureHint {
+    EndpointFamilyAvailabilityRecentFailureHint {
+        status: "none",
+        source: "routing_telemetry_bounded_window",
+        window_event_count: 0,
+        matched_event_count: 0,
+        reason_codes: Vec::new(),
+        channel_ids: Vec::new(),
+    }
+}
+
+fn endpoint_family_recent_failure_hint_from_state(
+    state: &AppState,
+    public_model: &str,
+    route: Option<&ModelRoute>,
+) -> EndpointFamilyAvailabilityRecentFailureHint {
+    let snapshot = state
+        .routing_telemetry
+        .lock()
+        .expect("routing telemetry mutex poisoned")
+        .snapshot();
+    endpoint_family_recent_failure_hint(&snapshot, public_model, route)
+}
+
+fn endpoint_family_recent_failure_hint(
+    snapshot: &[RoutingTelemetry],
+    public_model: &str,
+    route: Option<&ModelRoute>,
+) -> EndpointFamilyAvailabilityRecentFailureHint {
+    let window_event_count = snapshot.len();
+    let route_channel_ids = route
+        .map(|route| {
+            route
+                .targets
+                .iter()
+                .map(|target| target.channel_id.0.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut matched_event_count = 0usize;
+    let mut reason_codes = Vec::new();
+    let mut channel_ids = Vec::new();
+    for event in snapshot.iter().rev() {
+        let RoutingTelemetry::UpstreamFailureObserved {
+            channel_id,
+            failure,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if failure.public_model.as_deref() != Some(public_model) {
+            continue;
+        }
+        if !route_channel_ids.is_empty()
+            && !route_channel_ids
+                .iter()
+                .any(|route_channel_id| route_channel_id == channel_id)
+        {
+            continue;
+        }
+        matched_event_count = matched_event_count.saturating_add(1);
+        let reason_code = endpoint_family_failure_reason_code(failure);
+        if reason_codes.len() < 8 && !reason_codes.iter().any(|value| value == reason_code) {
+            reason_codes.push(reason_code.to_string());
+        }
+        let channel_label = safe_channel_id_label(channel_id);
+        if channel_ids.len() < 8 && !channel_ids.iter().any(|value| value == &channel_label) {
+            channel_ids.push(channel_label);
+        }
+    }
+    EndpointFamilyAvailabilityRecentFailureHint {
+        status: if matched_event_count == 0 {
+            "none"
+        } else {
+            "present"
+        },
+        source: "routing_telemetry_bounded_window",
+        window_event_count,
+        matched_event_count,
+        reason_codes,
+        channel_ids,
+    }
+}
+
+fn endpoint_family_failure_reason_code(failure: &UpstreamFailureTelemetry) -> &'static str {
+    match failure.failure_kind.as_str() {
+        "response_filter_rejected" => "response_filter_rejected",
+        "rate_limited" => "upstream_rate_limited",
+        "auth_invalid" => "upstream_auth_invalid",
+        "quota_exhausted" => "upstream_quota_exhausted",
+        "provider_unavailable" => "upstream_provider_unavailable",
+        "key_switch_cooldown" => "key_switch_cooldown",
+        _ => match failure.status {
+            Some(500..=599) => "upstream_5xx",
+            Some(408) => "upstream_timeout",
+            Some(400..=499) => "upstream_4xx",
+            _ => "unknown_failure_class",
+        },
     }
 }
 
@@ -1133,12 +1318,11 @@ fn endpoint_family_next_step(reason_code: &str) -> EndpointFamilyAvailabilityNex
             requires_confirmation: false,
         },
         "token_unknown" | "token_disabled" => EndpointFamilyAvailabilityNextStep {
-            summary: "Inspect runtime client-token references before rerunning models explain.",
-            template_id: "client_tokens_list",
+            summary: "Inspect the read-only runtime doctor projection before rerunning models explain.",
+            template_id: "doctor",
             safe_argv: vec![
                 "one-ai-key",
-                "client-tokens",
-                "list",
+                "doctor",
                 "--management-url",
                 "<url>",
                 "--management-token-env",
@@ -1167,16 +1351,18 @@ fn endpoint_family_next_step(reason_code: &str) -> EndpointFamilyAvailabilityNex
             requires_confirmation: false,
         },
         "model_missing" => EndpointFamilyAvailabilityNextStep {
-            summary: "Inspect compiled runtime public models before changing configuration.",
-            template_id: "models_list",
+            summary: "Inspect the runtime model projection for this public model.",
+            template_id: "models_explain",
             safe_argv: vec![
                 "one-ai-key",
                 "models",
-                "list",
+                "explain",
                 "--management-url",
                 "<url>",
                 "--management-token-env",
                 "<env>",
+                "--model",
+                "<public-model>",
             ],
             side_effect_class: "runtime_readonly",
             requires_confirmation: false,
@@ -1237,6 +1423,18 @@ fn safe_client_token_id_label(id: &str) -> String {
 
 fn safe_client_token_name_label(name: &str) -> String {
     safe_reference_label_value(name).unwrap_or_else(|| "<redacted-client-token-name>".to_string())
+}
+
+fn safe_channel_id_label(channel_id: &str) -> String {
+    safe_reference_label_value(channel_id).unwrap_or_else(|| "<redacted-channel-id>".to_string())
+}
+
+fn safe_reload_reason_code_label(reason_code: String) -> Option<String> {
+    if is_safe_reference_label(&reason_code) {
+        Some(reason_code)
+    } else {
+        None
+    }
 }
 
 fn safe_public_model_label(public_model: &str) -> String {
@@ -1392,7 +1590,27 @@ impl EndpointFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::endpoint_capabilities::EndpointSupport;
+    use crate::{
+        config::{
+            AccountConfig, ClientTokenConfig, CredentialSetConfig, ErrorRulesConfig,
+            KeySelectionStrategyConfig, ManagementConfig, ModelRouteConfig, ModelRouteTargetConfig,
+            PoolConfig, ProviderConfig, RouteTargetRetryConfig, RoutingProfileConfig,
+            SameRequestCredentialRetryConfig,
+        },
+        endpoint_capabilities::{EndpointCapabilitiesConfig, EndpointSupport},
+        provider::ProviderKind,
+        registry::RegistryDocument,
+        registry_store::{ProviderRegistryCommand, RegistryCommand, RegistryStoreHandle},
+    };
+    use std::{
+        collections::HashMap,
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static TEMP_SQLITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn client(id: &str, enabled: bool) -> ResolvedClientToken {
         ResolvedClientToken {
@@ -1433,6 +1651,136 @@ mod tests {
                 diagnostic_labels: Vec::new(),
             },
         )])
+    }
+
+    fn temp_sqlite_registry_path(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let sequence = TEMP_SQLITE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "{name}-{}-{suffix}-{sequence}.sqlite",
+            std::process::id()
+        ))
+    }
+
+    fn availability_registry_document(keys_file: PathBuf) -> RegistryDocument {
+        RegistryDocument {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "client-a".to_string(),
+                token: "test-client-token".to_string(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: "test-admin-token".to_string(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path: None,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: Default::default(),
+            routing: Default::default(),
+            response_filter: Default::default(),
+            default_pool: Some("ch1".to_string()),
+            providers: HashMap::from([(
+                "openai".to_string(),
+                ProviderConfig {
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    enabled: true,
+                },
+            )]),
+            accounts: HashMap::from([(
+                "primary".to_string(),
+                AccountConfig {
+                    provider: "openai".to_string(),
+                    api_base: "https://relay.example.test/v1".to_string(),
+                    auth_header: "Authorization".to_string(),
+                    auth_prefix: "Bearer ".to_string(),
+                    enabled: true,
+                },
+            )]),
+            credential_sets: HashMap::from([(
+                "primary-keys".to_string(),
+                CredentialSetConfig { keys_file },
+            )]),
+            model_groups: HashMap::new(),
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: HashMap::from([(
+                "default-routing".to_string(),
+                RoutingProfileConfig {
+                    key_selection: KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry: SameRequestCredentialRetryConfig {
+                        enabled: false,
+                        max_retries: 0,
+                    },
+                    route_target_retry: RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            model_routes: HashMap::from([(
+                "gpt-public".to_string(),
+                ModelRouteConfig {
+                    strategy: Some("priority".to_string()),
+                    targets: vec![ModelRouteTargetConfig {
+                        channel: "ch1".to_string(),
+                        upstream_model: Some("upstream-private".to_string()),
+                        priority: 0,
+                        weight: 1,
+                        enabled: true,
+                    }],
+                },
+            )]),
+            pools: HashMap::from([(
+                "ch1".to_string(),
+                PoolConfig {
+                    endpoint_capabilities: EndpointCapabilitiesConfig {
+                        chat_completions: Some(EndpointSupport::Supported),
+                        responses: Some(EndpointSupport::Unsupported),
+                        embeddings: Some(EndpointSupport::Unknown),
+                        models: Default::default(),
+                        diagnostic_labels: Vec::new(),
+                    },
+                    enabled: true,
+                    account: Some("primary".to_string()),
+                    policy_profile: None,
+                    routing_profile: None,
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    api_base: "https://relay.example.test/v1".to_string(),
+                    credential_set: "primary-keys".to_string(),
+                    auth_header: "Authorization".to_string(),
+                    auth_prefix: "Bearer ".to_string(),
+                    error_rules: ErrorRulesConfig::default(),
+                },
+            )]),
+        }
+    }
+
+    async fn availability_state_with_registry_store() -> (AppState, PathBuf) {
+        let path = temp_sqlite_registry_path("one-ai-key-availability-registry");
+        let keys_path = temp_sqlite_registry_path("one-ai-key-availability-keys");
+        fs::write(&keys_path, "k1\n").unwrap();
+        let document = availability_registry_document(keys_path);
+        crate::registry_store::SqliteRegistryStore::bootstrap_from_document(&path, {
+            let mut persisted = document.clone();
+            persisted.client_tokens.clear();
+            persisted
+        })
+        .unwrap();
+        let state = AppState::new_with_registry_store_and_validation_bootstrap(
+            document.clone().resolve().unwrap(),
+            RegistryStoreHandle::sqlite(&path).unwrap(),
+            Some(document),
+        )
+        .unwrap();
+        (state, path)
     }
 
     fn candidate_status(
@@ -1623,7 +1971,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_family_explain_reports_available_for_supported_usable_route() {
+    fn endpoint_family_availability_reports_reload_drift_for_supported_usable_route() {
         let route = route();
         let clients = vec![client("client-a", true)];
 
@@ -1664,6 +2012,75 @@ mod tests {
         assert_eq!(value["next_step"]["safe_argv"], serde_json::json!([]));
         assert_eq!(value["next_step"]["side_effect_class"], "runtime_readonly");
         assert_eq!(value["next_step"]["requires_confirmation"], false);
+        assert_eq!(value["reload_drift"]["status"], "unknown");
+        assert_eq!(
+            value["reload_drift"]["reason_code"],
+            "staged_registry_version_unavailable"
+        );
+        assert_eq!(value["reload_drift"]["active_registry_generation"], 7);
+        assert_eq!(value["recent_failure_hint"]["status"], "none");
+        assert_eq!(
+            value["recent_failure_hint"]["source"],
+            "routing_telemetry_bounded_window"
+        );
+        assert_eq!(value["recent_failure_hint"]["matched_event_count"], 0);
+        assert_eq!(
+            value["recent_failure_hint"]["reason_codes"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_family_availability_reload_drift_reports_staged_registry_drift_from_state() {
+        let (state, _path) = availability_state_with_registry_store().await;
+        state
+            .registry_store
+            .apply_command(
+                RegistryCommand::Provider(ProviderRegistryCommand::SetEnabled {
+                    provider_id: "openai".to_string(),
+                    enabled: false,
+                }),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+
+        let explain = endpoint_family_availability_explain(
+            &state,
+            Some("client-a"),
+            "chat_completions",
+            "gpt-public",
+        )
+        .await;
+
+        let drift = serde_json::to_value(explain.reload_drift).unwrap();
+        assert_eq!(drift["status"], "drift");
+        assert_eq!(drift["reason_code"], "staged_registry_differs");
+        assert_eq!(drift["active_registry_version"], 1);
+        assert_eq!(drift["staged_registry_version"], 2);
+        assert_eq!(drift["runtime_reload_required"], true);
+        assert!(drift["active_registry_generation"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn endpoint_family_availability_reload_drift_reports_current_from_state() {
+        let (state, _path) = availability_state_with_registry_store().await;
+
+        let explain = endpoint_family_availability_explain(
+            &state,
+            Some("client-a"),
+            "chat_completions",
+            "gpt-public",
+        )
+        .await;
+
+        let drift = serde_json::to_value(explain.reload_drift).unwrap();
+        assert_eq!(drift["status"], "current");
+        assert_eq!(drift["reason_code"], "active_registry_matches_staged");
+        assert_eq!(drift["active_registry_version"], 1);
+        assert_eq!(drift["staged_registry_version"], 1);
+        assert_eq!(drift["runtime_reload_required"], false);
+        assert!(drift["active_registry_generation"].as_u64().unwrap() > 0);
     }
 
     #[test]
@@ -1898,5 +2315,111 @@ mod tests {
             serde_json::json!(["no_available_credentials"])
         );
         assert_eq!(no_usable_value["next_step"]["template_id"], "route_explain");
+    }
+
+    #[test]
+    fn endpoint_family_explain_uses_only_stage2_safe_readonly_next_steps() {
+        let clients = vec![client("disabled", false), client("client-a", true)];
+
+        let unknown = endpoint_family_availability_explain_from_parts(
+            EndpointFamilyAvailabilityExplainInput {
+                client_tokens: &clients,
+                client_token_ref: Some("unknown"),
+                endpoint_family: "chat_completions",
+                public_model: "gpt-public",
+                registry_generation: 7,
+                model_allowed: true,
+                model_visible: true,
+                route_kind: "explicit_model_route",
+                route: Some(&route()),
+                channel_states: &HashMap::new(),
+                endpoint_capabilities: &HashMap::new(),
+                candidate_limit: 16,
+            },
+        );
+        let unknown_value = serde_json::to_value(&unknown).unwrap();
+        assert_ne!(
+            unknown_value["next_step"]["template_id"],
+            "client_tokens_list"
+        );
+        assert_eq!(unknown_value["next_step"]["template_id"], "doctor");
+
+        let model_missing = endpoint_family_availability_explain_from_parts(
+            EndpointFamilyAvailabilityExplainInput {
+                client_tokens: &clients,
+                client_token_ref: Some("client-a"),
+                endpoint_family: "chat_completions",
+                public_model: "missing-model",
+                registry_generation: 7,
+                model_allowed: true,
+                model_visible: false,
+                route_kind: "no_route",
+                route: None,
+                channel_states: &HashMap::new(),
+                endpoint_capabilities: &HashMap::new(),
+                candidate_limit: 16,
+            },
+        );
+        let model_missing_value = serde_json::to_value(&model_missing).unwrap();
+        assert_ne!(
+            model_missing_value["next_step"]["template_id"],
+            "models_list"
+        );
+        assert_eq!(
+            model_missing_value["next_step"]["template_id"],
+            "models_explain"
+        );
+    }
+
+    #[test]
+    fn endpoint_family_availability_recent_failure_hint_is_bounded_and_redacted() {
+        let snapshot = vec![
+            RoutingTelemetry::RouteSelected {
+                request_id: "req-ignored".to_string(),
+                registry_generation: 1,
+                channel_id: "safe-channel".to_string(),
+            },
+            RoutingTelemetry::UpstreamFailureObserved {
+                request_id: "req-secret".to_string(),
+                channel_id: "https://relay.example/private?secret=sk-SHOULD_NOT_RENDER".to_string(),
+                failure: Box::new(UpstreamFailureTelemetry {
+                    public_model: Some("gpt-public".to_string()),
+                    credential_id_hash: "credential-hash-should-not-render".to_string(),
+                    attempt: 0,
+                    failure_source: "upstream_transaction".to_string(),
+                    failure_kind: "provider_unavailable".to_string(),
+                    failure_scope: "channel".to_string(),
+                    retryable: true,
+                    confidence: "high".to_string(),
+                    status: Some(503),
+                    classifier_id: "classifier-should-not-render".to_string(),
+                    classifier_version: "1".to_string(),
+                    adaptation_rule_id: None,
+                    retry_after_source: None,
+                    cooldown_seconds: None,
+                    directive: "return_error".to_string(),
+                    denial_reason: Some("upstream body SHOULD_NOT_RENDER".to_string()),
+                    duplicate_charge_risk: "unknown".to_string(),
+                    effective_deadline_remaining_ms: None,
+                    retry_pressure_accounted: true,
+                    retry_decision: "return_current_error".to_string(),
+                    retry_decision_reason: Some("attempt_limit_reached".to_string()),
+                }),
+            },
+        ];
+
+        let hint = endpoint_family_recent_failure_hint(&snapshot, "gpt-public", None);
+        let rendered = serde_json::to_string(&hint).unwrap();
+
+        assert_eq!(hint.status, "present");
+        assert_eq!(hint.window_event_count, 2);
+        assert_eq!(hint.matched_event_count, 1);
+        assert_eq!(hint.reason_codes, vec!["upstream_provider_unavailable"]);
+        assert_eq!(hint.channel_ids, vec!["<redacted-channel-id>"]);
+        assert!(!rendered.contains("SHOULD_NOT_RENDER"));
+        assert!(!rendered.contains("secret="));
+        assert!(!rendered.contains("https://relay.example"));
+        assert!(!rendered.contains("credential-hash-should-not-render"));
+        assert!(!rendered.contains("classifier-should-not-render"));
     }
 }

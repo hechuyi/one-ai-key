@@ -412,6 +412,9 @@ fn release_smoke_script_covers_local_mock_data_plane_and_operator_commands() {
         "INVALID_CLIENT_STATUS",
         "invalid router api key",
         "invalid client token response leaked token material",
+        "UPSTREAM_MODELS_BEFORE_SERVICE=$(mock_upstream_model_catalog_requests)",
+        "UPSTREAM_MODELS_AFTER_AUTHENTICATED_MODELS=$(mock_upstream_model_catalog_requests)",
+        "authenticated /v1/models called upstream /v1/models",
         "side_effect_class",
         "models-explain.json",
         "models explain --model gpt-example --client-token-ref local-client --endpoint-family chat_completions --output json",
@@ -460,6 +463,59 @@ fn release_smoke_script_covers_local_mock_data_plane_and_operator_commands() {
 }
 
 #[test]
+fn release_smoke_script_covers_local_model_publication_workflow() {
+    let path = "scripts/release-smoke.sh";
+    let script = read_repo_file(path);
+
+    for required in [
+        r#"export KEY_POOL_ROUTER_SQLITE_REGISTRY_STORE="${WORK_DIR}/registry-store.sqlite""#,
+        "release-smoke-public-model",
+        "release-smoke-upstream-model",
+        "models-onboard-plan.json",
+        "models-onboard-apply-dry-run.json",
+        "models-onboard-apply.json",
+        "reload-status-staged.json",
+        "models-explain-staged.json",
+        "reload-diff-staged.json",
+        "reload-apply.json",
+        "models-explain-published.json",
+        "STAGED_REGISTRY_VERSION",
+        "PRE_ONBOARD_STAGED_REGISTRY_VERSION",
+        "models onboard-plan --channel",
+        "--public-model \"${PUBLISHED_PUBLIC_MODEL}\"",
+        "--upstream-model \"${PUBLISHED_UPSTREAM_MODEL}\"",
+        "--client-token-ref local-client",
+        "--endpoint-family chat_completions",
+        "--apply --dry-run",
+        "--apply --expected-staged-registry-version",
+        "reload apply --yes --expected-staged-registry-version",
+        r#".planning_only_no_visibility_change == true"#,
+        r#".client_visibility_changed == false"#,
+        r#".live_discovery_called == false"#,
+        r#".management_mutation_sent == false"#,
+        r#".runtime_reload_required == true"#,
+        r#".applied_to_runtime == false"#,
+        r#".staged_vs_runtime.active_matches_staged == false"#,
+        r#".staged_vs_runtime.reload_required_reason == "staged_registry_differs""#,
+        r#".reason_code == "reload_diff_available""#,
+        r#".resource_changes | type == "array""#,
+        r#".budget.truncated == false"#,
+        r#".reason_code == "runtime_reload_applied""#,
+        r#".can_use == true"#,
+        r#"map(.id) | index($published_public_model) == null"#,
+        r#"map(.id) | index($published_public_model) != null"#,
+        "UPSTREAM_MODELS_AFTER_WORKFLOW",
+        "UPSTREAM_MODELS_AFTER_AUTHENTICATED_MODELS",
+        "release smoke published model ok",
+    ] {
+        assert!(
+            script.contains(required),
+            "{path} must cover local model publication smoke token `{required}`"
+        );
+    }
+}
+
+#[test]
 fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
     let path = "scripts/release-smoke.sh";
     let script = read_repo_file(path);
@@ -483,6 +539,14 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
         "reload-status.json",
         "reload-diff.json",
         "reload-apply-dry-run.json",
+        "models-onboard-plan.json",
+        "models-onboard-apply-dry-run.json",
+        "models-onboard-apply.json",
+        "reload-status-staged.json",
+        "models-explain-staged.json",
+        "reload-diff-staged.json",
+        "reload-apply.json",
+        "models-explain-published.json",
         "negative-management-url.txt",
         "release-smoke-client-token",
         "release-smoke-management-token",
@@ -501,6 +565,10 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
         ".evidence.candidate_limit >= 0",
         ".evidence.endpoint_family_target_count >= 0",
         ".evidence.preview_candidate_count >= 0",
+        "from urllib.parse import urlsplit",
+        "failed to parse mock upstream event JSONL",
+        "mock upstream event missing string method/path",
+        "urlsplit(event[\"path\"]).path",
     ] {
         assert!(
             script.contains(required),
@@ -511,6 +579,7 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
         "local truncated=false",
         r#"$truncated == false"#,
         "--argjson truncated",
+        "except Exception:\n            continue",
     ] {
         assert!(
             !script.contains(forbidden),

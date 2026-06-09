@@ -292,7 +292,7 @@ pub fn is_valid_safe_next_action(value: &Value) -> bool {
     let Some(argv) = argv else {
         return false;
     };
-    is_allowed_safe_argv(&argv) && argv.iter().copied().all(is_safe_argv_arg)
+    is_allowed_safe_action(template_id, &argv) && argv.iter().copied().all(is_safe_argv_arg)
 }
 
 fn next_action_value(action: SafeAction) -> Value {
@@ -427,6 +427,132 @@ fn action_spec(action: SafeAction) -> ActionSpec {
 }
 
 #[cfg(test)]
+fn is_allowed_safe_action(template_id: &str, argv: &[&str]) -> bool {
+    if argv.is_empty() {
+        return template_id == "no_action_required";
+    }
+    matches!(
+        (template_id, argv),
+        (
+            "models_explain",
+            [
+                "one-ai-key",
+                "models",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "--model",
+                "<public-model>"
+            ]
+        ) | (
+            "models_explain_visibility",
+            [
+                "one-ai-key",
+                "models",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "--model",
+                "<public-model>",
+                "--client-token-ref",
+                "<client-token-ref>"
+            ]
+        ) | (
+            "use_supported_endpoint_family",
+            [
+                "one-ai-key",
+                "models",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "--model",
+                "<public-model>",
+                "--endpoint-family",
+                "chat_completions"
+            ]
+        ) | (
+            "route_explain",
+            [
+                "one-ai-key",
+                "route",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "<public-model>"
+            ]
+        ) | (
+            "failures_tail",
+            [
+                "one-ai-key",
+                "failures",
+                "tail",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "--last",
+                "50"
+            ]
+        ) | (
+            "failures_explain_request",
+            [
+                "one-ai-key",
+                "failures",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "<request-id>",
+                "--last",
+                "50"
+            ]
+        ) | (
+            "doctor",
+            [
+                "one-ai-key",
+                "doctor",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>"
+            ]
+        ) | (
+            "reload_status",
+            [
+                "one-ai-key",
+                "reload",
+                "status",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>"
+            ]
+        ) | (
+            "reload_diff",
+            [
+                "one-ai-key",
+                "reload",
+                "diff",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>"
+            ]
+        )
+    )
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 fn is_allowed_safe_argv(argv: &[&str]) -> bool {
     if argv.is_empty() {
         return true;
@@ -634,6 +760,27 @@ mod tests {
                 "summary": "unsafe",
                 "template_id": "curl",
                 "safe_argv": ["curl", "https://example.invalid/path"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            }),
+            serde_json::json!({
+                "summary": "unsafe",
+                "template_id": "client_tokens_list",
+                "safe_argv": ["one-ai-key", "client-tokens", "list", "--management-url", "<url>", "--management-token-env", "<env>"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            }),
+            serde_json::json!({
+                "summary": "unsafe",
+                "template_id": "models_list",
+                "safe_argv": ["one-ai-key", "models", "list", "--management-url", "<url>", "--management-token-env", "<env>"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            }),
+            serde_json::json!({
+                "summary": "unsafe",
+                "template_id": "client_tokens_list",
+                "safe_argv": ["one-ai-key", "doctor", "--management-url", "<url>", "--management-token-env", "<env>"],
                 "side_effect_class": "runtime_readonly",
                 "requires_confirmation": false
             }),

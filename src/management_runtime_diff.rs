@@ -185,7 +185,7 @@ fn runtime_reload_resource_diff(
             channel_changed_fields,
         ),
         diff_model_route_maps(
-            "model_routes",
+            "model_route",
             active_model_route_summaries(state),
             staged_model_route_summaries(staged),
             model_route_changed_fields,

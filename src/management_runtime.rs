@@ -1274,16 +1274,17 @@ async fn apply_runtime_reload(
     actor: ManagementEventActor,
     expected_staged_registry_version: Option<u64>,
 ) -> Result<RuntimeReloadResponse, ManagementServiceError> {
-    let staged_registry_version = state
-        .registry_store
-        .current_version()
-        .await
-        .map_err(registry_store_error)?;
     let Some(expected_staged_registry_version) = expected_staged_registry_version else {
         return Err(ManagementServiceError::PreconditionFailed(
             "runtime reload requires expected_staged_registry_version precondition".to_string(),
         ));
     };
+    let _mutation_guard = state.registry_mutation_lock.lock().await;
+    let staged_registry_version = state
+        .registry_store
+        .current_version()
+        .await
+        .map_err(registry_store_error)?;
     if staged_registry_version != Some(expected_staged_registry_version) {
         return Err(ManagementServiceError::PreconditionFailed(format!(
             "runtime reload precondition failed: staged registry version changed from {expected_staged_registry_version} to {staged_registry_version:?}"
