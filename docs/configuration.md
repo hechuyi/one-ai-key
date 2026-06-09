@@ -211,6 +211,15 @@ credential store can import replacement credentials through management APIs.
 Request forwarding still selects from in-memory pool state and does not query
 SQLite on the hot path.
 
+Raw upstream keys are not accepted as CLI positional arguments. Valid key
+sources are configured `keys_file` entries, environment or startup secret
+sources supported by the deployment, local source files controlled by the
+operator, the writable credential store, and `one-ai-key keys import --source
+<path>`. The `--source` value is a path to a local file, not the key value
+itself. `keys import --dry-run` reads the file locally for redacted counts and
+duplicate hints; confirmed `keys import --yes` sends the source contents to the
+management credential store.
+
 ## Relay Error Policy
 
 Relay behavior is configured with structured evidence, not free-form upstream
@@ -289,7 +298,10 @@ Optional local SQLite stores are selected by environment variables:
 | `KEY_POOL_ROUTER_SQLITE_CREDENTIAL_STORE` | Persists upstream credential lifecycle and imports. |
 
 Writable stores are control-plane state. Client request forwarding continues to
-use compiled runtime snapshots and in-memory credential pools.
+use compiled runtime snapshots and in-memory credential pools. The credential
+store is the durable control plane for replacement imports and lifecycle
+commands; the request hot path does not read YAML, SQLite, or other credential
+stores.
 
 ## Local File Hygiene
 

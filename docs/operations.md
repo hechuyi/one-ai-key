@@ -199,6 +199,125 @@ non-sensitive. It should prove one model-bearing client request can pass through
 the newly published public id without storing private prompts, raw tokens,
 upstream keys, private URLs, or provider payloads.
 
+## Credential Replacement Workflow
+
+Credential replacement is explicit maintenance for one credential set. It is
+not auto-rotation, background key scanning, batch probe apply, model
+publication, route mutation, or live catalog discovery.
+
+Start with read-only evidence:
+
+```bash
+one-ai-key keys stats --credential-set <credential-set-id> \
+  --include-credential-refs
+
+one-ai-key keys replacement-plan --credential-set <credential-set-id> \
+  --model <public-model-id> \
+  --client-token-ref <client-token-ref>
+```
+
+`keys stats` shows aggregate lifecycle counts and bounded non-secret
+`credential_ref` values when available. `keys replacement-plan` combines
+credential-set capacity with read-only route impact. It reports whether the
+requested credential set is selected, a fallback candidate, not in the current
+route candidates, or unknown. It does not probe upstreams, import credentials,
+disable or restore credentials, mutate routing, or reload runtime state.
+
+Import replacements from a local source file:
+
+```bash
+one-ai-key keys import --credential-set <credential-set-id> \
+  --source <local-source-file> --dry-run
+
+one-ai-key keys import --credential-set <credential-set-id> \
+  --source <local-source-file> --yes
+```
+
+`--source` is a path to a local file, not a raw key argument. Dry-run reads the
+file locally for counts and duplicate hints without sending source secrets to
+management. Confirmed import requires a writable credential store and writes the
+management store; when the running service accepts imported credentials, the
+active in-memory pool can become immediately eligible without a request-path
+store read.
+
+Probe and apply evidence only for one explicit credential reference:
+
+```bash
+one-ai-key keys probe --credential-set <credential-set-id> \
+  --credential-ref <credential-ref> \
+  --model <upstream-model-id> --dry-run
+
+one-ai-key keys probe --credential-set <credential-set-id> \
+  --credential-ref <credential-ref> \
+  --model <upstream-model-id> --yes
+
+one-ai-key keys probe-apply plan --credential-set <credential-set-id> \
+  --credential-ref <credential-ref>
+
+one-ai-key keys probe-apply apply --credential-set <credential-set-id> \
+  --credential-ref <credential-ref> \
+  --probe-result-ref <probe-result-ref> --dry-run
+
+one-ai-key keys probe-apply apply --credential-set <credential-set-id> \
+  --credential-ref <credential-ref> \
+  --probe-result-ref <probe-result-ref> --yes
+```
+
+Confirmed probe is upstream-touching and may persist redacted probe evidence.
+The probe `--model` is the provider-facing upstream model because the command
+directly checks one credential in one upstream context; use `replacement-plan`,
+`route explain`, `models explain`, and a client request to verify public model
+availability. Probe apply remains explicit and preconditioned by a
+`probe_result_ref`; dry-run does not send the mutating apply request. Do not
+substitute internal credential ids or fingerprints for `credential_ref`.
+
+Use lifecycle repair commands only for one known credential:
+
+```bash
+one-ai-key keys disable --credential-set <credential-set-id> \
+  --credential-ref <credential-ref> \
+  --reason <operator-reason> --dry-run
+
+one-ai-key keys disable --credential-set <credential-set-id> \
+  --credential-ref <credential-ref> \
+  --reason <operator-reason> --yes
+
+one-ai-key keys restore --credential-set <credential-set-id> \
+  --credential-ref <credential-ref> \
+  --reason <operator-reason> --dry-run
+
+one-ai-key keys restore --credential-set <credential-set-id> \
+  --credential-ref <credential-ref> \
+  --reason <operator-reason> --yes
+```
+
+Confirmed `keys disable --yes` and `keys restore --yes` are management writes
+that mutate credential lifecycle state. The reason is operator metadata; keep it
+short and non-secret. The CLI does not echo path-like, token-like, or raw-body
+markers into next-action argv. `keys restore` repairs recoverable failed states
+such as expired or quota exhausted. It is not the inverse of a manual
+`keys disable`; disabled credentials remain deliberately out of rotation until a
+separate enable workflow is provided.
+
+Finish with verification:
+
+```bash
+one-ai-key keys stats --credential-set <credential-set-id> \
+  --include-credential-refs
+
+one-ai-key route explain <public-model-id> \
+  --client-token-ref <client-token-ref>
+
+one-ai-key models explain --model <public-model-id> \
+  --client-token-ref <client-token-ref> \
+  --endpoint-family chat_completions
+```
+
+For a local or operator-run smoke, add one harmless client request against a
+mock or otherwise non-sensitive upstream. Store only redacted status, reason
+codes, public model ids, route/channel names, lifecycle counts, and release
+identity.
+
 ## Operator Command Boundaries
 
 All operator reports use a redacted envelope with status, stable reason code,
@@ -244,9 +363,12 @@ diagnosis next action.
 Dry-run commands preview the intended effect and must leave write/upstream bits
 off: `init local --dry-run`, `keys import --credential-set <id> --source <path>
 --dry-run`, `keys probe --credential-set <id> --credential-ref <ref> --model
-<public-model> --dry-run`, `keys probe-apply apply --credential-set <id>
---credential-ref <ref> --dry-run`, `models onboard-plan --dry-run`, `models
-onboard-plan --apply --dry-run`, and `reload apply --dry-run`.
+<upstream-model> --dry-run`, `keys probe-apply apply --credential-set <id>
+--credential-ref <ref> --dry-run`, `keys disable --credential-set <id>
+--credential-ref <ref> --reason <reason> --dry-run`, `keys restore
+--credential-set <id> --credential-ref <ref> --reason <reason> --dry-run`,
+`models onboard-plan --dry-run`, `models onboard-plan --apply --dry-run`, and
+`reload apply --dry-run`.
 
 Upstream-touching commands are explicit. `keys probe --yes` probes one
 credential reference and may persist redacted probe evidence; it is not a
@@ -255,7 +377,8 @@ background health scan and it is not an automatic routing mutation.
 Mutating commands require `--yes` or interactive confirmation:
 `keys import --credential-set <id> --source <path> --yes`, `keys disable
 --credential-set <id> --credential-ref <ref> --reason <reason> --yes`, `keys
-probe-apply apply --credential-set <id> --credential-ref <ref>
+restore --credential-set <id> --credential-ref <ref> --reason <reason> --yes`,
+`keys probe-apply apply --credential-set <id> --credential-ref <ref>
 --probe-result-ref <probe-ref> --yes`, `models onboard-plan --apply
 --expected-staged-registry-version <version> --yes`, and `reload apply
 --expected-staged-registry-version <version> --yes`. Each report must disclose
@@ -366,7 +489,10 @@ scripts/release-smoke.sh
 That smoke uses the extracted release binary, generated placeholder tokens, and
 a local mock upstream. It is local, redacted, and operator-run. It does not
 contact a deployment host, use real upstream credentials, store private tokens
-or URLs, call upstream live catalogs, or require production endpoints.
+or URLs, call upstream live catalogs, or require production endpoints. The
+artifact smoke also covers credential replacement with a temporary local
+credential store, a mock upstream, and placeholder key files that are created
+under the smoke work directory and removed at exit.
 
 After an operator intentionally pins a deployment host to a GitHub Release asset
 and checksum, the operator may run a minimal deployment smoke against the public

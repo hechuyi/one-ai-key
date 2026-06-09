@@ -320,20 +320,52 @@ conversion between endpoint families.
 
 `one-ai-key keys list` and `one-ai-key keys stats` are read-only credential-set
 views. `keys stats --credential-set <id> --include-credential-refs` may show
-non-secret `credential_ref` values for individual workflows when the runtime has
-a durable non-secret reference. `keys import --credential-set <id> --source
-<path> --dry-run` previews a replacement import from a local file. `keys import
---credential-set <id> --source <path> --yes` writes only after explicit
-confirmation and reports whether management store or active runtime state
-changed.
+non-secret `credential_ref` values for single-credential workflows when the
+runtime has durable non-secret references.
 
-`one-ai-key keys probe --credential-set <id> --credential-ref <ref> --model
-<public-model> --dry-run` previews a single-credential probe. A confirmed
-`--yes` probe is upstream-touching and may persist redacted probe evidence. Use
-`keys probe-apply plan --credential-set <id> --credential-ref <ref>` and `keys
-probe-apply apply --credential-set <id> --credential-ref <ref> --dry-run` before
-a confirmed `keys probe-apply apply --credential-set <id> --credential-ref <ref>
---probe-result-ref <probe-ref> --yes`.
+Safe credential replacement is an explicit operator workflow:
+
+```bash
+one-ai-key keys stats --credential-set <id> --include-credential-refs
+one-ai-key keys replacement-plan --credential-set <id> --model <public-model> \
+  --client-token-ref <client-token-ref>
+one-ai-key keys import --credential-set <id> --source <local-source-file> --dry-run
+one-ai-key keys import --credential-set <id> --source <local-source-file> --yes
+one-ai-key keys probe --credential-set <id> --credential-ref <ref> \
+  --model <upstream-model> --dry-run
+one-ai-key keys probe --credential-set <id> --credential-ref <ref> \
+  --model <upstream-model> --yes
+one-ai-key keys probe-apply plan --credential-set <id> --credential-ref <ref>
+one-ai-key keys probe-apply apply --credential-set <id> --credential-ref <ref> \
+  --probe-result-ref <probe-ref> --dry-run
+one-ai-key keys probe-apply apply --credential-set <id> --credential-ref <ref> \
+  --probe-result-ref <probe-ref> --yes
+one-ai-key keys disable --credential-set <id> --credential-ref <ref> \
+  --reason <reason> --dry-run
+one-ai-key keys disable --credential-set <id> --credential-ref <ref> \
+  --reason <reason> --yes
+one-ai-key keys restore --credential-set <id> --credential-ref <ref> \
+  --reason <reason> --dry-run
+one-ai-key keys restore --credential-set <id> --credential-ref <ref> \
+  --reason <reason> --yes
+```
+
+Confirmed `keys import`, `keys disable`, `keys restore`, and `keys probe-apply
+apply` are management writes and require `--yes` or interactive confirmation.
+Confirmed `keys probe` touches exactly one upstream credential and may persist
+redacted probe evidence. Its `--model` value is the provider-facing upstream
+model for that credential set; public client model availability is checked by
+`replacement-plan`, `route explain`, `models explain`, and a client request.
+`keys restore` repairs credentials in recoverable failed states such as expired
+or quota exhausted; it is not the inverse of a manual `keys disable`. Dry-runs
+do not write management state; `keys import --dry-run` only reads the local
+source file for counts. Raw upstream keys are not accepted as positional CLI
+arguments. They come from configured key files, environment or startup secret
+sources, a local source file passed with `keys import --source <path>`, or the
+writable credential store.
+
+After any replacement action, verify with `keys stats`, `route explain`,
+`models explain`, and one local mock or otherwise non-sensitive client request.
 
 `one-ai-key failures tail --last <n>` and `one-ai-key failures explain
 <request-id>` read only bounded recent failure evidence from management

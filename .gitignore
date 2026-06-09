@@ -31,6 +31,8 @@
 /config/*.json
 /config/*.toml
 /scripts/one_ai_key_keys.py
+/scripts/one_ai_key_upload_key.py
+/tests/test_one_ai_key_upload_key.py
 
 # Secret material.
 *.pem

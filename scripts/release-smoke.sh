@@ -105,6 +105,7 @@ cd "${WORK_DIR}"
 CLIENT_TOKEN="release-smoke-client-token"
 MANAGEMENT_TOKEN="release-smoke-management-token"
 UPSTREAM_TOKEN="release-smoke-upstream-token"
+REPLACEMENT_TOKEN="release-smoke-replacement-token"
 INVALID_CLIENT_TOKEN="release-smoke-invalid-client-token"
 SERVICE_PORT=$(python3 - <<'PY'
 import socket
@@ -147,8 +148,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/models":
             self._send_json({"object": "list", "data": [{"id": "provider/gpt-example", "object": "model"}]})
             return
-        if self.path == "/v1/models/provider/gpt-example":
+        if self.path in ("/v1/models/provider/gpt-example", "/v1/models/provider%2Fgpt-example"):
             self._send_json({"id": "provider/gpt-example", "object": "model"})
+            return
+        if self.path in ("/v1/models/provider/invalid-probe", "/v1/models/provider%2Finvalid-probe"):
+            self._send_json({"error": {"code": "invalid_api_key"}}, status=401)
             return
         self._send_json({"error": {"code": "not_found"}}, status=404)
 
@@ -228,6 +232,7 @@ printf '%s\n' "${UPSTREAM_TOKEN}" > data/relay.keys
   | jq -e '.status == "ok" and .reason_code == "ok" and (.model_visibility_preview[] | select(.client_token_ref == "local-client") | .visible_models == ["gpt-example"])' >/dev/null
 
 export KEY_POOL_ROUTER_SQLITE_REGISTRY_STORE="${WORK_DIR}/registry-store.sqlite"
+export KEY_POOL_ROUTER_SQLITE_CREDENTIAL_STORE="${WORK_DIR}/credential-store.sqlite"
 UPSTREAM_MODELS_BEFORE_SERVICE=$(mock_upstream_model_catalog_requests)
 if [[ "${UPSTREAM_MODELS_BEFORE_SERVICE}" != "0" ]]; then
   printf 'error: upstream /v1/models was called before service startup\n' >&2
@@ -307,6 +312,22 @@ EXPECTED_MANAGEMENT_REPORTS=(
   "models-explain.json"
   "route-explain.json"
   "keys-stats.json"
+  "keys-replacement-plan.json"
+  "keys-import-dry-run.json"
+  "keys-import-apply.json"
+  "keys-stats-after-import.json"
+  "keys-probe-dry-run.json"
+  "keys-probe.json"
+  "keys-probe-apply-plan.json"
+  "keys-probe-apply-dry-run.json"
+  "keys-probe-invalid.json"
+  "keys-probe-apply-invalid-plan.json"
+  "keys-probe-apply-apply.json"
+  "keys-disable-dry-run.json"
+  "keys-disable-apply.json"
+  "keys-restore-dry-run.json"
+  "keys-restore-apply.json"
+  "keys-stats-after-restore.json"
   "failures-tail.json"
   "reload-status.json"
   "reload-diff.json"
@@ -377,6 +398,7 @@ assert_no_management_report_leaks() {
     "${CLIENT_TOKEN}"
     "${MANAGEMENT_TOKEN}"
     "${UPSTREAM_TOKEN}"
+    "${REPLACEMENT_TOKEN}"
     "${INVALID_CLIENT_TOKEN}"
     "${WORK_DIR}"
     "data/relay.keys"
@@ -453,6 +475,214 @@ jq -e --arg model "${MODEL_EXPLAIN_MODEL}" --arg client_token_ref "${MODEL_EXPLA
 ' route-explain.json >/dev/null
 capture_management_report keys-stats.json keys stats --credential-set relay_credentials --output json
 jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' keys-stats.json >/dev/null
+capture_management_report keys-replacement-plan.json keys replacement-plan --credential-set relay_credentials --model gpt-example --client-token-ref local-client --output json
+jq -e '
+  .status == "ok"
+  and .reason_code == "keys_replacement_plan_projected"
+  and .side_effect_class == "runtime_readonly"
+  and .effect_vector.reads_management_runtime == true
+  and .effect_vector.reads_management_store == true
+  and .data.scan_mode == "management_projection_only"
+  and .data.credential_set_id == "relay_credentials"
+  and (.data.capacity_summary.available | type == "number")
+  and (.data.replacement_need.status | type == "string")
+  and .data.route_impact.status == "available"
+  and .data.route_impact.model == "gpt-example"
+  and (.data.route_impact.requested_credential_set.candidate_presence as $presence | ["selected_candidate", "candidate_not_selected", "not_candidate", "unknown"] | index($presence) != null)
+  and (.data.safe_next_actions | type == "array" and length > 0)
+  and (.next_action.safe_argv | type == "array")
+' keys-replacement-plan.json >/dev/null
+printf '%s\n' "${REPLACEMENT_TOKEN}" > replacement.keys
+capture_management_report keys-import-dry-run.json keys import --credential-set relay_credentials --source replacement.keys --dry-run --output json
+jq -e '
+  .status == "dry_run"
+  and .reason_code == "keys_import_local_preview"
+  and .side_effect_class == "local_preview"
+  and .effect_vector.reads_local_files == true
+  and .effect_vector.writes_management_store == false
+  and .effect_vector.mutates_runtime == false
+  and .data.command == "keys import"
+  and .data.non_empty_line_count == 1
+  and .data.source_secrets_sent_to_management == false
+  and (.next_action.safe_argv | type == "array")
+  and .next_action.requires_confirmation == true
+' keys-import-dry-run.json >/dev/null
+capture_management_report keys-import-apply.json keys import --credential-set relay_credentials --source replacement.keys --yes --output json
+jq -e '
+  .status == "ok"
+  and .reason_code == "keys_import_applied"
+  and .side_effect_class == "management_write"
+  and .effect_vector.reads_local_files == true
+  and .effect_vector.writes_management_store == true
+  and .effect_vector.mutates_runtime == true
+  and .data.command == "keys import"
+  and .data.source_secrets_sent_to_management == true
+  and .data.management_response.imported_credentials == 1
+  and .data.management_response.credential_statuses_returned >= 1
+  and (.next_action.safe_argv | type == "array")
+' keys-import-apply.json >/dev/null
+capture_management_report keys-stats-after-import.json keys stats --credential-set relay_credentials --include-credential-refs --output json
+jq -e '
+  .status
+  and .reason_code
+  and .side_effect_class == "runtime_readonly"
+  and (.credential_sets[0].credential_refs | index("cr:v1:pos:0") != null)
+  and (.credential_sets[0].credential_refs | index("cr:v1:pos:1") != null)
+' keys-stats-after-import.json >/dev/null
+capture_management_report keys-probe-dry-run.json keys probe --credential-set relay_credentials --credential-ref cr:v1:pos:0 --model provider/gpt-example --dry-run --output json
+jq -e '
+  .status == "dry_run"
+  and .reason_code == "keys_probe_plan"
+  and .side_effect_class == "runtime_readonly"
+  and .effect_vector.calls_upstream == false
+  and .data.command == "keys probe"
+  and .data.credential_ref == "cr:v1:pos:0"
+  and .data.model == "provider/gpt-example"
+  and .data.upstream_request_sent == false
+  and (.next_action.safe_argv | type == "array")
+' keys-probe-dry-run.json >/dev/null
+capture_management_report keys-probe.json keys probe --credential-set relay_credentials --credential-ref cr:v1:pos:0 --model provider/gpt-example --yes --output json
+jq -e '
+  .status == "ok"
+  and .reason_code == "keys_probe_recorded"
+  and .side_effect_class == "upstream_touching"
+  and .effect_vector.calls_upstream == true
+  and .effect_vector.writes_management_store == true
+  and .data.command == "keys probe"
+  and .data.credential_ref == "cr:v1:pos:0"
+  and .data.model == "provider/gpt-example"
+  and .data.upstream_request_sent == true
+  and .data.probe_evidence_persisted == true
+  and .data.probe.outcome == "success"
+  and .data.probe.upstream_status == 200
+' keys-probe.json >/dev/null
+capture_management_report keys-probe-apply-plan.json keys probe-apply plan --credential-set relay_credentials --credential-ref cr:v1:pos:0 --output json
+jq -e '
+  .status == "dry_run"
+  and .reason_code == "keys_probe_apply_plan_projected"
+  and .side_effect_class == "runtime_readonly"
+  and .data.command == "keys probe-apply plan"
+  and .data.credential_ref == "cr:v1:pos:0"
+  and (.data.probe_result_ref | type == "string")
+  and .data.probe.outcome == "success"
+  and .data.mutating_apply_sent == false
+' keys-probe-apply-plan.json >/dev/null
+PROBE_RESULT_REF=$(jq -r '.data.probe_result_ref' keys-probe-apply-plan.json)
+capture_management_report keys-probe-apply-dry-run.json keys probe-apply apply --credential-set relay_credentials --credential-ref cr:v1:pos:0 --probe-result-ref "${PROBE_RESULT_REF}" --dry-run --output json
+jq -e --arg probe_result_ref "${PROBE_RESULT_REF}" '
+  .status == "dry_run"
+  and .reason_code == "keys_probe_apply_plan_projected"
+  and .side_effect_class == "runtime_readonly"
+  and .data.command == "keys probe-apply apply"
+  and .data.credential_ref == "cr:v1:pos:0"
+  and .data.probe_result_ref == $probe_result_ref
+  and .data.probe_result_ref_matches == true
+  and .data.mutating_apply_sent == false
+  and .data.lifecycle_mutation_applied == false
+' keys-probe-apply-dry-run.json >/dev/null
+capture_management_report keys-probe-invalid.json keys probe --credential-set relay_credentials --credential-ref cr:v1:pos:0 --model provider/invalid-probe --yes --output json
+jq -e '
+  .status == "ok"
+  and .reason_code == "keys_probe_recorded"
+  and .side_effect_class == "upstream_touching"
+  and .effect_vector.calls_upstream == true
+  and .effect_vector.writes_management_store == true
+  and .data.command == "keys probe"
+  and .data.credential_ref == "cr:v1:pos:0"
+  and .data.model == "provider/invalid-probe"
+  and .data.probe.outcome == "invalid"
+  and .data.probe.upstream_status == 401
+' keys-probe-invalid.json >/dev/null
+capture_management_report keys-probe-apply-invalid-plan.json keys probe-apply plan --credential-set relay_credentials --credential-ref cr:v1:pos:0 --output json
+jq -e '
+  .status == "dry_run"
+  and .reason_code == "keys_probe_apply_plan_projected"
+  and .side_effect_class == "runtime_readonly"
+  and .data.command == "keys probe-apply plan"
+  and .data.credential_ref == "cr:v1:pos:0"
+  and (.data.probe_result_ref | type == "string")
+  and .data.planned_action == "expire"
+  and .data.probe.outcome == "invalid"
+  and .data.mutating_apply_sent == false
+' keys-probe-apply-invalid-plan.json >/dev/null
+INVALID_PROBE_RESULT_REF=$(jq -r '.data.probe_result_ref' keys-probe-apply-invalid-plan.json)
+capture_management_report keys-probe-apply-apply.json keys probe-apply apply --credential-set relay_credentials --credential-ref cr:v1:pos:0 --probe-result-ref "${INVALID_PROBE_RESULT_REF}" --yes --output json
+jq -e --arg probe_result_ref "${INVALID_PROBE_RESULT_REF}" '
+  .status == "ok"
+  and .reason_code == "keys_probe_apply_applied"
+  and .side_effect_class == "management_write"
+  and .effect_vector.writes_management_store == true
+  and .effect_vector.mutates_runtime == true
+  and .data.command == "keys probe-apply apply"
+  and .data.credential_ref == "cr:v1:pos:0"
+  and .data.probe_result_ref == $probe_result_ref
+  and .data.applied_action == "expire"
+  and .data.probe.outcome == "invalid"
+  and .data.mutating_apply_sent == true
+  and .data.lifecycle_mutation_applied == true
+  and .data.mutation.state_kind == "expired"
+' keys-probe-apply-apply.json >/dev/null
+capture_management_report keys-disable-dry-run.json keys disable --credential-set relay_credentials --credential-ref cr:v1:pos:1 --reason "operator verified unavailable credential" --dry-run --output json
+jq -e '
+  .status == "dry_run"
+  and .reason_code == "keys_disable_plan"
+  and .side_effect_class == "offline_readonly"
+  and .data.command == "keys disable"
+  and .data.credential_ref == "cr:v1:pos:1"
+  and .data.mutating_disable_sent == false
+  and .next_action.requires_confirmation == true
+' keys-disable-dry-run.json >/dev/null
+capture_management_report keys-disable-apply.json keys disable --credential-set relay_credentials --credential-ref cr:v1:pos:1 --reason "operator verified unavailable credential" --yes --output json
+jq -e '
+  .status == "ok"
+  and .reason_code == "keys_disable_applied"
+  and .side_effect_class == "management_write"
+  and .effect_vector.writes_management_store == true
+  and .effect_vector.mutates_runtime == true
+  and .data.command == "keys disable"
+  and .data.credential_ref == "cr:v1:pos:1"
+  and .data.state_kind == "disabled"
+  and .data.mutating_disable_sent == true
+  and .next_action.requires_confirmation == false
+' keys-disable-apply.json >/dev/null
+capture_management_report keys-restore-dry-run.json keys restore --credential-set relay_credentials --credential-ref cr:v1:pos:0 --reason "operator verified recovered credential" --dry-run --output json
+jq -e '
+  .status == "dry_run"
+  and .reason_code == "keys_restore_plan"
+  and .side_effect_class == "offline_readonly"
+  and .effect_vector.writes_management_store == false
+  and .effect_vector.mutates_runtime == false
+  and .effect_vector.calls_upstream == false
+  and .data.command == "keys restore"
+  and .data.credential_ref == "cr:v1:pos:0"
+  and .data.mutating_restore_sent == false
+  and (.next_action.safe_argv | type == "array")
+  and .next_action.requires_confirmation == true
+  and .next_action.side_effect_class == "management_write"
+' keys-restore-dry-run.json >/dev/null
+capture_management_report keys-restore-apply.json keys restore --credential-set relay_credentials --credential-ref cr:v1:pos:0 --reason "operator verified recovered credential" --yes --output json
+jq -e '
+  .status == "ok"
+  and .reason_code == "keys_restore_applied"
+  and .side_effect_class == "management_write"
+  and .effect_vector.writes_management_store == true
+  and .effect_vector.mutates_runtime == true
+  and .data.command == "keys restore"
+  and .data.credential_ref == "cr:v1:pos:0"
+  and .data.state_kind == "available"
+  and .data.mutating_restore_sent == true
+  and .next_action.requires_confirmation == false
+' keys-restore-apply.json >/dev/null
+capture_management_report keys-stats-after-restore.json keys stats --credential-set relay_credentials --include-credential-refs --output json
+jq -e '
+  .status
+  and .reason_code
+  and .side_effect_class == "runtime_readonly"
+  and (.credential_sets[0].credentials.available >= 1)
+  and (.credential_sets[0].credentials.disabled >= 1)
+  and (.credential_sets[0].credential_refs | index("cr:v1:pos:0") != null)
+  and (.credential_sets[0].credential_refs | index("cr:v1:pos:1") != null)
+' keys-stats-after-restore.json >/dev/null
 capture_management_report failures-tail.json failures tail --last 20 --output json
 jq -e '
   .status
@@ -620,7 +850,7 @@ curl -fsS "http://127.0.0.1:${SERVICE_PORT}/v1/chat/completions" \
 
 UPSTREAM_MODELS_AFTER_WORKFLOW=$(mock_upstream_model_catalog_requests)
 if [[ "${UPSTREAM_MODELS_AFTER_WORKFLOW}" != "${UPSTREAM_MODELS_AFTER_AUTHENTICATED_MODELS}" ]]; then
-  printf 'error: model publication workflow called upstream /v1/models\n' >&2
+  printf 'error: operator workflows called upstream /v1/models\n' >&2
   exit 1
 fi
 

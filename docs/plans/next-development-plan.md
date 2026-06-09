@@ -336,21 +336,76 @@ become a reusable control-plane pattern.
 
 ## Stage 4: Safe Credential Replacement Workflow v1
 
-This is intentionally after the first three stages.
-
 **User value:** replace bad or exhausted upstream credentials without leaking
 secrets, guessing the wrong blocker, or mutating more than intended.
 
-Future MVP:
+### Tasks
 
-- `keys replacement-plan` for credential-set capacity and route impact;
-- `keys import --dry-run/--yes` as the only import path;
-- single-credential `keys probe` with explicit upstream-touching effect;
-- single-credential probe-apply with `probe_result_ref`;
-- disable/restore as explicit lifecycle repair;
-- post-action verification through keys stats, route explain, and local client
-  smoke;
-- documentation that keys are read from files/env, not CLI arguments.
+- [x] **Credential capacity and route impact plan**
+
+  Files: `src/cli.rs`, `src/cli_commands/keys.rs`, `src/cli_effects.rs`,
+  `scripts/release-smoke.sh`.
+
+  Tests: `keys replacement-plan` reads credential-set management projections,
+  optional bounded credential refs, and optional route preview context. Route
+  preview failures degrade to unavailable route impact; credential-set reads
+  remain required. JSON and default table output show whether the requested
+  credential set is selected, a fallback candidate, not a candidate, or unknown.
+
+  Non-goals: no probe, import, lifecycle mutation, reload, route mutation,
+  background health scan, or live catalog call.
+
+- [x] **Import remains the only replacement key ingress**
+
+  Files: `src/cli_commands/keys.rs`, `docs/configuration.md`,
+  `docs/operations.md`, `scripts/release-smoke.sh`.
+
+  Tests: `keys import --dry-run` reads a local source file for redacted counts
+  only; confirmed `keys import --yes` requires a writable credential store and
+  reports management-write/runtime-mutation effect without exposing source
+  secrets. Release smoke covers both paths with placeholder local files.
+
+  Non-goals: no raw key positional CLI argument, no paste-key command, no
+  automatic import suggestion from diagnosis.
+
+- [x] **Single-credential probe and probe-apply workflow**
+
+  Files: `src/cli_commands/keys.rs`, `scripts/release-smoke.sh`.
+
+  Tests: `keys probe --dry-run` is read-only, confirmed `keys probe --yes`
+  touches one explicit `credential_ref` with a provider-facing upstream model
+  and persists redacted probe evidence, `keys probe-apply plan` exposes a
+  bounded `probe_result_ref`, and `keys probe-apply apply --dry-run` verifies
+  the precondition without mutation.
+
+  Non-goals: no batch probe apply, no background probing, no automatic
+  lifecycle mutation from diagnosis.
+
+- [x] **Explicit disable and restore lifecycle repair**
+
+  Files: `src/cli.rs`, `src/cli_commands/keys.rs`, `src/cli_effects.rs`,
+  `src/operator_client.rs`, `scripts/release-smoke.sh`.
+
+  Tests: `keys disable` and `keys restore` accept only non-secret
+  `credential_ref` values. Dry-run is offline readonly; confirmed operations
+  require `--yes`, call only set-scoped management mutation endpoints, and
+  redact raw keys, fingerprints, private paths, raw bodies, and token-like
+  values. Path-like operator reasons are not echoed into next-action argv.
+
+  Non-goals: no bulk restore, no inferred target from stats, no direct internal
+  credential id use.
+
+- [x] **Post-action verification and documentation**
+
+  Files: `README.md`, `docs/operations.md`, `docs/configuration.md`,
+  `scripts/release-smoke.sh`, `docs/plans/next-development-plan-stop-card.md`.
+
+  Tests: release smoke verifies stats, replacement-plan, import,
+  probe/probe-apply dry-run and confirmed evidence paths, disable/restore,
+  route/model explain, `/v1/models`, and one mock completion without private
+  deployment state. Documentation states that keys come from configured files,
+  environment/startup secret sources, local source files, writable credential
+  stores, or `keys import --source`, not raw CLI positional arguments.
 
 Rejected:
 
@@ -361,6 +416,25 @@ Rejected:
 - balance dashboard;
 - raw key output;
 - automatic model/route mutation as part of key maintenance.
+
+### Stage 4 Stop Criteria
+
+- Credential replacement has a documented read-only first step:
+  `keys stats` plus `keys replacement-plan`.
+- Replacement key ingress is `keys import --source <path>` only; raw upstream
+  keys are not positional CLI arguments.
+- Single-credential workflows use non-secret `credential_ref` values and never
+  ask operators for internal ids or fingerprints.
+- Dry-run commands do not write management state, call upstreams, or mutate
+  active runtime except where explicitly classified as local preview.
+- Confirmed import, disable, restore, and probe-apply require `--yes` or
+  interactive confirmation and disclose management-write/runtime-mutation
+  effects.
+- Confirmed probe is single-credential and upstream-touching; it is not a
+  background health check.
+- Release smoke covers the replacement workflow with local placeholders and
+  leak scanning.
+- Request hot path still reads only compiled in-memory state.
 
 ## Cross-Stage Client Compatibility Contract
 
