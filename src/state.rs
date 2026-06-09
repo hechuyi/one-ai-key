@@ -1356,18 +1356,18 @@ fn route_state_for_pool(pool: &PoolState) -> ChannelRouteState {
     if matches!(health, ChannelHealth::Disabled { .. }) {
         return ChannelRouteState::Disabled;
     }
-    if let Some(state) = pool
+    let failure_domain_state = pool
         .failure_domains
-        .route_state(&pool.provider_id, &pool.account_id)
-    {
-        return state;
-    }
+        .route_state(&pool.provider_id, &pool.account_id);
     let Ok(pool_guard) = pool.pool.try_lock() else {
-        return ChannelRouteState::RuntimeUnavailable;
+        return failure_domain_state.unwrap_or(ChannelRouteState::RuntimeUnavailable);
     };
     let has_available_credentials = pool_guard.has_available_credentials_read_only();
     if !has_available_credentials {
         return ChannelRouteState::NoAvailableCredentials;
+    }
+    if let Some(state) = failure_domain_state {
+        return state;
     }
     match health {
         ChannelHealth::Available => ChannelRouteState::Available,
@@ -1927,7 +1927,7 @@ mod tests {
     use crate::{
         config::{
             AccountConfig, AppConfig, ClientTokenConfig, CredentialSetConfig, ErrorRulesConfig,
-            ManagementConfig, PoolConfig, TimeoutConfig,
+            ManagementConfig, PoolConfig, ProviderConfig, TimeoutConfig,
         },
         credential_repository::{
             CredentialLifecycleEvidence, CredentialLifecycleUpdate, SqliteCredentialRepository,
@@ -3482,6 +3482,121 @@ mod tests {
 
         assert_eq!(snapshot.expired_credentials, 1);
         assert_eq!(snapshot.available_credentials, 0);
+    }
+
+    #[test]
+    fn no_available_credentials_remains_hard_blocker_during_failure_domain_soft_cooling() {
+        let keys_file = temp_path("key-pool-router-soft-cooling-no-credentials-keys");
+        fs::write(&keys_file, "k1\n").unwrap();
+        let config = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "test-client".to_string(),
+                token: fixtures().client_token.clone(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: fixtures().admin_token.clone(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path: None,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: TimeoutConfig::default(),
+            routing: crate::config::RoutingConfig::default(),
+            default_pool: Some("test".to_string()),
+            providers: HashMap::from([(
+                "soft-provider".to_string(),
+                ProviderConfig {
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    enabled: true,
+                },
+            )]),
+            accounts: HashMap::from([(
+                "soft-account".to_string(),
+                AccountConfig {
+                    provider: "soft-provider".to_string(),
+                    api_base: "https://example.com/v1".to_string(),
+                    auth_header: "authorization".to_string(),
+                    auth_prefix: "Bearer ".to_string(),
+                    enabled: true,
+                },
+            )]),
+            credential_sets: credential_sets_from_files([("test-credentials", keys_file)]),
+            model_routes: HashMap::new(),
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: std::collections::HashMap::from([(
+                "default-routing".to_string(),
+                crate::config::RoutingProfileConfig {
+                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry:
+                        crate::config::SameRequestCredentialRetryConfig {
+                            enabled: false,
+                            max_retries: 0,
+                        },
+                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            pools: HashMap::from([(
+                "test".to_string(),
+                PoolConfig {
+                    endpoint_capabilities: Default::default(),
+                    enabled: true,
+                    account: Some("soft-account".to_string()),
+                    policy_profile: None,
+                    routing_profile: None,
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    api_base: "https://ignored.example/v1".to_string(),
+                    credential_set: "test-credentials".to_string(),
+                    auth_header: "authorization".to_string(),
+                    auth_prefix: "Bearer ".to_string(),
+                    error_rules: ErrorRulesConfig::default(),
+                },
+            )]),
+        }
+        .resolve()
+        .unwrap();
+        let state = AppState::new(config).unwrap();
+        state.channels.apply_failure_domain_transition(
+            "provider:soft-provider",
+            "account:soft-account",
+            Some(Instant::now() + Duration::from_secs(60)),
+            "provider unavailable",
+        );
+        assert_eq!(
+            state.channels.channel_route_state("test"),
+            ChannelRouteState::ProviderCoolingDown
+        );
+
+        let pool_state = state.channels.get("test").unwrap();
+        {
+            let _pool_guard = pool_state.pool.blocking_lock();
+            assert_eq!(
+                state.channels.channel_route_state("test"),
+                ChannelRouteState::ProviderCoolingDown
+            );
+        }
+
+        let credential_id = {
+            let pool = pool_state.pool.blocking_lock();
+            pool.credential_snapshots()[0].id.clone()
+        };
+        {
+            let mut pool = pool_state.pool.blocking_lock();
+            pool.expire_credential_by_id(&CredentialId(credential_id), "test exhaustion");
+        }
+
+        assert_eq!(
+            state.channels.channel_route_state("test"),
+            ChannelRouteState::NoAvailableCredentials
+        );
     }
 
     #[test]

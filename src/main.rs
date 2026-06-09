@@ -32025,6 +32025,338 @@ model_routes:
     }
 
     #[tokio::test]
+    async fn frozen_route_fallback_skips_attempt_time_provider_cooling_when_better_target_remains()
+    {
+        let (primary_hit_tx, primary_hit_rx) = oneshot::channel::<()>();
+        let primary_hit_tx = Arc::new(Mutex::new(Some(primary_hit_tx)));
+        let (release_primary_tx, release_primary_rx) = oneshot::channel::<()>();
+        let release_primary_rx = Arc::new(Mutex::new(Some(release_primary_rx)));
+        let primary = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let primary_hit_tx = primary_hit_tx.clone();
+                let release_primary_rx = release_primary_rx.clone();
+                async move {
+                    if let Some(tx) = primary_hit_tx.lock().await.take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = release_primary_rx.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "upstream_unavailable",
+                                "message": "provider unavailable"
+                            }
+                        })),
+                    )
+                }
+            }),
+        );
+        let mid_hits = Arc::new(AtomicU64::new(0));
+        let mid_hits_for_handler = mid_hits.clone();
+        let mid = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let mid_hits = mid_hits_for_handler.clone();
+                async move {
+                    mid_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "mid-should-not-hit"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let better_hits = Arc::new(AtomicU64::new(0));
+        let better_hits_for_handler = better_hits.clone();
+        let better = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let better_hits = better_hits_for_handler.clone();
+                async move {
+                    better_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "better-ok"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let primary_base = spawn_upstream(primary).await;
+        let mid_base = spawn_upstream(mid).await;
+        let better_base = spawn_upstream(better).await;
+
+        let mut credential_sets = HashMap::new();
+        let mut pools = HashMap::new();
+        for (name, api_base, key) in [
+            ("primary", primary_base, "primary-key"),
+            ("mid", mid_base, "mid-key"),
+            ("better", better_base, "better-key"),
+        ] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(&format!("{key}\n")),
+                },
+            );
+            let mut pool = openai_pool(api_base, credential_set);
+            if name == "mid" {
+                pool.account = Some("mid-account".to_string());
+            }
+            pools.insert(name.to_string(), pool);
+        }
+
+        let config = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "test-client".to_string(),
+                token: fixture_client_token(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: fixture_admin_token(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path: None,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: TimeoutConfig::default(),
+            routing: crate::config::RoutingConfig::default(),
+            default_pool: Some("primary".to_string()),
+            providers: HashMap::from([(
+                "mid-provider".to_string(),
+                ProviderConfig {
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    enabled: true,
+                },
+            )]),
+            accounts: HashMap::from([(
+                "mid-account".to_string(),
+                AccountConfig {
+                    provider: "mid-provider".to_string(),
+                    api_base: "https://ignored.example/v1".to_string(),
+                    auth_header: "authorization".to_string(),
+                    auth_prefix: "Bearer ".to_string(),
+                    enabled: true,
+                },
+            )]),
+            credential_sets,
+            model_routes: HashMap::from([priority_route(
+                "gpt-route",
+                ["primary", "mid", "better"],
+            )]),
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: std::collections::HashMap::from([(
+                "default-routing".to_string(),
+                crate::config::RoutingProfileConfig {
+                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry:
+                        crate::config::SameRequestCredentialRetryConfig {
+                            enabled: false,
+                            max_retries: 0,
+                        },
+                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            pools,
+        }
+        .resolve()
+        .unwrap();
+        let state = AppState::new(config).unwrap();
+        let request = app(state.clone()).oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::AUTHORIZATION, client_bearer())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-route","messages":[{"role":"user","content":"ok"}]}"#,
+                ))
+                .unwrap(),
+        );
+        let request_task = tokio::spawn(async move { request.await.unwrap() });
+
+        primary_hit_rx.await.unwrap();
+        state.channels.apply_failure_domain_transition(
+            "provider:mid-provider",
+            "account:mid-account",
+            Some(Instant::now() + Duration::from_secs(60)),
+            "provider unavailable",
+        );
+        assert_eq!(
+            state.channels.channel_route_state("mid"),
+            ChannelRouteState::ProviderCoolingDown
+        );
+        let _ = release_primary_tx.send(());
+        let response = request_task.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(mid_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(better_hits.load(Ordering::SeqCst), 1);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"].as_str(),
+            Some("better-ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_cooling_route_with_no_available_credentials_fails_without_upstream_hit() {
+        let upstream_hits = Arc::new(AtomicU64::new(0));
+        let upstream_hits_for_handler = upstream_hits.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let upstream_hits = upstream_hits_for_handler.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "should-not-hit"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let mut pool = openai_pool(api_base, "test-credentials");
+        pool.account = Some("test-account".to_string());
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("test".to_string()),
+                providers: HashMap::from([(
+                    "test-provider".to_string(),
+                    ProviderConfig {
+                        provider_kind: ProviderKind::OpenAiCompatible,
+                        enabled: true,
+                    },
+                )]),
+                accounts: HashMap::from([(
+                    "test-account".to_string(),
+                    AccountConfig {
+                        provider: "test-provider".to_string(),
+                        api_base: "https://ignored.example/v1".to_string(),
+                        auth_header: "authorization".to_string(),
+                        auth_prefix: "Bearer ".to_string(),
+                        enabled: true,
+                    },
+                )]),
+                credential_sets: credential_sets_from_files([(
+                    "test-credentials",
+                    temp_keys_file("test-key\n"),
+                )]),
+                model_routes: HashMap::from([priority_route("gpt-route", ["test"])]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([("test".to_string(), pool)]),
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+        state.channels.apply_failure_domain_transition(
+            "provider:test-provider",
+            "account:test-account",
+            Some(Instant::now() + Duration::from_secs(60)),
+            "provider unavailable",
+        );
+        assert_eq!(
+            state.channels.channel_route_state("test"),
+            ChannelRouteState::ProviderCoolingDown
+        );
+        let credential_id = {
+            let channel = state.channels.get("test").unwrap();
+            let pool = channel.pool.lock().await;
+            pool.credential_snapshots()[0].id.clone()
+        };
+        {
+            let channel = state.channels.get("test").unwrap();
+            let mut pool = channel.pool.lock().await;
+            pool.expire_credential_by_id(&CredentialId(credential_id), "test exhaustion");
+        }
+        assert_eq!(
+            state.channels.channel_route_state("test"),
+            ChannelRouteState::NoAvailableCredentials
+        );
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-route","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "no_route_candidate");
+        assert_eq!(value["error"]["reasons"][0], "no_available_credentials");
+    }
+
+    #[tokio::test]
     async fn route_target_send_is_serialized_with_channel_disable() {
         let (primary_hit_tx, primary_hit_rx) = oneshot::channel::<()>();
         let primary_hit_tx = Arc::new(Mutex::new(Some(primary_hit_tx)));

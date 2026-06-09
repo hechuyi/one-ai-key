@@ -706,6 +706,8 @@ pub struct RegistryModelRouteMutationResponse {
     pub public_model: String,
     #[serde(flatten)]
     pub status: RegistryMutationStatusFields,
+    pub validation: RegistryMutationValidationSummary,
+    pub audit: RegistryMutationAuditSummary,
 }
 
 pub fn registry_model_route_mutation_response(
@@ -715,6 +717,42 @@ pub fn registry_model_route_mutation_response(
     RegistryModelRouteMutationResponse {
         public_model: public_model.to_string(),
         status: registry_mutation_status_fields(status),
+        validation: registry_mutation_validation_passed(),
+        audit: registry_model_route_upsert_audit_summary(public_model),
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegistryMutationValidationSummary {
+    pub status: &'static str,
+    pub errors: Vec<String>,
+}
+
+fn registry_mutation_validation_passed() -> RegistryMutationValidationSummary {
+    RegistryMutationValidationSummary {
+        status: "passed",
+        errors: Vec::new(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegistryMutationAuditSummary {
+    pub kind: &'static str,
+    pub action: &'static str,
+    pub resource_type: &'static str,
+    pub resource_id: String,
+    pub outcome: &'static str,
+    pub reason_code: &'static str,
+}
+
+fn registry_model_route_upsert_audit_summary(public_model: &str) -> RegistryMutationAuditSummary {
+    RegistryMutationAuditSummary {
+        kind: "registry_model_route_upserted",
+        action: "registry_model_route_upserted",
+        resource_type: "model_route",
+        resource_id: public_model.to_string(),
+        outcome: "applied",
+        reason_code: "manual_registry_model_route_upsert",
     }
 }
 
@@ -842,6 +880,34 @@ mod tests {
             serde_json::to_value(model_route).expect("serialize model route response");
         let routing_profile_json =
             serde_json::to_value(routing_profile).expect("serialize routing profile response");
+
+        assert_eq!(
+            model_route_json["validation"]["status"], "passed",
+            "model-route staged apply response must expose validation status"
+        );
+        assert_eq!(
+            model_route_json["validation"]["errors"],
+            serde_json::json!([]),
+            "model-route staged apply response must expose stable validation errors"
+        );
+        assert_eq!(
+            model_route_json["audit"],
+            serde_json::json!({
+                "kind": "registry_model_route_upserted",
+                "action": "registry_model_route_upserted",
+                "resource_type": "model_route",
+                "resource_id": "gpt-4o-mini",
+                "outcome": "applied",
+                "reason_code": "manual_registry_model_route_upsert",
+            }),
+            "model-route staged apply response must expose a redacted stable audit summary"
+        );
+        for forbidden in ["actor", "credential_id", "channel_id", "request_id"] {
+            assert!(
+                model_route_json["audit"].get(forbidden).is_none(),
+                "redacted audit summary must omit {forbidden}"
+            );
+        }
 
         for response in [
             account_json,

@@ -47,6 +47,11 @@ const CONTRACTS: &[ContractEntry] = &[
         action: SafeAction::None,
     },
     ContractEntry {
+        reason_code: "management_projection_invalid",
+        blocking_domain: "management_projection",
+        action: SafeAction::None,
+    },
+    ContractEntry {
         reason_code: "token_missing",
         blocking_domain: "client_token",
         action: SafeAction::ModelsExplainWithClientTokenRef,
@@ -214,6 +219,7 @@ pub const STAGE2_REASON_CODES: &[&str] = &[
     "model_visible_to_client",
     "no_failures_in_window",
     "request_failure_not_found_in_window",
+    "management_projection_invalid",
     "token_missing",
     "token_unknown",
     "token_disabled",

@@ -811,6 +811,7 @@ fn safe_reload_diff_resource_type(value: &str) -> Option<&'static str> {
         "accounts" => Some("accounts"),
         "credential_sets" => Some("credential_sets"),
         "channels" => Some("channels"),
+        "model_route" => Some("model_route"),
         "model_routes" => Some("model_routes"),
         "policy_profiles" => Some("policy_profiles"),
         "routing_profiles" => Some("routing_profiles"),
@@ -1277,7 +1278,7 @@ mod tests {
                     "raw_yaml": "SHOULD_NOT_RENDER_RESOURCE_RAW_YAML"
                 },
                 {
-                    "resource_type": "model_routes",
+                    "resource_type": "model_route",
                     "added": [],
                     "removed": [],
                     "changed": [
@@ -1377,7 +1378,11 @@ mod tests {
             super::render_reload_diff_report(&backend, crate::cli_report::OutputFormat::Table);
         assert!(rendered_table.contains("status: ok"));
         assert!(rendered_table.contains("reason_code: reload_diff_available"));
-        assert!(rendered_table.contains("resource_changes.model_routes.changed"));
+        assert_eq!(
+            report["resource_changes"][1]["resource_type"],
+            "model_route"
+        );
+        assert!(rendered_table.contains("resource_changes.model_route.changed"));
         assert!(rendered_table.contains("model_route:0"));
         for forbidden in [
             "reload apply",

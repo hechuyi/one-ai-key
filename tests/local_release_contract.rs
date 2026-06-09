@@ -463,6 +463,67 @@ fn release_smoke_script_covers_local_mock_data_plane_and_operator_commands() {
 }
 
 #[test]
+fn release_smoke_models_explain_diagnosis_is_canonical_endpoint_family() {
+    let path = "scripts/release-smoke.sh";
+    let script = read_repo_file(path);
+
+    let canonical_models_explain_lines = script
+        .lines()
+        .filter(|line| {
+            line.contains("capture_management_report")
+                && line.contains("models")
+                && line.contains("explain")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        !canonical_models_explain_lines.is_empty(),
+        "{path} must smoke canonical models explain diagnosis"
+    );
+    for line in canonical_models_explain_lines {
+        assert!(
+            line.contains("--endpoint-family"),
+            "{path} canonical models explain smoke must include --endpoint-family: {line}"
+        );
+    }
+}
+
+#[test]
+fn diagnostic_next_action_static_contract_excludes_mutating_and_probe_commands() {
+    let diagnostic_contract = read_repo_file("src/diagnostic_contract.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let models_cli = read_repo_file("src/cli_commands/models.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap_or_default()
+        .to_string();
+
+    for (path, text) in [
+        ("src/diagnostic_contract.rs", diagnostic_contract),
+        ("src/cli_commands/models.rs", models_cli),
+    ] {
+        for forbidden in [
+            r#""keys", "import""#,
+            r#""keys", "probe""#,
+            r#""reload", "apply""#,
+            r#""curl""#,
+            "template_id: \"keys_import\"",
+            "template_id: \"keys_probe\"",
+            "template_id: \"reload_apply\"",
+            "template_id: \"curl\"",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{path} diagnostic next_action contract must not include forbidden command token `{forbidden}`"
+            );
+        }
+    }
+}
+
+#[test]
 fn release_smoke_script_covers_local_model_publication_workflow() {
     let path = "scripts/release-smoke.sh";
     let script = read_repo_file(path);

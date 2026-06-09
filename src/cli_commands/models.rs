@@ -323,10 +323,16 @@ fn sanitized_models_explain_report(
                 .or_else(|| preview.get("runtime_reload")),
         );
     let availability = availability.map(sanitize_model_availability);
+    let invalid_management_projection = availability
+        .as_ref()
+        .and_then(invalid_model_availability_evidence);
+    let has_invalid_management_projection = invalid_management_projection.is_some();
     let availability_can_use = availability
         .as_ref()
         .and_then(|value| value.get("can_use"))
-        .and_then(Value::as_bool);
+        .and_then(Value::as_bool)
+        .filter(|_| !has_invalid_management_projection)
+        .or_else(|| has_invalid_management_projection.then_some(false));
     let status = if let Some(can_use) = availability_can_use {
         if can_use {
             "ok"
@@ -338,26 +344,37 @@ fn sanitized_models_explain_report(
     } else {
         "blocked"
     };
-    let reason_code = availability
-        .as_ref()
-        .and_then(|value| value.get("reason_code"))
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| models_explain_reason_code(has_selected_target, client_scope_status));
+    let reason_code = if has_invalid_management_projection {
+        "management_projection_invalid"
+    } else {
+        availability
+            .as_ref()
+            .and_then(|value| value.get("reason_code"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| models_explain_reason_code(has_selected_target, client_scope_status))
+    };
     let diagnostic_contract = crate::diagnostic_contract::contract_for_reason(reason_code);
-    let blocking_domain = availability
-        .as_ref()
-        .and_then(|value| value.get("blocking_domain"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            diagnostic_contract
-                .as_ref()
-                .map(|contract| contract.blocking_domain)
-        });
-    let report_model = availability
-        .as_ref()
-        .and_then(|value| value.get("model"))
-        .and_then(Value::as_str)
-        .or_else(|| preview.get("model").and_then(Value::as_str));
+    let blocking_domain = if has_invalid_management_projection {
+        Some("management_projection")
+    } else {
+        availability
+            .as_ref()
+            .and_then(|value| value.get("blocking_domain"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                diagnostic_contract
+                    .as_ref()
+                    .map(|contract| contract.blocking_domain)
+            })
+    };
+    let report_model = if availability.is_some() {
+        availability
+            .as_ref()
+            .and_then(|value| value.get("model"))
+            .and_then(Value::as_str)
+    } else {
+        preview.get("model").and_then(Value::as_str)
+    };
     let report_endpoint_family = availability
         .as_ref()
         .and_then(|value| value.get("endpoint_family"))
@@ -377,14 +394,26 @@ fn sanitized_models_explain_report(
         .and_then(|value| value.get("recent_failure_hint"))
         .filter(|value| !value.is_null())
         .cloned();
-    let next_action = availability
-        .as_ref()
-        .and_then(|value| value.get("next_step"))
-        .filter(|value| !value.is_null())
-        .cloned()
-        .unwrap_or_else(|| {
-            models_explain_next_action(status, preview, client_scope_status, reason_code)
-        });
+    let next_action = if has_invalid_management_projection {
+        diagnostic_contract
+            .map(|contract| contract.next_action)
+            .unwrap_or_else(management_projection_invalid_next_action)
+    } else {
+        availability
+            .as_ref()
+            .and_then(|value| value.get("next_step"))
+            .filter(|value| !value.is_null())
+            .cloned()
+            .unwrap_or_else(|| {
+                models_explain_next_action(status, preview, client_scope_status, reason_code)
+            })
+    };
+    let evidence = invalid_management_projection.or_else(|| {
+        availability
+            .as_ref()
+            .and_then(|value| value.get("evidence"))
+            .cloned()
+    });
     let data = serde_json::json!({
         "command": "models explain",
         "active_registry_generation": runtime_reload.active_registry_generation,
@@ -400,10 +429,7 @@ fn sanitized_models_explain_report(
         "endpoint_family": report_endpoint_family,
         "model": report_model,
         "client_token_ref": report_client_token_ref,
-        "evidence": availability
-            .as_ref()
-            .and_then(|value| value.get("evidence"))
-            .cloned(),
+        "evidence": evidence,
         "reload_drift": reload_drift,
         "recent_failure_hint": recent_failure_hint,
         "route_kind": preview.get("route_kind").and_then(Value::as_str),
@@ -428,6 +454,73 @@ fn sanitized_models_explain_report(
         window: Value::Null,
         next_action,
         data,
+    })
+}
+
+fn invalid_model_availability_evidence(availability: &Value) -> Option<Value> {
+    let mut invalid_fields = Vec::new();
+    if availability
+        .get("can_use")
+        .and_then(Value::as_bool)
+        .is_none()
+    {
+        invalid_fields.push("can_use");
+    }
+    if availability
+        .get("reason_code")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        invalid_fields.push("reason_code");
+    }
+    if availability
+        .get("blocking_domain")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        invalid_fields.push("blocking_domain");
+    }
+    if availability
+        .get("endpoint_family")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        invalid_fields.push("endpoint_family");
+    }
+    if availability.get("model").and_then(Value::as_str).is_none() {
+        invalid_fields.push("model");
+    }
+    if availability
+        .get("evidence")
+        .filter(|value| !value.is_null())
+        .is_none()
+    {
+        invalid_fields.push("evidence");
+    }
+    if availability
+        .get("next_step")
+        .filter(|value| !value.is_null())
+        .is_none()
+    {
+        invalid_fields.push("next_step");
+    }
+    if invalid_fields.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({
+            "projection": "model_availability",
+            "invalid_fields": invalid_fields,
+        }))
+    }
+}
+
+fn management_projection_invalid_next_action() -> Value {
+    serde_json::json!({
+        "summary": "The management model availability projection is incomplete or invalid. No automatic diagnostic action is available.",
+        "template_id": "no_action_required",
+        "safe_argv": [],
+        "side_effect_class": "runtime_readonly",
+        "requires_confirmation": false,
     })
 }
 
@@ -1107,6 +1200,9 @@ fn models_explain_reason_code(
 
 fn models_explain_reason(reason_code: &str) -> &'static str {
     match reason_code {
+        "management_projection_invalid" => {
+            "The management model availability projection is incomplete or invalid."
+        }
         "model_not_in_client_scope" => "The public model is not in this client-token scope.",
         "no_runtime_route_candidate" => "The public model has no selected runtime route candidate.",
         _ => "The public model has a selected runtime route candidate.",
@@ -2094,6 +2190,10 @@ mod tests {
             "model": "gpt-public",
             "public_model": "gpt-public",
             "client_token_ref": "local-client",
+            "evidence": {
+                "route_target_count": 0,
+                "endpoint_family_target_count": 0
+            },
             "next_step": {
                 "summary": "Do not surface legacy models list.",
                 "template_id": "models_list",
@@ -2121,6 +2221,10 @@ mod tests {
             "model": "gpt-public",
             "public_model": "gpt-public",
             "client_token_ref": "local-client",
+            "evidence": {
+                "route_target_count": 0,
+                "endpoint_family_target_count": 0
+            },
             "next_step": {
                 "summary": "Do not surface legacy client token list.",
                 "template_id": "client_tokens_list",
@@ -2148,6 +2252,10 @@ mod tests {
             "model": "gpt-public",
             "public_model": "gpt-public",
             "client_token_ref": "local-client",
+            "evidence": {
+                "route_target_count": 1,
+                "endpoint_family_target_count": 1
+            },
             "next_step": {
                 "summary": "Inspect read-only runtime reload status.",
                 "template_id": "reload_status",
@@ -2178,6 +2286,10 @@ mod tests {
             "model": "gpt-public",
             "public_model": "gpt-public",
             "client_token_ref": "local-client",
+            "evidence": {
+                "route_target_count": 1,
+                "endpoint_family_target_count": 1
+            },
             "next_step": {
                 "summary": "Inspect read-only runtime doctor projection.",
                 "template_id": "client_tokens_list",
@@ -2195,6 +2307,131 @@ mod tests {
         let report: Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(report["availability"]["next_step"], serde_json::Value::Null);
         assert_ne!(report["next_action"]["template_id"], "client_tokens_list");
+    }
+
+    #[test]
+    fn canonical_models_explain_rejects_missing_management_next_step_without_local_fallback() {
+        let preview = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "explicit_model_route",
+            "registry_generation": 5,
+            "client_token": {"name": "local-client"},
+            "selected_target": null,
+            "candidates": []
+        });
+        let availability = serde_json::json!({
+            "status": "unavailable",
+            "can_use": false,
+            "blocking_domain": "route",
+            "reason_code": "no_route",
+            "endpoint_family": "chat_completions",
+            "model": "gpt-public",
+            "public_model": "gpt-public",
+            "client_token_ref": "local-client",
+            "evidence": {
+                "route_target_count": 0,
+                "endpoint_family_target_count": 0,
+                "candidate_reason_codes": ["no_route"]
+            }
+        });
+
+        let rendered = super::render_models_explain_report_with_management_projection(
+            &preview,
+            None,
+            Some(&availability),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["can_use"], false);
+        assert_eq!(report["reason_code"], "management_projection_invalid");
+        assert_eq!(report["blocking_domain"], "management_projection");
+        assert_eq!(
+            report["next_action"]["template_id"],
+            "no_action_required",
+            "canonical endpoint-family path must not locally derive route_explain when management next_step is missing"
+        );
+        assert_eq!(report["next_action"]["safe_argv"], serde_json::json!([]));
+        assert_eq!(report["evidence"]["projection"], "model_availability");
+        assert_eq!(
+            report["evidence"]["invalid_fields"],
+            serde_json::json!(["next_step"])
+        );
+        assert_eq!(report["availability"]["next_step"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn canonical_models_explain_rejects_invalid_management_projection_fields_without_unsafe_action()
+    {
+        let preview = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "explicit_model_route",
+            "registry_generation": 5,
+            "client_token": {"name": "local-client"},
+            "selected_target": {"channel_id": "preview-selected", "plan_position": 0},
+            "candidates": []
+        });
+        let availability = serde_json::json!({
+            "status": "unavailable",
+            "can_use": false,
+            "blocking_domain": "../route",
+            "reason_code": "no_route",
+            "endpoint_family": "chat_completions",
+            "model": "gpt-public",
+            "public_model": "gpt-public",
+            "client_token_ref": "local-client",
+            "evidence": {
+                "route_target_count": 0,
+                "endpoint_family_target_count": 0,
+                "candidate_reason_codes": ["no_route"]
+            },
+            "next_step": {
+                "summary": "Apply runtime reload.",
+                "template_id": "reload_apply",
+                "safe_argv": ["one-ai-key", "reload", "apply", "--yes"],
+                "side_effect_class": "runtime_readonly",
+                "requires_confirmation": false
+            }
+        });
+
+        let rendered = super::render_models_explain_report_with_management_projection(
+            &preview,
+            None,
+            Some(&availability),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        let next_action_argv = report["next_action"]["safe_argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .unwrap()
+            .join(" ");
+
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["can_use"], false);
+        assert_eq!(report["reason_code"], "management_projection_invalid");
+        assert_eq!(report["blocking_domain"], "management_projection");
+        assert_eq!(report["next_action"]["template_id"], "no_action_required");
+        assert_eq!(
+            report["evidence"]["invalid_fields"],
+            serde_json::json!(["blocking_domain", "next_step"])
+        );
+        for forbidden in [
+            "reload apply",
+            "keys import",
+            "keys probe",
+            "curl",
+            "route explain",
+        ] {
+            assert!(
+                !next_action_argv.contains(forbidden),
+                "invalid canonical projection must not produce local or unsafe suggestion `{forbidden}`"
+            );
+        }
     }
 
     #[test]
@@ -2216,6 +2453,11 @@ mod tests {
             "model": "gpt-public",
             "public_model": "gpt-public",
             "client_token_ref": "local-client",
+            "evidence": {
+                "route_target_count": 1,
+                "endpoint_family_target_count": 0,
+                "candidate_reason_codes": ["no_usable_key_or_target"]
+            },
             "reload_drift": {
                 "status": "unknown",
                 "reason_code": "staged_registry_version_unavailable",
