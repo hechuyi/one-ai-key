@@ -10796,6 +10796,48 @@ pools:
     }
 
     #[tokio::test]
+    async fn management_registry_model_route_upsert_requires_writable_store() {
+        let state = read_only_test_state_with_api_base("https://example.com/v1");
+        let app = app(state);
+
+        let before_runtime = management_response_json(&app, "/management/runtime").await;
+        assert!(before_runtime["staged_registry_version"].is_null());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(
+                        "/management/registry/model-routes/gpt-public?expected_staged_registry_version=1",
+                    )
+                    .header(header::AUTHORIZATION, admin_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "targets":[{"channel":"test","upstream_model":"gpt-upstream-a"}]
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("registry persistence requires a writable registry store"));
+
+        let after_runtime = management_response_json(&app, "/management/runtime").await;
+        assert!(after_runtime["staged_registry_version"].is_null());
+        assert_eq!(after_runtime["runtime_reload_required"], false);
+        let routes = management_response_json(&app, "/management/model-routes").await;
+        assert!(routes["routes"].as_array().unwrap().is_empty());
+        let events = management_response_json(&app, "/management/events").await;
+        assert!(events["events"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn management_registry_model_route_upsert_rejects_stale_staged_version_before_mutation() {
         let (app, registry_store_path) = registry_provider_fixture();
 
@@ -25090,6 +25132,422 @@ pools:
             "route_target_retry_allowed"
         );
         assert_eq!(body["events"].as_array().unwrap().len(), 2);
+    }
+
+    async fn post_test_chat_completion(state: AppState, model: &str) -> Response {
+        app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"model":"{model}","messages":[{{"role":"user","content":"ok"}}]}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn single_failure_transition_summary(telemetry: &Value) -> &Value {
+        let summaries = telemetry["failure_transition_summaries"]
+            .as_array()
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
+        &summaries[0]
+    }
+
+    async fn selected_credential_id(state: &AppState) -> String {
+        let channel = state.channels.get("test").unwrap();
+        let pool = channel.pool.lock().await;
+        pool.credential_snapshots()[0].id.clone()
+    }
+
+    fn test_state_with_keys_api_base_and_route_target_retry(
+        keys: &str,
+        api_base: &str,
+        route_target_retry_enabled: bool,
+    ) -> AppState {
+        let mut document = test_config_with_api_base(api_base).into_registry_document();
+        document.credential_sets.insert(
+            "test-credentials".to_string(),
+            CredentialSetConfig {
+                keys_file: temp_keys_file(keys),
+            },
+        );
+        document.routing_profiles.insert(
+            "default-routing".to_string(),
+            crate::config::RoutingProfileConfig {
+                key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                default_credential_cooldown_seconds: 20,
+                same_request_credential_retry: crate::config::SameRequestCredentialRetryConfig {
+                    enabled: false,
+                    max_retries: 0,
+                },
+                route_target_retry: crate::config::RouteTargetRetryConfig {
+                    enabled: route_target_retry_enabled,
+                },
+            },
+        );
+        AppState::new(document.resolve().unwrap()).unwrap()
+    }
+
+    fn test_state_with_relay_balance_channel_scope(keys: &str, api_base: &str) -> AppState {
+        let mut document = test_config_with_api_base(api_base).into_registry_document();
+        document.credential_sets.insert(
+            "test-credentials".to_string(),
+            CredentialSetConfig {
+                keys_file: temp_keys_file(keys),
+            },
+        );
+        document.pools.get_mut("test").unwrap().error_rules = ErrorRulesConfig {
+            relay_profile: Some(RelayProfile::GenericRelay),
+            balance_scope: Some(BalanceScope::Channel),
+            ..ErrorRulesConfig::default()
+        };
+        AppState::new(document.resolve().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn routing_telemetry_failure_transition_summary_matches_credential_hard_states() {
+        let cases = [
+            (
+                "auth-invalid",
+                StatusCode::UNAUTHORIZED,
+                None,
+                serde_json::json!({"error":{"code":"invalid_api_key","message":"invalid key"}}),
+                "auth_invalid",
+                "expire_credential",
+                "expired",
+                "upstream_auth_invalid",
+            ),
+            (
+                "quota-exhausted",
+                StatusCode::BAD_REQUEST,
+                None,
+                serde_json::json!({"error":{"code":"insufficient_quota","message":"quota exhausted"}}),
+                "quota_exhausted",
+                "mark_credential_quota_exhausted",
+                "quota_exhausted",
+                "upstream_quota_exhausted",
+            ),
+            (
+                "rate-limited",
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("3"),
+                serde_json::json!({"error":{"code":"rate_limit_exceeded","message":"rate limited"}}),
+                "rate_limited",
+                "mark_credential_cooling_down",
+                "cooling_down",
+                "upstream_rate_limited",
+            ),
+        ];
+
+        for (
+            suffix,
+            status,
+            retry_after,
+            response_body,
+            failure_kind,
+            transition_action,
+            resulting_state,
+            reason,
+        ) in cases
+        {
+            let upstream = Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    let response_body = response_body.clone();
+                    async move {
+                        let mut response = (status, Json(response_body)).into_response();
+                        if let Some(retry_after) = retry_after {
+                            response
+                                .headers_mut()
+                                .insert(header::RETRY_AFTER, retry_after.parse().unwrap());
+                        }
+                        response
+                    }
+                }),
+            );
+            let api_base = spawn_upstream(upstream).await;
+            let state = test_state_with_keys_api_base_and_event_log_path(
+                &format!("summary-{suffix}-key\n"),
+                &api_base,
+                None,
+            );
+            let credential_id = selected_credential_id(&state).await;
+
+            let response = post_test_chat_completion(state.clone(), "gpt-test").await;
+            assert_eq!(response.status(), status);
+            let _ = to_bytes(response.into_body(), 4096).await.unwrap();
+
+            let channel_status = pool_status_for_channel(&state, "test").await.unwrap();
+            let channel_status = serde_json::to_value(channel_status).unwrap();
+            assert_eq!(
+                channel_status[format!("{resulting_state}_credentials")],
+                serde_json::json!(1)
+            );
+
+            let telemetry =
+                management_response_json(&app(state.clone()), "/management/routing-telemetry")
+                    .await;
+            let summary = single_failure_transition_summary(&telemetry);
+            let credential_hash = crate::credentials::short_hash(&credential_id);
+            assert_eq!(summary["channel_id"], "test");
+            assert_eq!(summary["public_model"], "gpt-test");
+            assert_eq!(summary["failure_source"], "upstream_transaction");
+            assert_eq!(summary["failure_kind"], failure_kind);
+            assert_eq!(summary["failure_scope"], "credential");
+            assert_eq!(summary["mutation_kind"], "credential_transition");
+            assert_eq!(summary["transition_action"], transition_action);
+            assert_eq!(summary["affected_resource_kind"], "credential");
+            assert_eq!(summary["selected_credential_id_hash"], credential_hash);
+            assert_eq!(summary["affected_credential_id_hash"], credential_hash);
+            assert_eq!(summary["resulting_state"], resulting_state);
+            assert_eq!(summary["reason"], reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_telemetry_failure_transition_summary_matches_relay_balance_channel_hard_cooldown(
+    ) {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "insufficient_quota",
+                            "limit_type": "balance",
+                            "message": "relay balance unavailable"
+                        }
+                    })),
+                )
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state =
+            test_state_with_relay_balance_channel_scope("summary-relay-balance-key\n", &api_base);
+
+        let response = post_test_chat_completion(state.clone(), "gpt-test").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let _ = to_bytes(response.into_body(), 4096).await.unwrap();
+
+        let channel_status = pool_status_for_channel(&state, "test").await.unwrap();
+        let channel_status = serde_json::to_value(channel_status).unwrap();
+        assert_eq!(channel_status["health"]["kind"], "cooling_down");
+        assert_eq!(
+            channel_status["health"]["reason"],
+            "relay balance unavailable"
+        );
+        assert_eq!(
+            channel_status["health"]["reason_code"],
+            "relay_balance_unavailable"
+        );
+        assert_eq!(channel_status["health"]["source"], "automatic");
+        assert_eq!(channel_status["health"]["suppression_count"], 1);
+
+        let telemetry =
+            management_response_json(&app(state.clone()), "/management/routing-telemetry").await;
+        let summary = single_failure_transition_summary(&telemetry);
+        assert_eq!(summary["channel_id"], "test");
+        assert_eq!(summary["public_model"], "gpt-test");
+        assert_eq!(summary["failure_source"], "upstream_transaction");
+        assert_eq!(summary["failure_kind"], "relay_balance_unavailable");
+        assert_eq!(summary["failure_scope"], "channel");
+        assert_eq!(summary["mutation_kind"], "channel_health_transition");
+        assert_eq!(
+            summary["transition_action"],
+            "mark_relay_balance_channel_cooling_down"
+        );
+        assert_eq!(summary["affected_resource_kind"], "channel");
+        assert!(summary["affected_credential_id_hash"].is_null());
+        assert_eq!(summary["resulting_state"], "cooling_down");
+        assert_eq!(summary["reason"], "relay_balance_unavailable");
+    }
+
+    #[tokio::test]
+    async fn routing_telemetry_failure_transition_summary_matches_provider_soft_states() {
+        let cases = [
+            (
+                "provider-degraded",
+                StatusCode::SERVICE_UNAVAILABLE,
+                None,
+                "mark_provider_account_channel_degraded",
+                "degraded",
+            ),
+            (
+                "provider-cooldown",
+                StatusCode::BAD_GATEWAY,
+                Some("4"),
+                "mark_provider_account_channel_cooling_down",
+                "cooling_down",
+            ),
+        ];
+
+        for (suffix, status, retry_after, transition_action, resulting_state) in cases {
+            let upstream = Router::new().route(
+                "/v1/chat/completions",
+                post(move || async move {
+                    let mut response = (
+                        status,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "upstream_unavailable",
+                                "message": "provider unavailable"
+                            }
+                        })),
+                    )
+                        .into_response();
+                    if let Some(retry_after) = retry_after {
+                        response
+                            .headers_mut()
+                            .insert(header::RETRY_AFTER, retry_after.parse().unwrap());
+                    }
+                    response
+                }),
+            );
+            let api_base = spawn_upstream(upstream).await;
+            let state = test_state_with_keys_api_base_and_route_target_retry(
+                &format!("summary-{suffix}-key\n"),
+                &api_base,
+                false,
+            );
+
+            let response = post_test_chat_completion(state.clone(), "gpt-test").await;
+            assert_eq!(response.status(), status);
+            let _ = to_bytes(response.into_body(), 4096).await.unwrap();
+
+            let channel_status = pool_status_for_channel(&state, "test").await.unwrap();
+            let channel_status = serde_json::to_value(channel_status).unwrap();
+            assert_eq!(channel_status["health"]["kind"], resulting_state);
+
+            let telemetry =
+                management_response_json(&app(state.clone()), "/management/routing-telemetry")
+                    .await;
+            let summary = single_failure_transition_summary(&telemetry);
+            assert_eq!(summary["channel_id"], "test");
+            assert_eq!(summary["public_model"], "gpt-test");
+            assert_eq!(summary["failure_source"], "upstream_transaction");
+            assert_eq!(summary["failure_kind"], "provider_unavailable");
+            assert_eq!(summary["failure_scope"], "channel");
+            assert_eq!(summary["mutation_kind"], "channel_health_transition");
+            assert_eq!(summary["transition_action"], transition_action);
+            assert_eq!(summary["affected_resource_kind"], "channel");
+            assert!(summary["affected_credential_id_hash"].is_null());
+            assert_eq!(summary["resulting_state"], resulting_state);
+            assert_eq!(summary["reason"], "upstream_provider_unavailable");
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_telemetry_failure_transition_summary_preserves_request_only_noop() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": "request rejected"
+                        }
+                    })),
+                )
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state = test_state_with_api_base(&api_base);
+
+        let response = post_test_chat_completion(state.clone(), "gpt-test").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let _ = to_bytes(response.into_body(), 4096).await.unwrap();
+
+        let channel_status = pool_status_for_channel(&state, "test").await.unwrap();
+        let channel_status = serde_json::to_value(channel_status).unwrap();
+        assert_eq!(channel_status["available_credentials"], 1);
+        assert_eq!(channel_status["health"]["kind"], "available");
+
+        let telemetry =
+            management_response_json(&app(state.clone()), "/management/routing-telemetry").await;
+        let summary = single_failure_transition_summary(&telemetry);
+        assert_eq!(summary["failure_source"], "upstream_transaction");
+        assert_eq!(summary["failure_kind"], "client_error");
+        assert_eq!(summary["failure_scope"], "request_only");
+        assert_eq!(summary["mutation_kind"], "noop");
+        assert_eq!(summary["transition_action"], "noop");
+        assert_eq!(summary["affected_resource_kind"], "none");
+        assert_eq!(summary["resulting_state"], "noop");
+        assert!(summary["reason"].is_null());
+    }
+
+    #[tokio::test]
+    async fn routing_telemetry_failure_transition_summary_includes_response_filter_lifecycle_action(
+    ) {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(serde_json::json!({
+                    "id": "fixture",
+                    "object": "chat.completion",
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "blocked-marker"}}
+                    ]
+                }))
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let mut document = test_config_with_api_base(&api_base).into_registry_document();
+        document.credential_sets.insert(
+            "test-credentials".to_string(),
+            CredentialSetConfig {
+                keys_file: temp_keys_file("summary-filter-key\n"),
+            },
+        );
+        document.response_filter = crate::config::ResponseFilterConfig {
+            enabled: true,
+            replacement: Some("[filtered]".to_string()),
+            event_window_capacity: None,
+            alert_window_seconds: None,
+            rules: vec![crate::config::ResponseFilterRuleConfig {
+                id: "summary-filter".to_string(),
+                enabled: true,
+                kind: crate::config::ResponseFilterRuleKindConfig::Literal,
+                action: crate::config::ResponseFilterActionConfig::RejectAndExpireCredential,
+                case_sensitive: false,
+                value: Some("blocked-marker".to_string()),
+                pattern: None,
+            }],
+        };
+        let state = AppState::new(document.resolve().unwrap()).unwrap();
+        let credential_id = selected_credential_id(&state).await;
+
+        let response = post_test_chat_completion(state.clone(), "gpt-test").await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body_text.contains("blocked-marker"));
+
+        let channel_status = pool_status_for_channel(&state, "test").await.unwrap();
+        let channel_status = serde_json::to_value(channel_status).unwrap();
+        assert_eq!(channel_status["expired_credentials"], 1);
+
+        let telemetry =
+            management_response_json(&app(state.clone()), "/management/routing-telemetry").await;
+        let summary = single_failure_transition_summary(&telemetry);
+        let credential_hash = crate::credentials::short_hash(&credential_id);
+        assert_eq!(summary["failure_source"], "response_filter_precommit");
+        assert_eq!(summary["failure_kind"], "response_filter_rejected");
+        assert_eq!(summary["failure_scope"], "credential");
+        assert_eq!(summary["mutation_kind"], "credential_transition");
+        assert_eq!(summary["transition_action"], "expire_credential");
+        assert_eq!(summary["affected_resource_kind"], "credential");
+        assert_eq!(summary["selected_credential_id_hash"], credential_hash);
+        assert_eq!(summary["affected_credential_id_hash"], credential_hash);
+        assert_eq!(summary["resulting_state"], "expired");
+        assert_eq!(summary["reason"], "response_filter_rejected");
     }
 
     #[tokio::test]
