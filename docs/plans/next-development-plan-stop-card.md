@@ -18,9 +18,9 @@ targeted_test_evidence: `pass: routing_telemetry_failure_transition_summary matc
 
 local_ci_result: `pass: CARGO_TARGET_DIR outside the repository, scripts/local-ci.sh exit 0; local-ci ran 1138 unit tests, 15 local_release_contract tests, and 5 pre_output_stability_boundary_contract tests`
 
-release_artifact_result: `pass: scripts/build-release-x86_64-linux-docker.sh exit 0; rebuilt dist/one-ai-key-0.1.10-x86_64-unknown-linux-gnu.tar.gz and matching .sha256 from current source`
+release_artifact_result: `pass: scripts/build-release-x86_64-linux-docker.sh exit 0; rebuilt dist/one-ai-key-0.1.11-x86_64-unknown-linux-gnu.tar.gz and matching .sha256 from current source`
 
-release_smoke_result: `pass: scripts/release-smoke.sh exit 0 after rebuild; extracted artifact smoke passed for one-ai-key 0.1.10 and covered replacement-plan, source-file import, upstream-model credential probe, invalid probe evidence, confirmed probe-apply expiration, disable, restore from expired to available, final credential stats, management report leak scanning, and one mock client completion`
+release_smoke_result: `pass: scripts/release-smoke.sh exit 0 after rebuild; extracted artifact smoke passed for one-ai-key 0.1.11 and covered replacement-plan, source-file import, upstream-model credential probe, invalid probe evidence, confirmed probe-apply expiration, disable, restore from expired to available, final credential stats, management report leak scanning, and one mock client completion`
 
 redaction_and_denylist_result: `pass: git diff --check exited 0; executable staged-path denylist exited 0; staged files are limited to docs/plans, source, and tests and exclude dist/, target/, config/, data/, SQLite, logs, keys, raw fixtures, private scripts, and AGENTS.md`
 
