@@ -9,6 +9,7 @@ const MAX_CREDENTIAL_REF_LIMIT: usize = 50;
 pub enum KeysCommand {
     List(KeysListOptions),
     Stats(KeysStatsOptions),
+    ReplacementPlan(KeysReplacementPlanOptions),
     Import(KeysImportOptions),
     Probe(KeysProbeOptions),
     Disable(KeysDisableOptions),
@@ -25,6 +26,17 @@ pub struct KeysListOptions {
 pub struct KeysStatsOptions {
     pub connection: crate::cli::OperatorConnectionOptions,
     pub credential_set_id: Option<String>,
+    pub include_credential_refs: bool,
+    pub credential_ref_limit: usize,
+    pub output: crate::cli_report::OutputFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeysReplacementPlanOptions {
+    pub connection: crate::cli::OperatorConnectionOptions,
+    pub credential_set_id: String,
+    pub model: Option<String>,
+    pub client_token_ref: Option<String>,
     pub include_credential_refs: bool,
     pub credential_ref_limit: usize,
     pub output: crate::cli_report::OutputFormat,
@@ -164,6 +176,7 @@ pub async fn run(
     match command {
         KeysCommand::List(options) => run_list(options).await,
         KeysCommand::Stats(options) => run_stats(options).await,
+        KeysCommand::ReplacementPlan(options) => run_replacement_plan(options).await,
         KeysCommand::Import(options) => run_import(options).await,
         KeysCommand::Probe(options) => run_probe(options).await,
         KeysCommand::Disable(options) => run_disable(options).await,
@@ -208,6 +221,60 @@ pub async fn run_stats(
     }
 
     Ok(render_sanitized_keys_report(&report, options.output))
+}
+
+pub async fn run_replacement_plan(
+    options: KeysReplacementPlanOptions,
+) -> Result<String, crate::operator_client::OperatorClientError> {
+    let client = crate::cli_commands::operator_client_from_connection(&options.connection)?;
+    let credential_sets = client.get_json(keys_stats_sets_endpoint()).await?;
+    let initial_report =
+        sanitized_keys_stats_report(&credential_sets, Some(&options.credential_set_id));
+    let selected_set_exists = selected_single_set_id(&initial_report).is_some();
+    let operations = if selected_set_exists {
+        Some(
+            client
+                .get_json(keys_stats_operations_endpoint(&options.credential_set_id))
+                .await?,
+        )
+    } else {
+        None
+    };
+    let credential_refs = if selected_set_exists && options.include_credential_refs {
+        Some(
+            client
+                .get_json(keys_stats_credentials_endpoint(
+                    &options.credential_set_id,
+                    options.credential_ref_limit,
+                ))
+                .await?,
+        )
+    } else {
+        None
+    };
+    let route = if let Some(model) = options.model.as_deref().and_then(safe_probe_model) {
+        client
+            .get_json(crate::operator_client::ReadOnlyEndpoint::RoutingPreview {
+                model: model.to_string(),
+                client_token_ref: options
+                    .client_token_ref
+                    .as_deref()
+                    .and_then(safe_local_id)
+                    .map(ToOwned::to_owned),
+            })
+            .await
+            .ok()
+    } else {
+        None
+    };
+
+    Ok(render_keys_replacement_plan_report(
+        &options,
+        &credential_sets,
+        operations.as_ref(),
+        credential_refs.as_ref(),
+        route.as_ref(),
+    ))
 }
 
 pub async fn run_import(
@@ -508,6 +575,7 @@ fn render_sanitized_keys_report(report: &Value, output: crate::cli_report::Outpu
                 Some("keys import") => render_keys_import_table(report),
                 Some("keys probe") => render_keys_probe_table(report),
                 Some("keys disable") => render_keys_disable_table(report),
+                Some("keys replacement-plan") => render_keys_replacement_plan_table(report),
                 Some("keys probe-apply plan") | Some("keys probe-apply apply") => {
                     render_keys_probe_apply_table(report)
                 }
@@ -1544,6 +1612,440 @@ fn sanitized_keys_stats_report(credential_sets: &Value, credential_set_id: Optio
     })
 }
 
+pub fn render_keys_replacement_plan_report(
+    options: &KeysReplacementPlanOptions,
+    credential_sets: &Value,
+    operations: Option<&Value>,
+    credential_refs: Option<&Value>,
+    route: Option<&Value>,
+) -> String {
+    let mut stats_report =
+        sanitized_keys_stats_report(credential_sets, Some(&options.credential_set_id));
+    if let Some(operations) = operations {
+        merge_operations_into_stats_report(&mut stats_report, operations);
+    }
+    if let Some(credential_refs) = credential_refs {
+        merge_credential_refs_into_stats_report(&mut stats_report, credential_refs);
+    }
+
+    let set = stats_report
+        .get("credential_sets")
+        .and_then(Value::as_array)
+        .and_then(|sets| sets.first())
+        .cloned();
+    let set_found = set.is_some();
+    let capacity_summary = set
+        .as_ref()
+        .and_then(|set| {
+            set.get("operations")
+                .and_then(|operations| operations.get("credentials"))
+                .or_else(|| set.get("credentials"))
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
+    let replacement_need = replacement_need_summary(set.as_ref());
+    let route_impact = route_impact_summary(options, route);
+    let status = if set_found { "ok" } else { "blocked" };
+    let reason_code = if set_found {
+        "keys_replacement_plan_projected"
+    } else {
+        "credential_set_not_projected"
+    };
+
+    let data = serde_json::json!({
+        "command": "keys replacement-plan",
+        "scan_mode": "management_projection_only",
+        "credential_set_id": safe_local_id(&options.credential_set_id),
+        "capacity_summary": capacity_summary,
+        "replacement_need": replacement_need,
+        "route_impact": route_impact,
+        "credential_set": set,
+        "safe_next_actions": replacement_plan_safe_next_actions(options, route.is_some()),
+    });
+    let report =
+        crate::cli_report::report_envelope_with_legacy_fields(crate::cli_report::ReportEnvelope {
+            status,
+            reason: if set_found {
+                "Credential replacement plan was projected without mutation."
+            } else {
+                "The requested credential set was not projected."
+            },
+            reason_code,
+            effect: crate::cli_effects::runtime_readonly_store_reads_effect(),
+            scope: serde_json::json!({
+                "credential_set_id": safe_local_id(&options.credential_set_id),
+                "model": options.model.as_deref().and_then(safe_probe_model),
+                "client_token_ref": options.client_token_ref.as_deref().and_then(safe_local_id),
+            }),
+            window: Value::Null,
+            next_action: replacement_plan_next_action(options, set_found),
+            data,
+        });
+    render_sanitized_keys_report(&report, options.output)
+}
+
+fn replacement_need_summary(set: Option<&Value>) -> Value {
+    let Some(set) = set else {
+        return serde_json::json!({
+            "status": "unknown",
+            "reason_code": "credential_set_not_projected",
+            "summary": "Replacement need cannot be assessed without a credential-set projection.",
+        });
+    };
+    let operations = set.get("operations");
+    let operations_needs_input = operations
+        .and_then(|operations| operations.get("needs_operator_input"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let required_action = operations
+        .and_then(|operations| operations.get("required_action"))
+        .and_then(Value::as_str)
+        .and_then(safe_local_id);
+    if operations_needs_input || required_action.is_some() {
+        return serde_json::json!({
+            "status": "replacement_recommended",
+            "reason_code": required_action.unwrap_or("credential_set_needs_operator_input"),
+            "summary": "Credential-set operations projection requests operator review before replacement.",
+        });
+    }
+
+    let credentials = operations
+        .and_then(|operations| operations.get("credentials"))
+        .or_else(|| set.get("credentials"));
+    let count = |field: &str| {
+        credentials
+            .and_then(|credentials| credentials.get(field))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let total = count("total");
+    let available = count("available");
+    let blocked =
+        count("cooling_down") + count("expired") + count("quota_exhausted") + count("disabled");
+    if total == 0 {
+        serde_json::json!({
+            "status": "replacement_recommended",
+            "reason_code": "credential_set_empty",
+            "summary": "Credential set has no projected credentials.",
+        })
+    } else if available == 0 {
+        serde_json::json!({
+            "status": "replacement_recommended",
+            "reason_code": "no_available_credentials",
+            "summary": "Credential set has no projected available credentials.",
+        })
+    } else if blocked > 0 {
+        serde_json::json!({
+            "status": "monitor",
+            "reason_code": "partial_capacity_loss",
+            "summary": "Credential set still has available capacity but some credentials are unavailable.",
+        })
+    } else {
+        serde_json::json!({
+            "status": "not_required",
+            "reason_code": "sufficient_available_capacity",
+            "summary": "Credential set has projected available capacity.",
+        })
+    }
+}
+
+fn route_impact_summary(options: &KeysReplacementPlanOptions, route: Option<&Value>) -> Value {
+    let model = options.model.as_deref().and_then(safe_probe_model);
+    let client_token_ref = options.client_token_ref.as_deref().and_then(safe_local_id);
+    if model.is_none() {
+        return serde_json::json!({
+            "status": "unavailable_without_model_context",
+            "model": Value::Null,
+            "client_token_ref": client_token_ref,
+            "admission_status": Value::Null,
+            "reason_code": Value::Null,
+            "selected_target": Value::Null,
+            "requested_credential_set": route_requested_credential_set_unknown(options),
+            "summary": "Route impact was not requested because no public model context was supplied.",
+        });
+    }
+    let Some(route) = route else {
+        return serde_json::json!({
+            "status": "unavailable_without_route_projection",
+            "model": model,
+            "client_token_ref": client_token_ref,
+            "admission_status": Value::Null,
+            "reason_code": Value::Null,
+            "selected_target": Value::Null,
+            "requested_credential_set": route_requested_credential_set_unknown(options),
+            "summary": "Route impact projection was not available from the management API.",
+        });
+    };
+    let selected_candidate = route_selected_candidate(route);
+    let requested_credential_set =
+        route_requested_credential_set_summary(options, route, selected_candidate);
+    serde_json::json!({
+        "status": "available",
+        "model": route
+            .get("model")
+            .and_then(Value::as_str)
+            .and_then(safe_probe_model)
+            .or(model),
+        "client_token_ref": route
+            .get("client_token")
+            .and_then(|client_token| client_token.get("name"))
+            .and_then(Value::as_str)
+            .and_then(safe_local_id)
+            .or(client_token_ref),
+        "route_kind": route
+            .get("route_kind")
+            .and_then(Value::as_str)
+            .and_then(safe_local_id),
+        "admission_status": route
+            .get("admission_summary")
+            .and_then(|summary| summary.get("status"))
+            .and_then(Value::as_str)
+            .and_then(safe_local_id),
+        "reason_code": route
+            .get("admission_summary")
+            .and_then(|summary| summary.get("reason_code"))
+            .and_then(Value::as_str)
+            .and_then(safe_local_id),
+        "candidate_count": route
+            .get("admission_summary")
+            .and_then(|summary| summary.get("candidate_count"))
+            .and_then(Value::as_u64),
+        "included_count": route
+            .get("admission_summary")
+            .and_then(|summary| summary.get("included_count"))
+            .and_then(Value::as_u64),
+        "blocked_count": route
+            .get("admission_summary")
+            .and_then(|summary| summary.get("blocked_count"))
+            .and_then(Value::as_u64),
+        "last_resort_used": route
+            .get("admission_summary")
+            .and_then(|summary| summary.get("last_resort_used"))
+            .and_then(Value::as_bool),
+        "selected_target": sanitize_route_selected_target(route.get("selected_target"), selected_candidate),
+        "requested_credential_set": requested_credential_set,
+        "summary": "Route impact was projected from the read-only routing preview schema; credential-set impact is candidate-level context, not an automatic replacement decision.",
+    })
+}
+
+fn route_requested_credential_set_unknown(options: &KeysReplacementPlanOptions) -> Value {
+    serde_json::json!({
+        "credential_set_id": safe_local_id(&options.credential_set_id),
+        "candidate_presence": "unknown",
+        "selected_candidate": Value::Null,
+        "matching_candidate_count": Value::Null,
+        "summary": "Requested credential-set participation cannot be determined without a route candidate projection.",
+    })
+}
+
+fn route_requested_credential_set_summary(
+    options: &KeysReplacementPlanOptions,
+    route: &Value,
+    selected_candidate: Option<&Value>,
+) -> Value {
+    let Some(requested_set_id) = safe_local_id(&options.credential_set_id) else {
+        return route_requested_credential_set_unknown(options);
+    };
+    let Some(candidates) = route.get("candidates").and_then(Value::as_array) else {
+        return route_requested_credential_set_unknown(options);
+    };
+
+    let mut matching_candidate_count = 0usize;
+    let mut saw_safe_credential_set_id = candidates.is_empty();
+    let mut requested_selected = false;
+    for candidate in candidates {
+        let candidate_set_id = candidate
+            .get("credential_set_id")
+            .and_then(Value::as_str)
+            .and_then(safe_local_id);
+        if candidate_set_id.is_some() {
+            saw_safe_credential_set_id = true;
+        }
+        if candidate_set_id == Some(requested_set_id) {
+            matching_candidate_count += 1;
+            if candidate
+                .get("selected")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || selected_candidate.is_some_and(|selected| std::ptr::eq(selected, candidate))
+            {
+                requested_selected = true;
+            }
+        }
+    }
+
+    if !saw_safe_credential_set_id {
+        return route_requested_credential_set_unknown(options);
+    }
+
+    let candidate_presence = if requested_selected {
+        "selected_candidate"
+    } else if matching_candidate_count > 0 {
+        "candidate_not_selected"
+    } else {
+        "not_candidate"
+    };
+    let selected_candidate = if requested_selected {
+        Some(true)
+    } else if matching_candidate_count > 0 {
+        Some(false)
+    } else {
+        None
+    };
+    let summary = match candidate_presence {
+        "selected_candidate" => "Requested credential set appears on the selected route candidate.",
+        "candidate_not_selected" => {
+            "Requested credential set appears in route candidates but not on the selected candidate."
+        }
+        "not_candidate" => "Requested credential set does not appear in the route candidates.",
+        _ => "Requested credential-set participation is unknown.",
+    };
+
+    serde_json::json!({
+        "credential_set_id": requested_set_id,
+        "candidate_presence": candidate_presence,
+        "selected_candidate": selected_candidate,
+        "matching_candidate_count": matching_candidate_count,
+        "summary": summary,
+    })
+}
+
+fn route_selected_candidate(route: &Value) -> Option<&Value> {
+    let candidates = route.get("candidates").and_then(Value::as_array)?;
+    candidates
+        .iter()
+        .find(|candidate| {
+            candidate
+                .get("selected")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            let selected_target = route.get("selected_target")?;
+            candidates.iter().find(|candidate| {
+                route_candidate_matches_selected_target(candidate, selected_target)
+            })
+        })
+}
+
+fn route_candidate_matches_selected_target(candidate: &Value, target: &Value) -> bool {
+    let channel_matches = candidate.get("channel_id").and_then(Value::as_str)
+        == target.get("channel_id").and_then(Value::as_str);
+    let position_matches = candidate.get("plan_position").and_then(Value::as_u64)
+        == target.get("plan_position").and_then(Value::as_u64);
+    channel_matches && position_matches
+}
+
+fn sanitize_route_selected_target(
+    target: Option<&Value>,
+    selected_candidate: Option<&Value>,
+) -> Value {
+    if target.is_none() && selected_candidate.is_none() {
+        return Value::Null;
+    };
+    let channel_id = target
+        .and_then(|target| target.get("channel_id"))
+        .or_else(|| selected_candidate.and_then(|candidate| candidate.get("channel_id")))
+        .and_then(Value::as_str)
+        .and_then(safe_local_id);
+    let plan_position = target
+        .and_then(|target| target.get("plan_position"))
+        .or_else(|| selected_candidate.and_then(|candidate| candidate.get("plan_position")))
+        .and_then(Value::as_u64);
+    let credential_set_id = selected_candidate.and_then(|candidate| {
+        candidate
+            .get("credential_set_id")
+            .and_then(Value::as_str)
+            .and_then(safe_local_id)
+    });
+
+    serde_json::json!({
+        "channel_id": channel_id,
+        "plan_position": plan_position,
+        "credential_set_id": credential_set_id,
+    })
+}
+
+fn replacement_plan_safe_next_actions(
+    options: &KeysReplacementPlanOptions,
+    route_projection_available: bool,
+) -> Value {
+    let mut actions = vec![serde_json::json!({
+        "summary": "Refresh credential-set stats from read-only management projections.",
+        "safe_argv": keys_stats_argv(Some(&options.credential_set_id), options.include_credential_refs),
+        "side_effect_class": "runtime_readonly",
+        "requires_confirmation": false,
+    })];
+    if route_projection_available {
+        actions.push(serde_json::json!({
+            "summary": "Re-check route impact through the read-only route explain projection.",
+            "safe_argv": route_explain_argv(options),
+            "side_effect_class": "runtime_readonly",
+            "requires_confirmation": false,
+        }));
+    }
+    actions.push(serde_json::json!({
+        "summary": "Preview a replacement import locally; this does not send credentials to management.",
+        "safe_argv": keys_import_dry_run_argv(&options.credential_set_id),
+        "side_effect_class": "local_preview",
+        "requires_confirmation": false,
+    }));
+    Value::Array(actions)
+}
+
+fn replacement_plan_next_action(options: &KeysReplacementPlanOptions, set_found: bool) -> Value {
+    if set_found {
+        serde_json::json!({
+            "summary": "Review the safe next actions before any credential import or lifecycle change.",
+            "safe_argv": keys_stats_argv(Some(&options.credential_set_id), options.include_credential_refs),
+            "side_effect_class": "runtime_readonly",
+            "requires_confirmation": false,
+            "automatic_rollback": false,
+        })
+    } else {
+        serde_json::json!({
+            "summary": "List credential sets from the read-only management projection.",
+            "safe_argv": ["one-ai-key", "keys", "list"],
+            "side_effect_class": "runtime_readonly",
+            "requires_confirmation": false,
+            "automatic_rollback": false,
+        })
+    }
+}
+
+fn route_explain_argv(options: &KeysReplacementPlanOptions) -> Value {
+    let Some(model) = options.model.as_deref().and_then(safe_probe_model) else {
+        return Value::Null;
+    };
+    let mut argv = vec![
+        Value::from("one-ai-key"),
+        Value::from("route"),
+        Value::from("explain"),
+        Value::from(model),
+    ];
+    if let Some(client_token_ref) = options.client_token_ref.as_deref().and_then(safe_local_id) {
+        argv.push(Value::from("--client-token-ref"));
+        argv.push(Value::from(client_token_ref));
+    }
+    Value::Array(argv)
+}
+
+fn keys_import_dry_run_argv(credential_set_id: &str) -> Value {
+    let Some(credential_set_id) = safe_local_id(credential_set_id) else {
+        return Value::Null;
+    };
+    serde_json::json!([
+        "one-ai-key",
+        "keys",
+        "import",
+        "--credential-set",
+        credential_set_id,
+        "--source",
+        "replacement.keys",
+        "--dry-run"
+    ])
+}
+
 fn keys_reason(reason_code: &str) -> &'static str {
     match reason_code {
         "no_credential_sets_projected" => "No credential-set projection is available.",
@@ -2197,6 +2699,49 @@ fn render_keys_probe_apply_table(report: &Value) -> String {
     output
 }
 
+fn render_keys_replacement_plan_table(report: &Value) -> String {
+    let mut output = String::new();
+    output.push_str("keys replacement-plan\n");
+    crate::cli_report::append_report_envelope_table_fields(&mut output, report);
+    for field in [
+        "credential_set_id",
+        "replacement_need.status",
+        "replacement_need.reason_code",
+        "route_impact.status",
+        "route_impact.model",
+        "route_impact.client_token_ref",
+        "route_impact.reason_code",
+        "route_impact.requested_credential_set.candidate_presence",
+    ] {
+        push_nested_table_field(&mut output, field, report);
+    }
+    if let Some(capacity) = report.get("capacity_summary") {
+        for field in [
+            "total",
+            "available",
+            "cooling_down",
+            "expired",
+            "quota_exhausted",
+            "disabled",
+        ] {
+            crate::cli_report::push_table_field(
+                &mut output,
+                &format!("capacity_summary.{field}"),
+                capacity.get(field),
+            );
+        }
+    }
+    output
+}
+
+fn push_nested_table_field(output: &mut String, path: &str, report: &Value) {
+    let mut value = report;
+    for segment in path.split('.') {
+        value = value.get(segment).unwrap_or(&Value::Null);
+    }
+    crate::cli_report::push_table_field(output, path, Some(value));
+}
+
 fn render_keys_table(report: &Value) -> String {
     let mut output = String::new();
     output.push_str(&format!(
@@ -2284,6 +2829,7 @@ fn display_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use axum::{
+        http::StatusCode,
         routing::{get, post},
         Json, Router,
     };
@@ -3486,6 +4032,585 @@ mod tests {
         assert!(!rendered.contains("RAW_SUCCESS_SECRET"));
         assert!(!rendered.contains("RAW_TIME_SECRET"));
         assert!(!rendered.contains("raw_key"));
+    }
+
+    #[test]
+    fn keys_replacement_plan_render_summarizes_capacity_and_sanitizes_route_context() {
+        let projection = json!({
+            "credential_sets": [{
+                "id": "shared-credentials",
+                "channels": 1,
+                "channel_ids": ["relay-a"],
+                "account_ids": ["account-a"],
+                "provider_ids": ["provider-a"],
+                "credentials": {
+                    "total": 3,
+                    "available": 0,
+                    "cooling_down": 1,
+                    "expired": 1,
+                    "quota_exhausted": 1,
+                    "disabled": 0,
+                    "refs": ["cr:v1:pos:0", "cr:v1:pos:1"],
+                    "raw_key": "RAW_KEY_SECRET"
+                },
+                "probe_summary": {
+                    "status": "available",
+                    "total_credentials": 3,
+                    "quota_exhausted": 1,
+                    "invalid": 1,
+                    "fingerprint": "probe-fp-secret"
+                },
+                "key_import": {
+                    "source_kind": "management_api",
+                    "source_path": "/Users/rtoc/private.keys"
+                },
+                "token_hash": "token-secret"
+            }]
+        });
+        let operations = json!({
+            "credential_set_id": "shared-credentials",
+            "status": "blocked",
+            "serving_mode": "unavailable",
+            "accepting_requests": false,
+            "needs_operator_input": true,
+            "required_action": "import_replacement_credentials",
+            "credentials": {
+                "total": 3,
+                "available": 0,
+                "cooling_down": 1,
+                "expired": 1,
+                "quota_exhausted": 1
+            },
+            "raw_response_body": "response-secret"
+        });
+        let route = json!({
+            "request_id": "preview-local",
+            "model": "gpt-example",
+            "route_kind": "explicit_model_route",
+            "registry_generation": 8,
+            "candidate_limit": 16,
+            "policy_summary": {
+                "route_target_retry_enabled": true,
+                "same_request_credential_retry_enabled": false,
+                "max_same_request_retries": 0,
+                "candidate_limit": 16
+            },
+            "client_token": {
+                "id": "client-local",
+                "name": "local-client",
+                "unrestricted_model_groups": true,
+                "unrestricted_channels": true,
+                "raw_token": "CLIENT_SECRET"
+            },
+            "admission_summary": {
+                "status": "unavailable",
+                "reason_code": "no_usable_key_or_target",
+                "selected_target": null,
+                "candidate_count": 2,
+                "included_count": 0,
+                "blocked_count": 2,
+                "soft_suppressed_count": 0,
+                "hard_blocked_count": 2,
+                "last_resort_used": false,
+                "last_resort_reason": null
+            },
+            "selected_target": {
+                "channel_id": "relay-a",
+                "plan_position": 0
+            },
+            "candidates": [
+                {
+                    "target_index": 0,
+                    "channel_id": "relay-a",
+                    "provider_kind": "openai_compatible",
+                    "plan_position": 0,
+                    "included": false,
+                    "selected": true,
+                    "reasons": ["credential_pool_exhausted"],
+                    "credential_set_id": "shared-credentials",
+                    "selector_generation": 7,
+                    "credentials": {"total": 3, "available": 0},
+                    "raw_key": "RAW_ROUTE_KEY_SECRET"
+                },
+                {
+                    "target_index": 1,
+                    "channel_id": "relay-b",
+                    "provider_kind": "openai_compatible",
+                    "plan_position": 1,
+                    "included": false,
+                    "selected": false,
+                    "reasons": ["channel_cooling_down"],
+                    "credential_set_id": "backup-credentials",
+                    "selector_generation": 8,
+                    "credentials": {"total": 1, "available": 0},
+                    "credential_id": "internal-credential-secret"
+                }
+            ],
+            "raw_request_body": "request-secret"
+        });
+        let options = super::KeysReplacementPlanOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some("https://router.example".to_string()),
+                deprecated_base_url: None,
+                management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            credential_set_id: "shared-credentials".to_string(),
+            model: Some("gpt-example".to_string()),
+            client_token_ref: Some("local-client".to_string()),
+            include_credential_refs: true,
+            credential_ref_limit: 2,
+            output: crate::cli_report::OutputFormat::Json,
+        };
+
+        let rendered = super::render_keys_replacement_plan_report(
+            &options,
+            &projection,
+            Some(&operations),
+            None,
+            Some(&route),
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["reason_code"], "keys_replacement_plan_projected");
+        assert_eq!(report["side_effect_class"], "runtime_readonly");
+        assert_eq!(report["effect_vector"]["reads_management_runtime"], true);
+        assert_eq!(report["effect_vector"]["reads_management_store"], true);
+        assert_eq!(report["scope"]["credential_set_id"], "shared-credentials");
+        assert_eq!(report["data"]["capacity_summary"]["available"], json!(0));
+        assert_eq!(
+            report["data"]["replacement_need"]["status"],
+            "replacement_recommended"
+        );
+        assert_eq!(
+            report["data"]["replacement_need"]["reason_code"],
+            "import_replacement_credentials"
+        );
+        assert_eq!(report["data"]["route_impact"]["status"], "available");
+        assert_eq!(report["data"]["route_impact"]["model"], "gpt-example");
+        assert_eq!(
+            report["data"]["route_impact"]["client_token_ref"],
+            "local-client"
+        );
+        assert_eq!(
+            report["data"]["route_impact"]["admission_status"],
+            "unavailable"
+        );
+        assert_eq!(
+            report["data"]["route_impact"]["reason_code"],
+            "no_usable_key_or_target"
+        );
+        assert_eq!(
+            report["data"]["route_impact"]["requested_credential_set"]["candidate_presence"],
+            "selected_candidate"
+        );
+        assert_eq!(
+            report["data"]["route_impact"]["requested_credential_set"]["selected_candidate"],
+            true
+        );
+        assert_eq!(
+            report["data"]["route_impact"]["selected_target"]["credential_set_id"],
+            "shared-credentials"
+        );
+        assert_eq!(
+            report["data"]["safe_next_actions"][0]["safe_argv"][0],
+            "one-ai-key"
+        );
+        assert!(report["data"]["safe_next_actions"]
+            .to_string()
+            .contains("import"));
+        assert!(report["data"]["safe_next_actions"]
+            .to_string()
+            .contains("dry-run"));
+        assert!(!report["data"]["safe_next_actions"]
+            .to_string()
+            .contains("--yes"));
+        assert!(!rendered.contains("RAW_KEY_SECRET"));
+        assert!(!rendered.contains("RAW_ROUTE_KEY_SECRET"));
+        assert!(!rendered.contains("CLIENT_SECRET"));
+        assert!(!rendered.contains("internal-credential-secret"));
+        assert!(!rendered.contains("token-secret"));
+        assert!(!rendered.contains("/Users/rtoc/private.keys"));
+        assert!(!rendered.contains("request-secret"));
+        assert!(!rendered.contains("response-secret"));
+
+        let table_options = super::KeysReplacementPlanOptions {
+            output: crate::cli_report::OutputFormat::Table,
+            ..options
+        };
+        let table_rendered = super::render_keys_replacement_plan_report(
+            &table_options,
+            &projection,
+            Some(&operations),
+            None,
+            Some(&route),
+        );
+
+        assert!(table_rendered.contains(
+            "route_impact.requested_credential_set.candidate_presence: selected_candidate"
+        ));
+        assert!(!table_rendered.contains("RAW_KEY_SECRET"));
+        assert!(!table_rendered.contains("RAW_ROUTE_KEY_SECRET"));
+        assert!(!table_rendered.contains("CLIENT_SECRET"));
+        assert!(!table_rendered.contains("internal-credential-secret"));
+        assert!(!table_rendered.contains("token-secret"));
+        assert!(!table_rendered.contains("/Users/rtoc/private.keys"));
+        assert!(!table_rendered.contains("request-secret"));
+        assert!(!table_rendered.contains("response-secret"));
+    }
+
+    #[test]
+    fn keys_replacement_plan_without_model_marks_route_impact_unavailable() {
+        let options = super::KeysReplacementPlanOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some("https://router.example".to_string()),
+                deprecated_base_url: None,
+                management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            credential_set_id: "shared-credentials".to_string(),
+            model: None,
+            client_token_ref: Some("local-client".to_string()),
+            include_credential_refs: false,
+            credential_ref_limit: 20,
+            output: crate::cli_report::OutputFormat::Json,
+        };
+
+        let rendered = super::render_keys_replacement_plan_report(
+            &options,
+            &json!({
+                "credential_sets": [{
+                    "id": "shared-credentials",
+                    "credentials": {"total": 1, "available": 1}
+                }]
+            }),
+            None,
+            None,
+            None,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            report["data"]["route_impact"]["status"],
+            "unavailable_without_model_context"
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_replacement_plan_uses_existing_readonly_endpoints_without_posting() {
+        let called_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let post_called = Arc::new(AtomicBool::new(false));
+        let paths = Arc::clone(&called_paths);
+        let router = Router::new()
+            .route(
+                "/management/credential-sets",
+                get(move || {
+                    let paths = Arc::clone(&paths);
+                    async move {
+                        paths
+                            .lock()
+                            .unwrap()
+                            .push("/management/credential-sets".to_string());
+                        Json(json!({
+                            "credential_sets": [{
+                                "id": "relay-credentials",
+                                "channels": 1,
+                                "credentials": {"total": 2, "available": 0, "quota_exhausted": 2}
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/management/credential-sets/relay-credentials/operations",
+                get({
+                    let paths = Arc::clone(&called_paths);
+                    move || {
+                        let paths = Arc::clone(&paths);
+                        async move {
+                            paths.lock().unwrap().push(
+                                "/management/credential-sets/relay-credentials/operations"
+                                    .to_string(),
+                            );
+                            Json(json!({
+                                "credential_set_id": "relay-credentials",
+                                "needs_operator_input": true,
+                                "required_action": "import_replacement_credentials",
+                                "credentials": {"total": 2, "available": 0, "quota_exhausted": 2}
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/management/credential-sets/relay-credentials/credentials",
+                get({
+                    let paths = Arc::clone(&called_paths);
+                    move || {
+                        let paths = Arc::clone(&paths);
+                        async move {
+                            paths.lock().unwrap().push(
+                                "/management/credential-sets/relay-credentials/credentials"
+                                    .to_string(),
+                            );
+                            Json(json!({
+                                "credential_set_id": "relay-credentials",
+                                "offset": 0,
+                                "limit": 2,
+                                "total_credentials": 2,
+                                "credentials": [{"credential_ref": "cr:v1:pos:0"}]
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/management/routing/preview",
+                get({
+                    let paths = Arc::clone(&called_paths);
+                    move || {
+                        let paths = Arc::clone(&paths);
+                        async move {
+                            paths
+                                .lock()
+                                .unwrap()
+                                .push("/management/routing/preview".to_string());
+                            Json(json!({
+                                "request_id": "preview-local",
+                                "model": "gpt-example",
+                                "route_kind": "explicit_model_route",
+                                "registry_generation": 8,
+                                "candidate_limit": 16,
+                                "policy_summary": {
+                                    "route_target_retry_enabled": true,
+                                    "same_request_credential_retry_enabled": false,
+                                    "max_same_request_retries": 0,
+                                    "candidate_limit": 16
+                                },
+                                "client_token": {
+                                    "id": "client-local",
+                                    "name": "local-client",
+                                    "unrestricted_model_groups": true,
+                                    "unrestricted_channels": true
+                                },
+                                "admission_summary": {
+                                    "status": "unavailable",
+                                    "reason_code": "no_usable_key_or_target",
+                                    "selected_target": null,
+                                    "candidate_count": 1,
+                                    "included_count": 0,
+                                    "blocked_count": 1,
+                                    "soft_suppressed_count": 0,
+                                    "hard_blocked_count": 1,
+                                    "last_resort_used": false,
+                                    "last_resort_reason": null
+                                },
+                                "selected_target": null,
+                                "candidates": [{
+                                    "target_index": 0,
+                                    "channel_id": "relay-a",
+                                    "provider_kind": "openai_compatible",
+                                    "plan_position": 0,
+                                    "included": false,
+                                    "selected": false,
+                                    "reasons": ["credential_pool_exhausted"],
+                                    "credential_set_id": "relay-credentials",
+                                    "selector_generation": 7,
+                                    "credentials": {"total": 2, "available": 0}
+                                }]
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/management/credential-sets/relay-credentials/credentials/import",
+                post({
+                    let post_called = Arc::clone(&post_called);
+                    move |Json(_body): Json<Value>| {
+                        let post_called = Arc::clone(&post_called);
+                        async move {
+                            post_called.store(true, Ordering::SeqCst);
+                            Json(json!({"unexpected": true}))
+                        }
+                    }
+                }),
+            );
+        let management_url = spawn_management_fixture(router).await;
+        let env_name = format!(
+            "ONE_AI_KEY_TEST_REPLACEMENT_PLAN_TOKEN_{}",
+            std::process::id()
+        );
+        std::env::set_var(&env_name, "opaque-management-fixture");
+
+        let rendered = super::run(super::KeysCommand::ReplacementPlan(
+            super::KeysReplacementPlanOptions {
+                connection: crate::cli::OperatorConnectionOptions {
+                    management_url: Some(management_url),
+                    deprecated_base_url: None,
+                    management_token_env: Some(env_name.clone()),
+                    management_token_stdin: false,
+                    timeout_seconds: 10,
+                },
+                credential_set_id: "relay-credentials".to_string(),
+                model: Some("gpt-example".to_string()),
+                client_token_ref: Some("local-client".to_string()),
+                include_credential_refs: true,
+                credential_ref_limit: 2,
+                output: crate::cli_report::OutputFormat::Json,
+            },
+        ))
+        .await
+        .unwrap();
+        std::env::remove_var(env_name);
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        let paths = called_paths.lock().unwrap().clone();
+
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["data"]["route_impact"]["status"], "available");
+        assert_eq!(
+            report["data"]["route_impact"]["requested_credential_set"]["candidate_presence"],
+            "candidate_not_selected"
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/management/credential-sets",
+                "/management/credential-sets/relay-credentials/operations",
+                "/management/credential-sets/relay-credentials/credentials",
+                "/management/routing/preview",
+            ]
+        );
+        assert!(!post_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn keys_replacement_plan_route_preview_failure_degrades_without_posting_or_raw_body() {
+        let called_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let post_called = Arc::new(AtomicBool::new(false));
+        let paths = Arc::clone(&called_paths);
+        let router = Router::new()
+            .route(
+                "/management/credential-sets",
+                get(move || {
+                    let paths = Arc::clone(&paths);
+                    async move {
+                        paths
+                            .lock()
+                            .unwrap()
+                            .push("/management/credential-sets".to_string());
+                        Json(json!({
+                            "credential_sets": [{
+                                "id": "relay-credentials",
+                                "channels": 1,
+                                "credentials": {"total": 2, "available": 1, "quota_exhausted": 1}
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/management/credential-sets/relay-credentials/operations",
+                get({
+                    let paths = Arc::clone(&called_paths);
+                    move || {
+                        let paths = Arc::clone(&paths);
+                        async move {
+                            paths.lock().unwrap().push(
+                                "/management/credential-sets/relay-credentials/operations"
+                                    .to_string(),
+                            );
+                            Json(json!({
+                                "credential_set_id": "relay-credentials",
+                                "needs_operator_input": false,
+                                "credentials": {"total": 2, "available": 1, "quota_exhausted": 1}
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/management/routing/preview",
+                get({
+                    let paths = Arc::clone(&called_paths);
+                    move || {
+                        let paths = Arc::clone(&paths);
+                        async move {
+                            paths
+                                .lock()
+                                .unwrap()
+                                .push("/management/routing/preview".to_string());
+                            (StatusCode::NOT_FOUND, "ROUTE_PREVIEW_RAW_BODY_SECRET")
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/management/credential-sets/relay-credentials/credentials/import",
+                post({
+                    let post_called = Arc::clone(&post_called);
+                    move |Json(_body): Json<Value>| {
+                        let post_called = Arc::clone(&post_called);
+                        async move {
+                            post_called.store(true, Ordering::SeqCst);
+                            Json(json!({"unexpected": true}))
+                        }
+                    }
+                }),
+            );
+        let management_url = spawn_management_fixture(router).await;
+        let env_name = format!(
+            "ONE_AI_KEY_TEST_REPLACEMENT_PLAN_ROUTE_FAIL_TOKEN_{}",
+            std::process::id()
+        );
+        std::env::set_var(&env_name, "opaque-management-fixture");
+
+        let rendered = super::run(super::KeysCommand::ReplacementPlan(
+            super::KeysReplacementPlanOptions {
+                connection: crate::cli::OperatorConnectionOptions {
+                    management_url: Some(management_url),
+                    deprecated_base_url: None,
+                    management_token_env: Some(env_name.clone()),
+                    management_token_stdin: false,
+                    timeout_seconds: 10,
+                },
+                credential_set_id: "relay-credentials".to_string(),
+                model: Some("gpt-example".to_string()),
+                client_token_ref: Some("local-client".to_string()),
+                include_credential_refs: false,
+                credential_ref_limit: 2,
+                output: crate::cli_report::OutputFormat::Json,
+            },
+        ))
+        .await
+        .unwrap();
+        std::env::remove_var(env_name);
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        let paths = called_paths.lock().unwrap().clone();
+
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["reason_code"], "keys_replacement_plan_projected");
+        assert_eq!(
+            report["data"]["route_impact"]["status"],
+            "unavailable_without_route_projection"
+        );
+        assert_eq!(
+            report["data"]["route_impact"]["requested_credential_set"]["candidate_presence"],
+            "unknown"
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/management/credential-sets",
+                "/management/credential-sets/relay-credentials/operations",
+                "/management/routing/preview",
+            ]
+        );
+        assert!(!post_called.load(Ordering::SeqCst));
+        assert!(!rendered.contains("ROUTE_PREVIEW_RAW_BODY_SECRET"));
     }
 
     #[test]

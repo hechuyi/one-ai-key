@@ -176,7 +176,8 @@ pub fn classify_action(action: &CliAction) -> CommandEffect {
                 }
             },
             crate::cli_commands::keys::KeysCommand::List(_)
-            | crate::cli_commands::keys::KeysCommand::Stats(_) => {
+            | crate::cli_commands::keys::KeysCommand::Stats(_)
+            | crate::cli_commands::keys::KeysCommand::ReplacementPlan(_) => {
                 runtime_readonly_store_reads_effect()
             }
         },
@@ -631,8 +632,19 @@ mod tests {
             )),
             CliAction::Keys(crate::cli_commands::keys::KeysCommand::Stats(
                 crate::cli_commands::keys::KeysStatsOptions {
-                    connection,
+                    connection: connection.clone(),
                     credential_set_id: Some("relay-a".to_string()),
+                    include_credential_refs: true,
+                    credential_ref_limit: 20,
+                    output: crate::cli_report::OutputFormat::Table,
+                },
+            )),
+            CliAction::Keys(crate::cli_commands::keys::KeysCommand::ReplacementPlan(
+                crate::cli_commands::keys::KeysReplacementPlanOptions {
+                    connection,
+                    credential_set_id: "relay-a".to_string(),
+                    model: Some("gpt-example".to_string()),
+                    client_token_ref: Some("local-client".to_string()),
                     include_credential_refs: true,
                     credential_ref_limit: 20,
                     output: crate::cli_report::OutputFormat::Table,
@@ -660,6 +672,46 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn keys_replacement_plan_is_runtime_readonly_with_store_reads() {
+        let action = CliAction::Keys(crate::cli_commands::keys::KeysCommand::ReplacementPlan(
+            crate::cli_commands::keys::KeysReplacementPlanOptions {
+                connection: crate::cli::OperatorConnectionOptions {
+                    management_url: Some("https://router.example".to_string()),
+                    deprecated_base_url: None,
+                    management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                    management_token_stdin: false,
+                    timeout_seconds: 10,
+                },
+                credential_set_id: "relay-a".to_string(),
+                model: Some("gpt-example".to_string()),
+                client_token_ref: Some("local-client".to_string()),
+                include_credential_refs: true,
+                credential_ref_limit: 20,
+                output: crate::cli_report::OutputFormat::Table,
+            },
+        ));
+
+        let effect = super::classify_action(&action);
+
+        assert_eq!(
+            effect.side_effect_class,
+            super::SideEffectClass::RuntimeReadonly
+        );
+        assert_eq!(
+            effect.effect_vector,
+            super::EffectVector {
+                reads_local_files: false,
+                reads_management_runtime: true,
+                reads_management_store: true,
+                writes_local_files: false,
+                writes_management_store: false,
+                calls_upstream: false,
+                mutates_runtime: false,
+            }
+        );
     }
 
     #[test]

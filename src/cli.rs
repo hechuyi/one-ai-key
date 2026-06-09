@@ -159,6 +159,7 @@ enum ClientTokensCommand {
 enum KeysCommandArgs {
     List(KeysListArgs),
     Stats(KeysStatsArgs),
+    ReplacementPlan(KeysReplacementPlanArgs),
     Import(KeysImportArgs),
     Probe(KeysProbeArgs),
     Disable(KeysDisableArgs),
@@ -343,6 +344,30 @@ struct KeysListArgs {
 struct KeysStatsArgs {
     #[arg(long = "credential-set")]
     credential_set_id: Option<String>,
+    #[arg(long, requires = "credential_set_id")]
+    include_credential_refs: bool,
+    #[arg(
+        long,
+        default_value_t = 20,
+        requires = "include_credential_refs",
+        value_parser = parse_credential_ref_limit
+    )]
+    credential_ref_limit: usize,
+    #[arg(long, value_enum, default_value_t = crate::cli_report::OutputFormat::Table)]
+    output: crate::cli_report::OutputFormat,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    long_about = "Plan safe credential replacement from read-only management projections. Side-effect class: runtime_readonly. Writes local files: no. Calls upstreams: no. Mutates management state or active runtime: no."
+)]
+struct KeysReplacementPlanArgs {
+    #[arg(long = "credential-set")]
+    credential_set_id: String,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long = "client-token-ref")]
+    client_token_ref: Option<String>,
     #[arg(long, requires = "credential_set_id")]
     include_credential_refs: bool,
     #[arg(
@@ -668,6 +693,19 @@ where
             crate::cli_commands::keys::KeysStatsOptions {
                 connection: operator_connection_options,
                 credential_set_id: args.credential_set_id,
+                include_credential_refs: args.include_credential_refs,
+                credential_ref_limit: args.credential_ref_limit,
+                output: args.output,
+            },
+        )),
+        Some(CliCommand::Keys {
+            command: KeysCommandArgs::ReplacementPlan(args),
+        }) => CliAction::Keys(crate::cli_commands::keys::KeysCommand::ReplacementPlan(
+            crate::cli_commands::keys::KeysReplacementPlanOptions {
+                connection: operator_connection_options,
+                credential_set_id: args.credential_set_id,
+                model: args.model,
+                client_token_ref: args.client_token_ref,
                 include_credential_refs: args.include_credential_refs,
                 credential_ref_limit: args.credential_ref_limit,
                 output: args.output,
@@ -1665,6 +1703,52 @@ mod tests {
                     credential_ref_limit: 7,
                     output: crate::cli_report::OutputFormat::Json,
                 },
+            ))
+        );
+    }
+
+    #[test]
+    fn keys_replacement_plan_parse_supports_route_context_and_bounded_refs() {
+        let action = parse_action_from([
+            "one-ai-key",
+            "--management-url",
+            "https://router.example",
+            "--management-token-env",
+            "ONE_AI_KEY_MANAGEMENT_TOKEN",
+            "keys",
+            "replacement-plan",
+            "--credential-set",
+            "relay-credentials",
+            "--model",
+            "gpt-example",
+            "--client-token-ref",
+            "local-client",
+            "--include-credential-refs",
+            "--credential-ref-limit",
+            "7",
+            "--output",
+            "json",
+        ])
+        .expect("keys replacement-plan should parse");
+
+        assert_eq!(
+            action,
+            CliAction::Keys(crate::cli_commands::keys::KeysCommand::ReplacementPlan(
+                crate::cli_commands::keys::KeysReplacementPlanOptions {
+                    connection: OperatorConnectionOptions {
+                        management_url: Some("https://router.example".to_string()),
+                        deprecated_base_url: None,
+                        management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                        management_token_stdin: false,
+                        timeout_seconds: 10,
+                    },
+                    credential_set_id: "relay-credentials".to_string(),
+                    model: Some("gpt-example".to_string()),
+                    client_token_ref: Some("local-client".to_string()),
+                    include_credential_refs: true,
+                    credential_ref_limit: 7,
+                    output: crate::cli_report::OutputFormat::Json,
+                }
             ))
         );
     }
