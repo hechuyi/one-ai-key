@@ -414,6 +414,43 @@ assert_expected_management_reports_captured() {
   done
 }
 
+LEGACY_MANAGEMENT_REPORT_LABELS=(
+  "unavailable_until_m4"
+  "deferred_by_m1_m4"
+  "keys_probe_unavailable_until_m3"
+  "deferred_to_separate_plan"
+  "deferred to a separate plan"
+  "later reload/scope workflows when available"
+  "until M4"
+  "before M3"
+  "M2.4b"
+)
+
+assert_no_legacy_management_report_labels() {
+  if [[ "$#" -gt 0 ]]; then
+    :
+  else
+    printf 'error: no management reports were provided for legacy label scanning\n' >&2
+    exit 1
+  fi
+  local report
+  local label
+  for report in "$@"; do
+    if [[ -s "${report}" ]]; then
+      :
+    else
+      printf 'error: management report is missing or empty: %s\n' "${report}" >&2
+      exit 1
+    fi
+    for label in "${LEGACY_MANAGEMENT_REPORT_LABELS[@]}"; do
+      if grep -Fq "${label}" "${report}"; then
+        printf 'error: management report %s leaked legacy internal phase label\n' "${report}" >&2
+        exit 1
+      fi
+    done
+  done
+}
+
 assert_no_management_report_leaks() {
   if [[ "$#" -gt 0 ]]; then
     :
@@ -1062,5 +1099,6 @@ MANAGEMENT_REPORTS+=("negative-management-url.txt")
 
 assert_expected_management_reports_captured
 assert_no_management_report_leaks "${MANAGEMENT_REPORTS[@]}"
+assert_no_legacy_management_report_labels "${MANAGEMENT_REPORTS[@]}"
 
 printf 'release smoke passed for %s %s\n' "${PACKAGE_NAME}" "${VERSION}"

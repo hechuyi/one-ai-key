@@ -715,6 +715,18 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
         "EXPECTED_MANAGEMENT_REPORTS=(",
         "assert_expected_management_reports_captured",
         "assert_no_management_report_leaks",
+        "LEGACY_MANAGEMENT_REPORT_LABELS=(",
+        "assert_no_legacy_management_report_labels",
+        "unavailable_until_m4",
+        "deferred_by_m1_m4",
+        "keys_probe_unavailable_until_m3",
+        "deferred_to_separate_plan",
+        "deferred to a separate plan",
+        "later reload/scope workflows when available",
+        "until M4",
+        "before M3",
+        "M2.4b",
+        "legacy internal phase label",
         "[[ \"$#\" -gt 0 ]]",
         "[[ -s \"${report}\" ]]",
         "management report list did not match expected captured reports",
@@ -725,6 +737,22 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
         "models-explain.json",
         "route-explain.json",
         "keys-stats.json",
+        "keys-replacement-plan.json",
+        "keys-import-dry-run.json",
+        "keys-import-apply.json",
+        "keys-stats-after-import.json",
+        "keys-probe-dry-run.json",
+        "keys-probe.json",
+        "keys-probe-apply-plan.json",
+        "keys-probe-apply-dry-run.json",
+        "keys-probe-invalid.json",
+        "keys-probe-apply-invalid-plan.json",
+        "keys-probe-apply-apply.json",
+        "keys-disable-dry-run.json",
+        "keys-disable-apply.json",
+        "keys-restore-dry-run.json",
+        "keys-restore-apply.json",
+        "keys-stats-after-restore.json",
         "failures-tail.json",
         "reload-status.json",
         "reload-diff.json",
@@ -737,6 +765,12 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
         "reload-diff-staged.json",
         "reload-apply.json",
         "models-explain-published.json",
+        "failures-tail-upstream-503.json",
+        "failures-explain-upstream-503.json",
+        "route-explain-provider-cooling-last-resort.json",
+        "keys-disable-final-available.json",
+        "failures-tail-local-admission-503.json",
+        "failures-explain-local-admission-503.json",
         "negative-management-url.txt",
         "release-smoke-client-token",
         "release-smoke-management-token",
@@ -759,6 +793,7 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
         ".evidence.candidate_limit >= 0",
         ".evidence.endpoint_family_target_count >= 0",
         ".evidence.preview_candidate_count >= 0",
+        "assert_no_legacy_management_report_labels \"${MANAGEMENT_REPORTS[@]}\"",
         "from urllib.parse import urlsplit",
         "failed to parse mock upstream event JSONL",
         "mock upstream event missing string method/path",
@@ -780,6 +815,16 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
             "{path} must not contain constant bounded evidence assertion `{forbidden}`"
         );
     }
+    let ordinary_leak_scan = script
+        .find("assert_no_management_report_leaks \"${MANAGEMENT_REPORTS[@]}\"")
+        .expect("release smoke must run ordinary management report leak scan");
+    let legacy_label_scan = script
+        .find("assert_no_legacy_management_report_labels \"${MANAGEMENT_REPORTS[@]}\"")
+        .expect("release smoke must run legacy management label scan");
+    assert!(
+        ordinary_leak_scan < legacy_label_scan,
+        "{path} must scan management reports for ordinary leaks before legacy phase labels"
+    );
 }
 
 #[test]

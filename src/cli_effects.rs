@@ -381,7 +381,8 @@ pub fn confirmation_outcome(action: &CliAction, stdin_is_tty: bool) -> Confirmat
         {
             ConfirmationOutcome::Denied {
                 exit_code: 3,
-                reason_code: "deferred_to_separate_plan",
+                reason_code:
+                    crate::cli_commands::models_onboard::MODELS_ONBOARD_EXPLICIT_MODE_REQUIRED,
             }
         }
         CliAction::ModelsOnboardPlan(options)
@@ -1490,9 +1491,15 @@ mod tests {
             super::confirmation_outcome(&action, false),
             super::ConfirmationOutcome::Denied {
                 exit_code: 3,
-                reason_code: "deferred_to_separate_plan"
+                reason_code: "models_onboard_explicit_mode_required"
             }
         );
+        let super::ConfirmationOutcome::Denied { reason_code, .. } =
+            super::confirmation_outcome(&action, false)
+        else {
+            panic!("expected models onboard live variant to be denied");
+        };
+        assert!(!reason_code.contains("deferred"));
     }
 
     #[test]

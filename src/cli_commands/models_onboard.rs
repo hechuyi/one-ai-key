@@ -22,6 +22,9 @@ pub enum ModelsOnboardPlanMode {
     DeferredToSeparatePlan,
 }
 
+pub(crate) const MODELS_ONBOARD_EXPLICIT_MODE_REQUIRED: &str =
+    "models_onboard_explicit_mode_required";
+
 pub async fn run(
     options: ModelsOnboardPlanOptions,
 ) -> Result<String, crate::operator_client::OperatorClientError> {
@@ -127,8 +130,8 @@ pub fn render_onboard_plan_report(
 fn render_deferred_report(options: &ModelsOnboardPlanOptions) -> String {
     let report = onboard_report_envelope(
         "blocked",
-        "deferred_to_separate_plan",
-        "Live discovery, sync, reload, and client-token scope mutation are deferred to a separate plan.",
+        MODELS_ONBOARD_EXPLICIT_MODE_REQUIRED,
+        "Model onboarding requires an explicit --dry-run or --apply mode; live discovery, sync, reload, and client-token scope changes are not performed by this command.",
         serde_json::json!({
             "command": "models onboard-plan",
             "channel_id": safe_local_string(&options.channel_id),
@@ -838,7 +841,7 @@ fn deferred_followups() -> Value {
 fn next_action_for_plan(status: &str) -> Value {
     if status == "dry_run" {
         serde_json::json!({
-            "summary": "Review this planning-only report. Add explicit local model-route configuration and use later reload/scope workflows when available.",
+            "summary": "Review this planning-only report. Add explicit local model-route configuration, then run the appropriate reload or client-token scope command explicitly.",
             "template_id": "manual_config_review",
             "safe_argv": [],
             "side_effect_class": "runtime_readonly",
@@ -852,8 +855,8 @@ fn next_action_for_plan(status: &str) -> Value {
 
 fn next_action_deferred() -> Value {
     serde_json::json!({
-        "summary": "Model onboarding apply, discovery, sync, reload, and client-token scope changes are deferred to a separate plan.",
-        "template_id": "deferred_to_separate_plan",
+        "summary": "Choose an explicit supported operation: run --dry-run for a read-only plan, or --apply with the required confirmation and staged-registry precondition for a registry update.",
+        "template_id": MODELS_ONBOARD_EXPLICIT_MODE_REQUIRED,
         "safe_argv": [],
         "side_effect_class": "runtime_readonly",
         "requires_confirmation": false,
@@ -1217,6 +1220,47 @@ mod tests {
         assert!(!rendered.contains("SHOULD_NOT_RENDER_CLIENT_TOKEN"));
     }
 
+    #[tokio::test]
+    async fn models_onboard_unsupported_live_mode_reports_explicit_mode_boundary() {
+        let rendered = super::run(super::ModelsOnboardPlanOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some("https://router.example".to_string()),
+                deprecated_base_url: None,
+                management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            channel_id: "relay-a".to_string(),
+            public_model: "coding".to_string(),
+            upstream_model: Some("vendor/coding".to_string()),
+            client_token_ref: Some("operator-client".to_string()),
+            endpoint_family: Some("chat_completions".to_string()),
+            mode: super::ModelsOnboardPlanMode::DeferredToSeparatePlan,
+            expected_staged_registry_version: None,
+            output: crate::cli_report::OutputFormat::Json,
+        })
+        .await
+        .unwrap();
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(
+            report["reason_code"],
+            "models_onboard_explicit_mode_required"
+        );
+        assert_eq!(
+            report["next_action"]["template_id"],
+            "models_onboard_explicit_mode_required"
+        );
+        assert_eq!(report["planning_only_no_visibility_change"], true);
+        assert_eq!(report["live_discovery_called"], false);
+        assert_eq!(report["management_mutation_sent"], false);
+        assert!(!rendered.contains("deferred_to_separate_plan"));
+        assert!(!rendered.contains("deferred to a separate plan"));
+        assert!(!rendered.contains("later reload/scope workflows when available"));
+        assert!(!rendered.contains("when available"));
+    }
+
     #[test]
     fn models_onboard_plan_reports_unavailable_projection_without_live_work() {
         let options = super::ModelsOnboardPlanOptions {
@@ -1266,6 +1310,8 @@ mod tests {
             "manual_config_or_registry_update_required"
         );
         assert!(!rendered.contains("deferred_by_m1_m4"));
+        assert!(!rendered.contains("later reload/scope workflows when available"));
+        assert!(!rendered.contains("when available"));
     }
 
     #[test]
