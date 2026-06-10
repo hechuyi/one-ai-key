@@ -1,10 +1,5 @@
 # Next Development Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use
-> superpowers:subagent-driven-development (recommended) or
-> superpowers:executing-plans to implement this plan task-by-task. Steps use
-> checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** move one-ai-key from a working key router into a dependable personal
 operator tool by stabilizing runtime semantics, then diagnosis, then model
 publication.
@@ -69,7 +64,7 @@ failure transition logic, not admission retry logic.
 
 ### Tasks
 
-- [x] **Route admission taxonomy**
+- **Route admission taxonomy**
 
   Files: `src/route_plan.rs`, `src/main.rs`.
 
@@ -81,7 +76,7 @@ failure transition logic, not admission retry logic.
   Non-goals: no YAML fields, no live catalog, no hard blocker downgrade, no M3
   retry expansion.
 
-- [x] **Proxy secondary gate alignment**
+- **Proxy secondary gate alignment**
 
   Files: `src/proxy.rs`, `src/main.rs`.
 
@@ -93,7 +88,7 @@ failure transition logic, not admission retry logic.
   Non-goals: no route replanning after upstream failure; no default-pool
   fallback; no endpoint-family fallback.
 
-- [x] **Relay/error classification hardening**
+- **Relay/error classification hardening**
 
   Files: `src/error.rs`, `src/routing.rs`, provider/error adaptation tests.
 
@@ -106,7 +101,7 @@ failure transition logic, not admission retry logic.
   no raw upstream text in telemetry; no broad relay profile framework unless
   already admitted by existing config.
 
-- [x] **Failure-to-state transition summary**
+- **Failure-to-state transition summary**
 
   Files: `src/routing.rs`, `src/failure_state_executor.rs`, management
   projection code if needed.
@@ -118,7 +113,7 @@ failure transition logic, not admission retry logic.
 
   Non-goals: the summary is explanatory; it must not become a routing input.
 
-- [x] **M3 retry non-expansion**
+- **M3 retry non-expansion**
 
   Files: `src/routing.rs`, `src/proxy.rs`, `tests/pre_output_stability_boundary_contract.rs`.
 
@@ -129,7 +124,7 @@ failure transition logic, not admission retry logic.
   Non-goals: no streaming retry, partial-output retry, named-pool retry,
   embeddings retry, `/v1/models` retry, or unknown endpoint retry.
 
-- [x] **Pre-output guard and response-filter stability**
+- **Pre-output guard and response-filter stability**
 
   Files: `src/proxy.rs`, response guard/filter modules, `src/main.rs` tests.
 
@@ -140,7 +135,7 @@ failure transition logic, not admission retry logic.
   Non-goals: no full buffering of successful responses; no content-safety
   product; no filter-driven routing engine.
 
-- [x] **Runtime projection exported for diagnosis**
+- **Runtime projection exported for diagnosis**
 
   Files: management routing/failure projection modules.
 
@@ -177,7 +172,7 @@ credential, endpoint, reload, or retry logic.
 
 ### Tasks
 
-- [x] **Canonical diagnosis entry**
+- **Canonical diagnosis entry**
 
   Files: `src/cli_commands/models.rs`, `src/management_routing.rs`,
   `tests/local_release_contract.rs`.
@@ -190,7 +185,7 @@ credential, endpoint, reload, or retry logic.
   Non-goals: no new top-level diagnose command unless the existing model entry
   cannot remain coherent; no auto-fix.
 
-- [x] **Management diagnosis projection**
+- **Management diagnosis projection**
 
   Files: `src/management_routing.rs`, relevant response structs.
 
@@ -200,7 +195,7 @@ credential, endpoint, reload, or retry logic.
 
   Non-goals: no mutation endpoints, no YAML fields.
 
-- [x] **Route/models/failures projection alignment**
+- **Route/models/failures projection alignment**
 
   Files: `src/cli_commands/route.rs`, `src/cli_commands/models.rs`,
   `src/cli_commands/failures.rs`.
@@ -212,7 +207,7 @@ credential, endpoint, reload, or retry logic.
   Non-goals: no full incident ledger, no raw response text, no production
   transcript support.
 
-- [x] **Safe next-action contract**
+- **Safe next-action contract**
 
   Files: CLI command modules, shared report/next-action helpers if already
   present.
@@ -222,7 +217,7 @@ credential, endpoint, reload, or retry logic.
   doctor, reload status, reload diff. No key import, probe, reload apply, or
   upstream curl appears as an automatic suggestion.
 
-- [x] **Doctor and reload role boundaries**
+- **Doctor and reload role boundaries**
 
   Files: `src/cli_commands/doctor.rs`, `src/cli_commands/reload.rs`,
   `docs/operations.md`.
@@ -231,7 +226,7 @@ credential, endpoint, reload, or retry logic.
   route/model context remains bounded; reload status/diff can be suggested,
   reload apply cannot be suggested by diagnosis.
 
-- [x] **Documentation and release smoke**
+- **Documentation and release smoke**
 
   Files: `README.md`, `docs/operations.md`, `docs/release-build.md`,
   `scripts/release-smoke.sh`.
@@ -263,7 +258,7 @@ become a reusable control-plane pattern.
 
 ### Tasks
 
-- [x] **Publication plan projection**
+- **Publication plan projection**
 
   Files: `src/cli_commands/models_onboard.rs`, `src/operator_client.rs`,
   `docs/operations.md`.
@@ -275,7 +270,7 @@ become a reusable control-plane pattern.
   Non-goals: no live discovery, upstream probe, registry write, YAML patch, or
   client-scope mutation.
 
-- [x] **Model route staged apply**
+- **Model route staged apply**
 
   Files: `src/management_registry.rs`, management route registration,
   `src/operator_client.rs`.
@@ -287,7 +282,7 @@ become a reusable control-plane pattern.
   Non-goals: no active runtime mutation, no YAML write, no credential store
   touch, no automatic provider/channel creation.
 
-- [x] **CLI publication apply**
+- **CLI publication apply**
 
   Files: `src/cli.rs`, `src/cli_commands/models_onboard.rs` or a focused
   models publication module, `src/cli_effects.rs`.
@@ -299,7 +294,7 @@ become a reusable control-plane pattern.
   Non-goals: no automatic reload, no `/v1/models` call inside apply, no
   credential probe.
 
-- [x] **Reload diff integration**
+- **Reload diff integration**
 
   Files: `src/cli_commands/reload.rs`,
   `src/cli_commands/runtime_reload_projection.rs`, registry diff projection.
@@ -307,7 +302,7 @@ become a reusable control-plane pattern.
   Tests: staged route shows typed `model_route` diff; reload apply requires
   expected staged registry version; generation mismatch fails before mutation.
 
-- [x] **Visibility verification**
+- **Visibility verification**
 
   Files: `src/cli_commands/models.rs`, `src/management_routing.rs`,
   `src/operator_client.rs`.
@@ -316,7 +311,7 @@ become a reusable control-plane pattern.
   reload, models explain and `/v1/models` agree on visibility for the client;
   client scope mismatch is explained, not automatically fixed.
 
-- [x] **Publication smoke and docs**
+- **Publication smoke and docs**
 
   Files: `scripts/release-smoke.sh` or a focused local smoke helper,
   `docs/operations.md`, `docs/configuration.md`, `README.md`.
@@ -341,7 +336,7 @@ secrets, guessing the wrong blocker, or mutating more than intended.
 
 ### Tasks
 
-- [x] **Credential capacity and route impact plan**
+- **Credential capacity and route impact plan**
 
   Files: `src/cli.rs`, `src/cli_commands/keys.rs`, `src/cli_effects.rs`,
   `scripts/release-smoke.sh`.
@@ -355,7 +350,7 @@ secrets, guessing the wrong blocker, or mutating more than intended.
   Non-goals: no probe, import, lifecycle mutation, reload, route mutation,
   background health scan, or live catalog call.
 
-- [x] **Import remains the only replacement key ingress**
+- **Import remains the only replacement key ingress**
 
   Files: `src/cli_commands/keys.rs`, `docs/configuration.md`,
   `docs/operations.md`, `scripts/release-smoke.sh`.
@@ -368,7 +363,7 @@ secrets, guessing the wrong blocker, or mutating more than intended.
   Non-goals: no raw key positional CLI argument, no paste-key command, no
   automatic import suggestion from diagnosis.
 
-- [x] **Single-credential probe and probe-apply workflow**
+- **Single-credential probe and probe-apply workflow**
 
   Files: `src/cli_commands/keys.rs`, `scripts/release-smoke.sh`.
 
@@ -381,7 +376,7 @@ secrets, guessing the wrong blocker, or mutating more than intended.
   Non-goals: no batch probe apply, no background probing, no automatic
   lifecycle mutation from diagnosis.
 
-- [x] **Explicit disable and restore lifecycle repair**
+- **Explicit disable and restore lifecycle repair**
 
   Files: `src/cli.rs`, `src/cli_commands/keys.rs`, `src/cli_effects.rs`,
   `src/operator_client.rs`, `scripts/release-smoke.sh`.
@@ -395,10 +390,10 @@ secrets, guessing the wrong blocker, or mutating more than intended.
   Non-goals: no bulk restore, no inferred target from stats, no direct internal
   credential id use.
 
-- [x] **Post-action verification and documentation**
+- **Post-action verification and documentation**
 
   Files: `README.md`, `docs/operations.md`, `docs/configuration.md`,
-  `scripts/release-smoke.sh`, `docs/plans/next-development-plan-stop-card.md`.
+  `scripts/release-smoke.sh`, public operations docs, and release notes.
 
   Tests: release smoke verifies stats, replacement-plan, import,
   probe/probe-apply dry-run and confirmed evidence paths, disable/restore,

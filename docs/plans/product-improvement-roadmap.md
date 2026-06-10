@@ -368,7 +368,7 @@ Acceptance gates:
   `duplicate_charge_risk`, and effective-deadline evidence are present without
   raw bodies, keys, tokens, full URLs, or upstream free-form text.
 
-Current closure evidence:
+Implementation boundary:
 
 - `transition_after_failure` owns the M3 gate and rejects endpoint families
   outside non-streaming Chat/Responses, named-pool forwarding, streaming,
@@ -438,31 +438,17 @@ documents, not in the first-run path.
 
 ## Plan Closure
 
-A milestone is closed by evidence, not by continued searching. Its stop card
-must record:
+A milestone is closed by finite release criteria, not by continued searching.
+The public record should summarize the shipped capability, deferred scope,
+parked or rejected items, verification category, known blockers, and next
+version candidates. It should not include private deployment transcripts,
+raw command logs, one-off support history, local absolute paths, secrets,
+artifact hashes used only for a past upload, or internal execution checklists.
 
-- `plan_id`;
-- `release_or_scope_name`;
-- `closed_capability`;
-- `implemented_scope`;
-- `deferred_scope`;
-- `parked_or_rejected_items`;
-- `operator_contract_evidence`;
-- `test_evidence`;
-- `non_empty_filtered_test_evidence`;
-- `local_ci_result`;
-- `release_artifact_result`;
-- `redaction_and_denylist_result`;
-- `anti_platform_gate_result`;
-- `support_residue_scan_result`;
-- `deployment_boundary_result`;
-- `known_blockers`;
-- `next_version_candidates`.
-
-Once the fixed evidence fields are present and valid, stop. New concerns must
-be classified as a blocking defect, a next-version blocker, or post-release
-debt. Do not keep expanding smoke tests, docs, or review loops without replacing
-an existing matrix item or opening a separate accepted plan.
+Once the release criteria are satisfied, stop. New concerns must be classified
+as a blocking defect, a next-version blocker, or post-release debt. Do not keep
+expanding smoke tests, docs, or review loops without replacing an existing
+matrix item or opening a separate accepted plan.
 
 ## Next Version Entry
 

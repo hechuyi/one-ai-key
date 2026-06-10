@@ -1,10 +1,5 @@
 # M4 Runtime Resilience Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use
-> superpowers:subagent-driven-development (recommended) or
-> superpowers:executing-plans to implement this plan task-by-task. Steps use
-> checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** make the runtime less fragile than direct upstream use by closing the
 local route-admission gap, auditing hard/soft state transitions, and giving
 operators bounded evidence for every local `no_route_candidate`.
@@ -356,310 +351,28 @@ must record `production_smoke_result` as `pass`, `not_run_by_design`, or
 `blocked`; private production access must not become a repository release
 dependency.
 
-## Implementation Tasks
+## Delivery Requirements
 
-### Task 1: Characterize Current Admission And State Behavior
+M4 closes only when the code and docs establish these product-level contracts:
 
-**Files:**
-
-- Test: `src/route_plan.rs`
-- Test: `src/routing.rs`
-- Test: `src/main.rs`
-- Modify only if needed for test helpers.
-
-- [x] Add targeted tests proving current candidate ordering:
-  `available > degraded > provider-cooling`.
-- [x] Add tests proving all-provider-cooling otherwise-valid routes are
-  included as last resort.
-- [x] Add tests proving hard blockers are excluded and produce stable reasons.
-- [x] Add runtime tests for proxy secondary gate behavior:
-  provider-cooling last resort is attempted when selected by the route plan,
-  but skipped when a better frozen target remains.
-- [x] Add state-transition characterization tests for hard channel cooldown,
-  provider/account soft cooldown, degraded state, credential cooldown,
-  credential quota exhaustion, and request-scoped no-op failures.
-- [x] Prove every characterization filter matches non-zero tests before using
-  it as evidence.
-- [x] Run the targeted tests and confirm each filter matches non-zero tests.
-- [x] Commit characterization tests.
-
-Task 1 checkpoint evidence:
-
-- `cargo test --locked route_plan::tests::route_preview_last_resort_reasons_have_stable_codes -- --exact`
-  matched 1 test and passed.
-- `cargo test --locked route_plan::tests::plan_route_prefers_available_over_degraded_and_provider_account_cooling -- --exact`
-  matched 1 test and passed.
-- `cargo test --locked route_plan::tests::provider_account_soft_cooling_is_last_resort_when_no_better_soft_tier_exists -- --exact`
-  matched 1 test and passed.
-- `cargo test --locked route_plan::tests::hard_blockers_fail_closed_and_never_become_last_resort -- --exact`
-  matched 1 test and passed.
-- `cargo test --locked proxy::tests::attempt_gate --` matched 3 tests and
-  passed.
-- `cargo test --locked routing::tests::state_transition_characterization_matrix_covers_hard_soft_credential_and_request_scopes -- --exact`
-  matched 1 test and passed.
-- `cargo test --locked provider_cooling_down_selected_target_is_not_rejected_when_fallback_exists`
-  matched 1 test and passed.
-- `cargo test --locked frozen_route_fallback_skips_attempt_time_provider_cooling_when_better_target_remains`
-  matched 1 test and passed.
-- `cargo test --locked provider_cooling_route_with_no_available_credentials_fails_without_upstream_hit`
-  matched 1 test and passed.
-
-### Task 2: Shared Admission Summary
-
-**Files:**
-
-- Modify: `src/route_plan.rs`
-- Optional Create: `src/route_admission.rs`
-- Modify: `src/main.rs` module declarations only if a new module is justified.
-
-- [x] Add pure reason classification helpers for hard blockers, soft
-  suppression, and last-resort markers.
-- [x] Add `AdmissionBlockerSummary` or equivalent stable DTO.
-- [x] Generate the summary from the same route preview used by `plan_route`.
-- [x] Keep the summary independent of HTTP, CLI, management serialization,
-  YAML, SQLite, credential stores, and upstream I/O.
-- [x] Add unit tests for classification, counts, primary reason selection, and
-  redaction-safe reason strings.
-- [x] Commit the shared admission summary.
-
-Task 2 checkpoint evidence:
-
-- `cargo test --locked route_preview_reason_classification_is_centralized_and_stable --`
-  matched 1 test and passed.
-- `cargo test --locked route_admission_summary --` matched 2 tests and passed.
-- `cargo test --locked routing_preview_admission_summary --` matched 3 tests
-  and passed.
-- `cargo test --locked routing_preview_exports_admission_summary_for_selected_route --`
-  matched 1 test and passed.
-- `cargo test --locked explicit_model_route_all_channel_cooldown_returns_no_route_candidate`
-  matched 1 test and passed.
-- `cargo test --locked proxy::tests::attempt_gate --` matched 3 tests and
-  passed.
-- `cargo test --locked routing_failure_events_distinguish_local_admission_denial_from_upstream_503`
-  matched 1 test and passed.
-- `rg` scan found no remaining `routing_preview_*_reason` duplicate taxonomy
-  helpers in management/proxy; management serializes `RouteAdmissionSummary`
-  from `route_plan.rs`.
-
-### Task 3: Proxy Admission Alignment
-
-**Files:**
-
-- Modify: `src/proxy.rs`
-- Test: `src/main.rs`
-
-- [x] Replace duplicated local blocker reasoning in proxy with the shared
-  admission result or shared summary where feasible.
-- [x] Audit `route_state_unavailable_response_for_attempt` so it does not
-  reject a legitimate provider-cooling last-resort selected by the route plan.
-- [x] Preserve frozen fallback behavior when a later target remains.
-- [x] Prove hard blockers cause zero upstream hits when no frozen target can be
-  used.
-- [x] Prove M3 attempt budget does not increase.
-- [x] Commit proxy alignment.
-
-Task 3 checkpoint evidence:
-
-- Proxy admission telemetry now uses the route-plan hard/soft reason helpers
-  instead of local duplicated taxonomy functions.
-- `cargo test --locked proxy::tests::attempt_gate --` matched 3 tests and
-  passed.
-- `cargo test --locked explicit_model_route_all_channel_cooldown_returns_no_route_candidate`
-  matched 1 test and passed.
-- `cargo test --locked provider_cooling_route_with_no_available_credentials_fails_without_upstream_hit`
-  matched 1 test and passed.
-- `cargo test --locked frozen_route_fallback_skips_attempt_time_provider_cooling_when_better_target_remains`
-  matched 1 test and passed.
-- `cargo test --locked --test pre_output_stability_boundary_contract stage1_task5_m3_retry_non_expansion_contract_is_explicit -- --exact`
-  matched 1 test and passed.
-
-### Task 4: State Transition Hard/Soft Audit
-
-**Files:**
-
-- Modify: `src/routing.rs`
-- Modify only if needed: classifier or policy-profile code that maps upstream
-  evidence to `FailureKind` / `FailureScope`.
-- Test: `src/routing.rs`
-- Test: `src/main.rs`
-
-- [x] Review every mutation that can produce channel hard cooldown, provider
-  soft cooldown, degraded state, credential cooldown, credential expiration,
-  quota exhaustion, or no-op.
-- [x] Add a compact transition table in tests: input failure kind/scope/source
-  plus profile context -> expected mutation class and admission hardness.
-- [x] Fix only proven misclassifications. Do not add a new fallback path to
-  compensate for an incorrect hard classification.
-- [x] Prove relay balance/channel-scope contamination remains hard, provider
-  transient failures remain soft/degraded, credential failures remain scoped to
-  the credential unless config says otherwise, and request errors do not mutate
-  route availability.
-- [x] Commit state-transition audit changes.
-
-Task 4 checkpoint evidence:
-
-- `routing::tests::state_transition_characterization_matrix_covers_hard_soft_credential_and_request_scopes`
-  covers credential expiration, credential cooldown, credential quota,
-  upstream relay-balance hard channel cooldown, non-upstream relay-balance
-  no-op, provider/account degraded state, provider/account retry-after soft
-  cooldown, response-filter credential expiration, response-filter hard channel
-  cooldown, key-switch no-op, request/model client-error no-op, and
-  unsupported provider-adapter no-op.
-- No misclassification requiring production code changes was found.
-- `cargo test --locked routing::tests::state_transition_characterization_matrix_covers_hard_soft_credential_and_request_scopes -- --exact`
-  matched 1 test and passed.
-
-### Task 5: Management Projection And Failure Evidence
-
-**Files:**
-
-- Modify: `src/management_routing.rs`
-- Modify if needed: management routing telemetry / failures projection modules.
-- Test: `src/main.rs`
-
-- [x] Add `route_admission_summary` to routing preview responses.
-- [x] Ensure the response uses stable reason codes and bounded counts.
-- [x] Ensure unsafe route labels, token-like values, paths, URLs, and raw
-  upstream text are redacted or absent.
-- [x] Add tests for admitted, provider-cooling last-resort, hard-blocked, and
-  mixed candidate summaries.
-- [x] Add or refine bounded admission-denial evidence only if route/models
-  explain cannot otherwise connect a recent client-visible local 503 to the
-  shared admission taxonomy.
-- [x] Prove admission evidence is not a routing input and remains bounded.
-- [x] Commit management projection changes.
-
-Task 5 checkpoint evidence:
-
-- Management routing preview serializes `RouteAdmissionSummary` from
-  `route_plan.rs`; it no longer owns admission taxonomy helpers.
-- `cargo test --locked routing_preview_exports_admission_summary_for_selected_route --`
-  matched 1 test and passed.
-- `cargo test --locked routing_preview_admission_summary --` matched 2 tests
-  and passed.
-- `cargo test --locked routing_preview_admission_summary_reports_unavailable_hard_blocker_without_selected_target --`
-  matched 1 test and passed.
-- `cargo test --locked routing_failure_events_distinguish_local_admission_denial_from_upstream_503`
-  matched 1 test and passed.
-- `cargo test --locked --test local_release_contract release_smoke_script_covers_local_admission_and_upstream_503_failure_evidence -- --exact`
-  matched 1 test and passed.
-- `cargo test --locked --test local_release_contract release_smoke_script_checks_management_reports_are_redacted_and_bounded -- --exact`
-  matched 1 test and passed.
-
-### Task 6: CLI Rendering
-
-**Files:**
-
-- Modify: `src/cli_commands/route.rs`
-- Modify: `src/cli_commands/models.rs`
-- Optional Modify: `src/cli_commands/failures.rs`
-- Test relevant CLI command tests.
-
-- [x] Render `route_admission_summary` in `route explain` table and JSON
-  outputs.
-- [x] Have `models explain` consume management-provided summary or equivalent
-  management-side reason codes; do not duplicate route admission logic.
-- [x] Keep `failures explain` P1: add only if the existing bounded event window
-  can reference admission failures without broadening scope.
-- [x] Add tests proving CLI output is redacted and does not compute admission
-  locally.
-- [x] Commit CLI rendering changes.
-
-Task 6 checkpoint evidence:
-
-- `route explain` renders backend-projected `admission_summary` in JSON and
-  table output without recomputing admission locally.
-- `models explain --endpoint-family` uses management model availability as the
-  canonical projection.
-- `failures explain` keeps route admission denial evidence bounded and does not
-  treat it as current availability.
-- `cargo test --locked route_explain_admission_summary_uses_backend_projection_without_reclassification --`
-  matched 1 test and passed.
-- `cargo test --locked models_explain_management_availability_projection_is_canonical --`
-  matched 1 test and passed.
-- `cargo test --locked failures_explain_preserves_local_admission_denial_evidence_and_upstream_status_boundary --`
-  matched 1 test and passed.
-- `cargo test --locked failures_explain_table_marks_bounded_evidence_not_current_availability --`
-  matched 1 test and passed.
-
-### Task 7: Release Smoke And Operator Smoke Boundary
-
-**Files:**
-
-- Modify: `scripts/release-smoke.sh`
-- Optional Create: `scripts/production-smoke.sh`
-- Modify: `docs/operations.md`
-- Modify: `docs/release-build.md`
-- Test: `tests/local_release_contract.rs`
-
-- [x] Add one local mock release-smoke path for provider/account soft-cooling
-  last-resort success.
-- [x] Add one local mock negative sanity path for a representative hard blocker
-  returning local `no_route_candidate` with zero upstream hits.
-- [x] Do not expand release smoke into the full admission matrix.
-- [x] If adding `scripts/production-smoke.sh`, require explicit
-  `--allow-production`, parameterize all values, and reject missing env/token
-  references without printing secrets.
-- [x] Document production smoke as an operator-run deployment check, not a CI or
-  source release gate.
-- [x] Update local release contract tests for the new script boundaries and
-  denylist expectations.
-- [x] Commit release and operator smoke changes.
-
-Task 7 checkpoint evidence:
-
-- `scripts/release-smoke.sh` now distinguishes selected upstream 503 from local
-  route admission 503 with symmetric mock upstream POST counters.
-- `scripts/release-smoke.sh` now creates a provider/account soft-cooling state
-  from a local mock upstream 503 with `Retry-After`, verifies
-  `provider_cooling_down_last_resort` in `route explain`, and proves the
-  last-resort request reaches the mock upstream exactly once.
-- No `scripts/production-smoke.sh` was added; production smoke remains an
-  operator-run deployment boundary documented outside source release tests.
-- `bash -n scripts/release-smoke.sh` exited 0.
-- `cargo test --locked --test local_release_contract release_smoke_script_covers_local_admission_and_upstream_503_failure_evidence -- --exact`
-  matched 1 test and passed.
-- `cargo test --locked --test local_release_contract docs_make_models_explain_endpoint_family_the_canonical_first_diagnosis -- --exact`
-  matched 1 test and passed.
-
-### Task 8: Documentation And Stop Card
-
-**Files:**
-
-- Modify: `README.md`
-- Modify: `docs/operations.md`
-- Modify: `docs/architecture.md`
-- Modify: `docs/technical-design.md`
-- Create: `docs/plans/m4-route-admission-resilience-stop-card.md`
-
-- [x] Document `no_route_candidate` in user terms: hard blockers versus
-  provider/account soft cooldown last resort.
-- [x] Document that M4 does not expand retry, streaming behavior, endpoint
-  fallback, or model discovery.
-- [x] Document hard state, soft state, credential state, and request-scoped
-  failure categories in operator terms.
-- [x] Record the configuration admission decision: no new YAML in M4.
-- [x] Create the stop card with the fields below.
-- [x] Commit documentation.
-
-Task 8 checkpoint evidence:
-
-- `README.md` describes local `no_route_candidate` as hard local admission
-  failure and distinguishes provider/account soft cooldown last resort.
-- `docs/operations.md` documents hard blockers, soft suppressions, credential
-  lifecycle states, and request-scoped failures in operator terms.
-- `docs/technical-design.md` records the route-admission state categories and
-  states that M4 adds no public YAML fields, retry expansion, streaming
-  fallback, endpoint fallback, Responses-to-Chat conversion, or live model
-  discovery.
-- `docs/architecture.md` documents that `admission_summary` is generated by
-  route planning and rendered by management/CLI rather than recomputed there.
-- `docs/plans/m4-route-admission-resilience-stop-card.md` records the source
-  closure evidence and explicitly marks release artifact and extracted-artifact
-  release smoke as not run until the release gate is executed.
-- `git diff --check`, `scripts/check-staged-denylist.sh`, and
-  `CARGO_TARGET_DIR=/tmp/one-ai-key-cargo-target scripts/local-ci.sh` passed
-  after the Task 8 edits.
+- route planning classifies candidates through one shared admission taxonomy;
+- candidate priority remains `available > degraded > provider/account soft-cooling`;
+- all-soft provider/account cooling can be selected only as a last-resort first
+  attempt from the frozen compiled route plan;
+- hard blockers remain fail-closed and produce stable redacted reasons without
+  touching upstreams;
+- proxy secondary admission uses the same route-plan semantics rather than a
+  second local taxonomy;
+- state-transition tests distinguish hard channel state, soft provider/account
+  state, credential-scoped state, and request-scoped no-op failures;
+- management routing preview exposes a bounded `route_admission_summary`;
+- `route explain`, `models explain`, and bounded failure evidence render backend
+  projections without recomputing route admission locally;
+- local release smoke covers one soft last-resort success path and one hard
+  local `no_route_candidate` path;
+- public docs explain `no_route_candidate`, hard/soft state, credential state,
+  and M4 non-goals without private deployment evidence or internal execution
+  records.
 
 ## Test Matrix
 
@@ -698,40 +411,18 @@ Before closing M4:
   `data/`, SQLite, logs, keys, raw production fixtures, private scripts, and
   `AGENTS.md`.
 
-## Stop Card Fields
+## Release Record
 
-The M4 stop card must include:
+The M4 release record should summarize the shipped route-admission capability,
+deferred scope, parked or rejected items, verification categories, known
+blockers, and next-version candidates. It should avoid private deployment
+state, raw command logs, artifact hashes used only for a past upload, local
+absolute paths, secret material, and internal execution checklists.
 
-- `plan_id`;
-- `release_or_scope_name`;
-- `closed_capability`;
-- `implemented_scope`;
-- `deferred_scope`;
-- `parked_or_rejected_items`;
-- `route_admission_taxonomy_result`;
-- `state_transition_taxonomy_result`;
-- `soft_cooling_last_resort_result`;
-- `hard_blocker_zero_upstream_result`;
-- `proxy_secondary_gate_result`;
-- `m3_retry_non_expansion_result`;
-- `management_projection_result`;
-- `admission_evidence_result`;
-- `cli_rendering_result`;
-- `operator_contract_evidence`;
-- `test_evidence`;
-- `non_empty_filtered_test_evidence`;
-- `local_ci_result`;
-- `release_artifact_result`;
-- `release_smoke_result`;
-- `production_smoke_result`;
-- `redaction_and_denylist_result`;
-- `anti_platform_gate_result`;
-- `support_residue_scan_result`;
-- `deployment_boundary_result`;
-- `known_blockers`;
-- `next_version_candidates`.
-
-`production_smoke_result` may be `pass`, `not_run_by_design`, or `blocked`.
+Production smoke remains an operator-run deployment check, not source-release
+evidence. A public release record may state that boundary, but it must not imply
+production was updated unless separately documented with redacted operator
+evidence.
 
 ## Stop Or Block Conditions
 
