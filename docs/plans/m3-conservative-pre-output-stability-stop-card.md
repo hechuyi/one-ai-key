@@ -8,7 +8,7 @@ closed_capability: `Conservative Pre-Output Stability v1`
 
 implemented_scope: `selected-target pre-output retry gate; endpoint-family allowlist for non-streaming Chat Completions and Responses; named-pool retry exclusion; one-extra-attempt budget across credential, route-target, and same-target continuations; redacted retry and denial telemetry; local route-admission 503 evidence separated from selected-upstream 503 evidence; README, operations, configuration, technical design, and roadmap behavior docs`
 
-deferred_scope: `release packaging; deployment pin update; production deployment smoke; broader protocol conversion; endpoint fallback; active background health probing; persistent adaptive routing; usage or billing ledger`
+deferred_scope: `deployment pin update; production deployment smoke; broader protocol conversion; endpoint fallback; active background health probing; persistent adaptive routing; usage or billing ledger`
 
 parked_or_rejected_items: `streaming retry; partial-output fallback; /v1/models retry; Embeddings retry; named-pool M3 retry; unknown endpoint retry; default 429 retry; cross-provider default fallback outside frozen route policy; YAML retry presets; live upstream catalog aggregation; background health scanning; UI, billing, multi-tenancy, and broad OpenAI protocol conversion`
 
@@ -26,7 +26,9 @@ release_smoke_result: `pass: scripts/release-smoke.sh exited 0 against the fresh
 
 artifact_sha: `12f181ba1d4c5b0c95c6550bf927a9840e9a53e5da6734a925fd105b2e2a3038`
 
-redaction_and_denylist_result: `pass: git diff --check exited 0; executable staged-path denylist exited 0; staged files are limited to README, docs, source, and tests and exclude dist/, target/, key-pool-router/, config/, data/, SQLite, logs, keys, raw fixtures, private scripts, and AGENTS.md`
+published_asset_verification: `pass: GitHub Release v0.1.12 was created at https://github.com/hechuyi/one-ai-key/releases/tag/v0.1.12; uploaded tarball and .sha256 assets were downloaded through the configured local proxy into a tempdir; checksum verified from the uploaded .sha256 sidecar; tarball contains only one-ai-key; release is not draft or prerelease`
+
+redaction_and_denylist_result: `pass: git diff --check exited 0; executable staged-path denylist exited 0; staged files are limited to Cargo release metadata, public docs, source, and tests and exclude dist/, target/, key-pool-router/, config/, data/, SQLite, logs, keys, raw fixtures, private scripts, and AGENTS.md`
 
 anti_platform_gate_result: `pass: no live upstream catalog aggregation, background health check loop, persistent failure ledger, billing/usage analytics, UI surface, or broad protocol adapter was added`
 
@@ -34,6 +36,6 @@ support_residue_scan_result: `pass: changed docs use stable product behavior, pl
 
 deployment_boundary_result: `not_run_by_design: no production server, DNS, systemd unit, gateway pin, token rotation, or public traffic was touched`
 
-known_blockers: `none for M3 source capability closure`
+known_blockers: `none for M3 source and release artifact closure`
 
-next_version_candidates: `release packaging for M3; route/app boundary extraction; config resolver/compiler boundary extraction; failures projection/classification split; explicit plan for any future Responses-to-Chat adapter or endpoint compatibility work`
+next_version_candidates: `route/app boundary extraction; config resolver/compiler boundary extraction; failures projection/classification split; explicit plan for any future Responses-to-Chat adapter or endpoint compatibility work`
