@@ -488,10 +488,16 @@ assert_bounded_evidence models-explain.json
 MODEL_EXPLAIN_MODEL=$(jq -r '.model' models-explain.json)
 MODEL_EXPLAIN_CLIENT_TOKEN_REF=$(jq -r '.client_token_ref' models-explain.json)
 MODEL_EXPLAIN_REASON_CODE=$(jq -r '.reason_code' models-explain.json)
-capture_management_report route-explain.json route explain gpt-example --client-token-ref local-client --output json
+capture_management_report route-explain.json route explain gpt-example --client-token-ref local-client --endpoint-family chat_completions --output json
 jq -e --arg model "${MODEL_EXPLAIN_MODEL}" --arg client_token_ref "${MODEL_EXPLAIN_CLIENT_TOKEN_REF}" --arg reason_code "${MODEL_EXPLAIN_REASON_CODE}" '
   .status == "available" and .reason_code == "available"
   and .reason_code == $reason_code
+  and .endpoint_family_status == "evaluated"
+  and .endpoint_family == "chat_completions"
+  and .can_use == true
+  and .blocking_domain == "none"
+  and .availability.status == "available"
+  and .availability.reason_code == "available"
   and .admission_summary.status == "available"
   and .admission_summary.reason_code == "available"
   and .admission_summary.reason_code == .reason_code

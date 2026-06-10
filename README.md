@@ -190,7 +190,8 @@ one-ai-key models explain \
 one-ai-key route explain gpt-example \
   --management-url http://127.0.0.1:4101 \
   --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
-  --client-token-ref local-client
+  --client-token-ref local-client \
+  --endpoint-family chat_completions
 ```
 
 The management CLI rejects a client `/v1` base URL used as
@@ -320,11 +321,12 @@ agree with authenticated `GET /v1/models` for the same client token.
 diagnosis for client/model/endpoint availability. It answers whether that
 client-token ref can use the model on the requested endpoint family and returns
 `can_use`, `blocking_domain`, `endpoint_family`, bounded evidence, and a safe next_action.
-`one-ai-key route explain <public-model>` is the follow-up
-read-only view over selected route candidates, client-token scope, reload
-status, and static endpoint capability metadata. Capability output is diagnostic
-metadata only; it does not probe upstreams, change routing, or imply protocol
-conversion between endpoint families.
+`one-ai-key route explain <public-model> --endpoint-family <family>` is the
+follow-up read-only view over selected route candidates, client-token scope,
+reload status, static endpoint capability metadata, and the same management
+model-availability projection used by `models explain`. Capability output is
+diagnostic metadata only; it does not probe upstreams, change routing, or imply
+protocol conversion between endpoint families.
 
 `one-ai-key keys list` and `one-ai-key keys stats` are read-only credential-set
 views. `keys stats --credential-set <id> --include-credential-refs` may show

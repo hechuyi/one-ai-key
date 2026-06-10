@@ -5,6 +5,7 @@ pub struct RouteExplainOptions {
     pub connection: crate::cli::OperatorConnectionOptions,
     pub model: String,
     pub client_token_ref: Option<String>,
+    pub endpoint_family: Option<String>,
     pub output: crate::cli_report::OutputFormat,
 }
 
@@ -20,7 +21,24 @@ pub async fn run(
         &mut preview,
         runtime_projection,
     );
-    Ok(render_route_explain_report(&preview, options.output))
+    let availability = if let Some(endpoint_family) = options.endpoint_family.as_ref() {
+        Some(
+            crate::cli_commands::model_availability_projection::fetch_model_availability(
+                &client,
+                &options.model,
+                endpoint_family,
+                options.client_token_ref.as_deref(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    Ok(render_route_explain_report_with_availability(
+        &preview,
+        availability.as_ref(),
+        options.output,
+    ))
 }
 
 fn route_explain_endpoint(
@@ -32,22 +50,31 @@ fn route_explain_endpoint(
     }
 }
 
+#[cfg(test)]
 pub fn render_route_explain_report(
     preview: &Value,
     output: crate::cli_report::OutputFormat,
 ) -> String {
+    render_route_explain_report_with_availability(preview, None, output)
+}
+
+pub fn render_route_explain_report_with_availability(
+    preview: &Value,
+    availability: Option<&Value>,
+    output: crate::cli_report::OutputFormat,
+) -> String {
     match output {
-        crate::cli_report::OutputFormat::Json => render_route_explain_json(preview),
-        crate::cli_report::OutputFormat::Table => render_route_explain_table(preview),
+        crate::cli_report::OutputFormat::Json => render_route_explain_json(preview, availability),
+        crate::cli_report::OutputFormat::Table => render_route_explain_table(preview, availability),
     }
 }
 
-fn render_route_explain_json(preview: &Value) -> String {
-    let report = sanitized_route_explain_report(preview);
+fn render_route_explain_json(preview: &Value, availability: Option<&Value>) -> String {
+    let report = sanitized_route_explain_report(preview, availability);
     serde_json::to_string_pretty(&report).expect("route explain json report should serialize")
 }
 
-fn sanitized_route_explain_report(preview: &Value) -> Value {
+fn sanitized_route_explain_report(preview: &Value, availability: Option<&Value>) -> Value {
     let effect = crate::cli_effects::runtime_readonly_effect();
     let runtime_reload =
         crate::cli_commands::runtime_reload_projection::summarize_runtime_reload_projection(
@@ -68,20 +95,94 @@ fn sanitized_route_explain_report(preview: &Value) -> Value {
     let capability_status =
         crate::cli_report::endpoint_capability_status_from_candidates(&candidates);
     let admission_summary = sanitize_admission_summary(preview.get("admission_summary"));
-    let status = admission_summary
+    let admission_status = admission_summary
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let reason_code = admission_summary
+    let admission_reason_code = admission_summary
         .get("reason_code")
         .and_then(Value::as_str)
         .unwrap_or("admission_summary_missing");
-    let reason = route_admission_reason(status, reason_code);
+    let availability = availability
+        .map(crate::cli_commands::model_availability_projection::sanitize_model_availability);
+    let invalid_availability = availability.as_ref().and_then(
+        crate::cli_commands::model_availability_projection::invalid_model_availability_evidence,
+    );
+    let has_invalid_availability = invalid_availability.is_some();
+    let availability_can_use = availability
+        .as_ref()
+        .and_then(|value| value.get("can_use"))
+        .and_then(Value::as_bool)
+        .filter(|_| !has_invalid_availability)
+        .or_else(|| has_invalid_availability.then_some(false));
+    let status = if let Some(can_use) = availability_can_use {
+        if can_use {
+            "available"
+        } else {
+            "unavailable"
+        }
+    } else {
+        admission_status
+    };
+    let reason_code = if has_invalid_availability {
+        "management_projection_invalid"
+    } else {
+        availability
+            .as_ref()
+            .and_then(|value| value.get("reason_code"))
+            .and_then(Value::as_str)
+            .unwrap_or(admission_reason_code)
+    };
+    let reason = if availability.is_some() {
+        route_endpoint_family_reason(status, reason_code)
+    } else {
+        route_admission_reason(status, reason_code)
+    };
     let diagnostic_contract = crate::diagnostic_contract::contract_for_reason(reason_code)
         .unwrap_or_else(crate::diagnostic_contract::fallback_contract);
-    let next_action = diagnostic_contract.next_action.clone();
+    let blocking_domain = if has_invalid_availability {
+        "management_projection"
+    } else {
+        availability
+            .as_ref()
+            .and_then(|value| value.get("blocking_domain"))
+            .and_then(Value::as_str)
+            .unwrap_or(diagnostic_contract.blocking_domain)
+    };
+    let next_action = if has_invalid_availability {
+        crate::cli_commands::model_availability_projection::management_projection_invalid_next_action()
+    } else {
+        availability
+            .as_ref()
+            .and_then(|value| value.get("next_step"))
+            .filter(|value| !value.is_null())
+            .cloned()
+            .unwrap_or_else(|| diagnostic_contract.next_action.clone())
+    };
+    let endpoint_family = availability
+        .as_ref()
+        .and_then(|value| value.get("endpoint_family"))
+        .and_then(Value::as_str);
+    let evidence = invalid_availability.or_else(|| {
+        availability
+            .as_ref()
+            .and_then(|value| value.get("evidence"))
+            .filter(|value| !value.is_null())
+            .cloned()
+    });
+    let reload_drift = availability
+        .as_ref()
+        .and_then(|value| value.get("reload_drift"))
+        .filter(|value| !value.is_null())
+        .cloned();
+    let recent_failure_hint = availability
+        .as_ref()
+        .and_then(|value| value.get("recent_failure_hint"))
+        .filter(|value| !value.is_null())
+        .cloned();
     let data = serde_json::json!({
         "command": "route explain",
+        "endpoint_family_status": if availability.is_some() { "evaluated" } else { "not_requested" },
         "active_registry_generation": runtime_reload.active_registry_generation,
         "active_registry_version": runtime_reload.active_registry_version,
         "staged_registry_version": runtime_reload.staged_registry_version,
@@ -91,6 +192,8 @@ fn sanitized_route_explain_report(preview: &Value) -> Value {
         "reload_diff_next_action": runtime_reload.reload_diff_next_action,
         "capability_status": capability_status,
         "model": preview.get("model").and_then(Value::as_str),
+        "endpoint_family": endpoint_family,
+        "can_use": availability_can_use,
         "route_kind": preview.get("route_kind").and_then(Value::as_str),
         "registry_generation": preview.get("registry_generation").and_then(Value::as_u64),
         "candidate_limit": preview.get("candidate_limit").and_then(Value::as_u64),
@@ -98,7 +201,11 @@ fn sanitized_route_explain_report(preview: &Value) -> Value {
         "client_token": sanitize_client_token(preview.get("client_token")),
         "selected_target": sanitize_target(preview.get("selected_target")),
         "admission_summary": admission_summary,
-        "blocking_domain": diagnostic_contract.blocking_domain,
+        "blocking_domain": blocking_domain,
+        "availability": availability.clone(),
+        "evidence": evidence,
+        "reload_drift": reload_drift,
+        "recent_failure_hint": recent_failure_hint,
         "next_action": next_action,
         "candidates": candidates,
     });
@@ -109,12 +216,13 @@ fn sanitized_route_explain_report(preview: &Value) -> Value {
         effect,
         serde_json::json!({
             "model": preview.get("model").and_then(Value::as_str),
+            "endpoint_family": endpoint_family,
             "client_token_ref": preview
                 .get("client_token")
                 .and_then(|client_token| client_token.get("name"))
                 .and_then(Value::as_str),
         }),
-        diagnostic_contract.next_action,
+        next_action,
         data,
     )
 }
@@ -133,6 +241,21 @@ fn route_admission_reason(status: &str, reason_code: &str) -> String {
             )
         }
         _ => "Backend route admission projection is unavailable.".to_string(),
+    }
+}
+
+fn route_endpoint_family_reason(status: &str, reason_code: &str) -> String {
+    match status {
+        "available" => {
+            "Management model-availability projection reports this route is usable for the requested endpoint family."
+                .to_string()
+        }
+        "unavailable" => {
+            format!(
+                "Management model-availability projection reports endpoint-family availability unavailable: {reason_code}."
+            )
+        }
+        _ => "Management model-availability projection is unavailable.".to_string(),
     }
 }
 
@@ -325,8 +448,8 @@ fn sanitize_credential_counts(credentials: Option<&Value>) -> Value {
     Value::Object(counts)
 }
 
-fn render_route_explain_table(preview: &Value) -> String {
-    let report = sanitized_route_explain_report(preview);
+fn render_route_explain_table(preview: &Value, availability: Option<&Value>) -> String {
+    let report = sanitized_route_explain_report(preview, availability);
     render_route_explain_table_from_report(&report)
 }
 
@@ -347,6 +470,23 @@ fn render_route_explain_table_from_report(report: &Value) -> String {
         "capability_status",
         report.get("capability_status"),
     );
+    crate::cli_report::push_table_field(
+        &mut output,
+        "endpoint_family_status",
+        report.get("endpoint_family_status"),
+    );
+    crate::cli_report::push_table_field(
+        &mut output,
+        "endpoint_family",
+        report.get("endpoint_family"),
+    );
+    crate::cli_report::push_table_field(&mut output, "can_use", report.get("can_use"));
+    if let Some(availability) = report.get("availability").filter(|value| !value.is_null()) {
+        crate::cli_commands::model_availability_projection::append_availability_table_fields(
+            &mut output,
+            availability,
+        );
+    }
     append_admission_summary_table_fields(&mut output, report.get("admission_summary"));
 
     if let Some(route_kind) = report.get("route_kind").and_then(Value::as_str) {
@@ -1085,6 +1225,7 @@ mod tests {
             },
             model: "gpt-4o".to_string(),
             client_token_ref: None,
+            endpoint_family: None,
             output: crate::cli_report::OutputFormat::Json,
         })
         .await
@@ -1103,6 +1244,129 @@ mod tests {
         assert_eq!(report["reload_diff_reason_code"], "reload_diff_empty");
         assert_eq!(report["active_registry_generation"], 33);
         assert_eq!(report["runtime_reload_required"], false);
+    }
+
+    #[tokio::test]
+    async fn route_explain_run_fetches_endpoint_family_availability_when_requested() {
+        let seen_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let preview_seen = Arc::clone(&seen_paths);
+        let diff_seen = Arc::clone(&seen_paths);
+        let availability_seen = Arc::clone(&seen_paths);
+        let router = Router::new()
+            .route(
+                "/management/routing/preview",
+                get(move || {
+                    let preview_seen = Arc::clone(&preview_seen);
+                    async move {
+                        preview_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/routing/preview".to_string());
+                        Json(json!({
+                            "model": "gpt-public",
+                            "selected_target": {"channel_id": "primary", "plan_position": 0},
+                            "client_token": {"name": "local-client"},
+                            "candidates": []
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/management/runtime/reload-diff",
+                get(move || {
+                    let diff_seen = Arc::clone(&diff_seen);
+                    async move {
+                        diff_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/runtime/reload-diff".to_string());
+                        Json(json!({
+                            "status": "ok",
+                            "reason_code": "reload_diff_empty",
+                            "runtime_reload_required": false
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/management/model-availability",
+                get(move || {
+                    let availability_seen = Arc::clone(&availability_seen);
+                    async move {
+                        availability_seen
+                            .lock()
+                            .unwrap()
+                            .push("/management/model-availability".to_string());
+                        Json(json!({
+                            "status": "unavailable",
+                            "can_use": false,
+                            "blocking_domain": "endpoint_family",
+                            "reason_code": "endpoint_family_mismatch",
+                            "next_action": "configure_endpoint_capabilities_or_route",
+                            "endpoint_family": "responses",
+                            "model": "gpt-public",
+                            "client_token_ref": "local-client",
+                            "evidence": {
+                                "route_target_count": 1,
+                                "endpoint_family_target_count": 0,
+                                "unknown_or_missing_target_count": 1
+                            },
+                            "next_step": {
+                                "summary": "Inspect runtime route target endpoint capabilities.",
+                                "template_id": "route_explain",
+                                "safe_argv": ["one-ai-key", "route", "explain", "--management-url", "<url>", "--management-token-env", "<env>", "<public-model>"],
+                                "side_effect_class": "runtime_readonly",
+                                "requires_confirmation": false
+                            },
+                            "raw_token": "SHOULD_NOT_RENDER"
+                        }))
+                    }
+                }),
+            );
+        let management_url = spawn_management_fixture(router).await;
+        let env_name = format!(
+            "ONE_AI_KEY_TEST_ROUTE_EXPLAIN_AVAILABILITY_TOKEN_{}",
+            std::process::id()
+        );
+        std::env::set_var(&env_name, "opaque-management-fixture");
+
+        let rendered = super::run(super::RouteExplainOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some(management_url),
+                deprecated_base_url: None,
+                management_token_env: Some(env_name.clone()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            model: "gpt-public".to_string(),
+            client_token_ref: Some("local-client".to_string()),
+            endpoint_family: Some("responses".to_string()),
+            output: crate::cli_report::OutputFormat::Json,
+        })
+        .await
+        .unwrap();
+        std::env::remove_var(env_name);
+        let report: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            *seen_paths.lock().unwrap(),
+            vec![
+                "/management/routing/preview".to_string(),
+                "/management/runtime/reload-diff".to_string(),
+                "/management/model-availability".to_string(),
+            ]
+        );
+        assert_eq!(report["endpoint_family_status"], "evaluated");
+        assert_eq!(report["endpoint_family"], "responses");
+        assert_eq!(report["can_use"], false);
+        assert_eq!(report["blocking_domain"], "endpoint_family");
+        assert_eq!(report["reason_code"], "endpoint_family_mismatch");
+        assert_eq!(
+            report["availability"]["reason_code"],
+            "endpoint_family_mismatch"
+        );
+        assert_eq!(report["availability"]["evidence"]["route_target_count"], 1);
+        assert!(!rendered.contains("SHOULD_NOT_RENDER"));
     }
 
     #[tokio::test]
@@ -1179,6 +1443,7 @@ mod tests {
             },
             model: "gpt-4o".to_string(),
             client_token_ref: None,
+            endpoint_family: None,
             output: crate::cli_report::OutputFormat::Json,
         })
         .await
@@ -1269,6 +1534,7 @@ mod tests {
             },
             model: "gpt-4o".to_string(),
             client_token_ref: None,
+            endpoint_family: None,
             output: crate::cli_report::OutputFormat::Json,
         })
         .await
@@ -1297,6 +1563,7 @@ mod tests {
             },
             model: "gpt-4o".to_string(),
             client_token_ref: Some("local-client".to_string()),
+            endpoint_family: None,
             output: crate::cli_report::OutputFormat::Json,
         };
 

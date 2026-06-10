@@ -159,11 +159,13 @@ It does not enable Responses defaulting, Responses-to-Chat conversion, missing
 model injection, or any request-path protocol adapter.
 
 Management projections and CLI explanation commands may display these fields.
-`models explain` and `route explain` read the compiled routing preview and
-report candidate endpoint capabilities as structured JSON or a table summary.
-Those commands do not query `/management/channels/{id}` per candidate, call
-upstream endpoints, mutate runtime state, or treat `unknown` as
-`unsupported`.
+`models explain` reads the compiled routing preview plus the management
+model-availability projection when an endpoint family is requested. `route
+explain` reads the compiled routing preview and, when `--endpoint-family` is
+provided, attaches that same model-availability projection to the route report.
+Those commands report candidate endpoint capabilities as structured JSON or a
+table summary. They do not query `/management/channels/{id}` per candidate, call
+upstream endpoints, mutate runtime state, or treat `unknown` as `unsupported`.
 
 `check-config` treats capability diagnostics as warnings only. The current
 offline check intentionally warns only for high-confidence mismatches: model

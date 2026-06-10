@@ -496,7 +496,10 @@ fn release_smoke_script_covers_local_mock_data_plane_and_operator_commands() {
         "doctor --output json",
         "client-tokens list --output json",
         "models list --client-token-ref local-client --output json",
-        "route explain gpt-example --client-token-ref local-client --output json",
+        "route explain gpt-example --client-token-ref local-client --endpoint-family chat_completions --output json",
+        r#".endpoint_family_status == "evaluated""#,
+        r#".can_use == true"#,
+        r#".availability.status == "available""#,
         "keys stats --credential-set relay_credentials --output json",
         "failures tail --last 20 --output json",
         "failures-tail.json",
@@ -583,6 +586,33 @@ fn release_smoke_models_explain_diagnosis_is_canonical_endpoint_family() {
         assert!(
             line.contains("--endpoint-family"),
             "{path} canonical models explain smoke must include --endpoint-family: {line}"
+        );
+    }
+}
+
+#[test]
+fn release_smoke_route_explain_followup_carries_endpoint_family() {
+    let path = "scripts/release-smoke.sh";
+    let script = read_repo_file(path);
+
+    let canonical_route_explain_lines = script
+        .lines()
+        .filter(|line| {
+            line.contains("capture_management_report")
+                && line.contains("route-explain.json")
+                && line.contains("route")
+                && line.contains("explain")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        !canonical_route_explain_lines.is_empty(),
+        "{path} must smoke canonical route explain follow-up"
+    );
+    for line in canonical_route_explain_lines {
+        assert!(
+            line.contains("--endpoint-family"),
+            "{path} canonical route explain follow-up must include --endpoint-family: {line}"
         );
     }
 }

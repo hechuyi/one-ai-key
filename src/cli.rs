@@ -218,6 +218,8 @@ struct RouteExplainArgs {
     model: String,
     #[arg(long = "client-token-ref")]
     client_token_ref: Option<String>,
+    #[arg(long = "endpoint-family")]
+    endpoint_family: Option<String>,
     #[arg(long, value_enum, default_value_t = crate::cli_report::OutputFormat::Table)]
     output: crate::cli_report::OutputFormat,
 }
@@ -611,6 +613,7 @@ where
             connection: operator_connection_options,
             model: args.model,
             client_token_ref: args.client_token_ref,
+            endpoint_family: args.endpoint_family,
             output: args.output,
         }),
         Some(CliCommand::Models {
@@ -1134,6 +1137,8 @@ mod tests {
             "gpt-4o",
             "--client-token-ref",
             "local-client",
+            "--endpoint-family",
+            "chat_completions",
             "--output",
             "json",
         ])
@@ -1151,6 +1156,7 @@ mod tests {
                 },
                 model: "gpt-4o".to_string(),
                 client_token_ref: Some("local-client".to_string()),
+                endpoint_family: Some("chat_completions".to_string()),
                 output: crate::cli_report::OutputFormat::Json,
             })
         );

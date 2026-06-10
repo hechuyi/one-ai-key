@@ -2,6 +2,7 @@ pub mod client_tokens;
 pub mod doctor;
 pub mod failures;
 pub mod keys;
+pub(crate) mod model_availability_projection;
 pub mod models;
 pub mod models_onboard;
 pub mod reload;

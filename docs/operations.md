@@ -116,7 +116,8 @@ one-ai-key models explain --management-url <management-origin> \
 
 one-ai-key route explain <public-model-id> --management-url <management-origin> \
   --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
-  --client-token-ref <client-token-ref>
+  --client-token-ref <client-token-ref> \
+  --endpoint-family chat_completions
 ```
 
 The offline `check-config` visibility preview, authenticated `/v1/models`, and
@@ -306,7 +307,8 @@ one-ai-key keys stats --credential-set <credential-set-id> \
   --include-credential-refs
 
 one-ai-key route explain <public-model-id> \
-  --client-token-ref <client-token-ref>
+  --client-token-ref <client-token-ref> \
+  --endpoint-family chat_completions
 
 one-ai-key models explain --model <public-model-id> \
   --client-token-ref <client-token-ref> \
