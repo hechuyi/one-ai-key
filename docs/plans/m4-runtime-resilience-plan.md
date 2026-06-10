@@ -555,15 +555,32 @@ Task 5 checkpoint evidence:
 - Optional Modify: `src/cli_commands/failures.rs`
 - Test relevant CLI command tests.
 
-- [ ] Render `route_admission_summary` in `route explain` table and JSON
+- [x] Render `route_admission_summary` in `route explain` table and JSON
   outputs.
-- [ ] Have `models explain` consume management-provided summary or equivalent
+- [x] Have `models explain` consume management-provided summary or equivalent
   management-side reason codes; do not duplicate route admission logic.
-- [ ] Keep `failures explain` P1: add only if the existing bounded event window
+- [x] Keep `failures explain` P1: add only if the existing bounded event window
   can reference admission failures without broadening scope.
-- [ ] Add tests proving CLI output is redacted and does not compute admission
+- [x] Add tests proving CLI output is redacted and does not compute admission
   locally.
-- [ ] Commit CLI rendering changes.
+- [x] Commit CLI rendering changes.
+
+Task 6 checkpoint evidence:
+
+- `route explain` renders backend-projected `admission_summary` in JSON and
+  table output without recomputing admission locally.
+- `models explain --endpoint-family` uses management model availability as the
+  canonical projection.
+- `failures explain` keeps route admission denial evidence bounded and does not
+  treat it as current availability.
+- `cargo test --locked route_explain_admission_summary_uses_backend_projection_without_reclassification --`
+  matched 1 test and passed.
+- `cargo test --locked models_explain_management_availability_projection_is_canonical --`
+  matched 1 test and passed.
+- `cargo test --locked failures_explain_preserves_local_admission_denial_evidence_and_upstream_status_boundary --`
+  matched 1 test and passed.
+- `cargo test --locked failures_explain_table_marks_bounded_evidence_not_current_availability --`
+  matched 1 test and passed.
 
 ### Task 7: Release Smoke And Operator Smoke Boundary
 
