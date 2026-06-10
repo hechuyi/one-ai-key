@@ -483,18 +483,31 @@ Task 3 checkpoint evidence:
 - Test: `src/routing.rs`
 - Test: `src/main.rs`
 
-- [ ] Review every mutation that can produce channel hard cooldown, provider
+- [x] Review every mutation that can produce channel hard cooldown, provider
   soft cooldown, degraded state, credential cooldown, credential expiration,
   quota exhaustion, or no-op.
-- [ ] Add a compact transition table in tests: input failure kind/scope/source
+- [x] Add a compact transition table in tests: input failure kind/scope/source
   plus profile context -> expected mutation class and admission hardness.
-- [ ] Fix only proven misclassifications. Do not add a new fallback path to
+- [x] Fix only proven misclassifications. Do not add a new fallback path to
   compensate for an incorrect hard classification.
-- [ ] Prove relay balance/channel-scope contamination remains hard, provider
+- [x] Prove relay balance/channel-scope contamination remains hard, provider
   transient failures remain soft/degraded, credential failures remain scoped to
   the credential unless config says otherwise, and request errors do not mutate
   route availability.
-- [ ] Commit state-transition audit changes.
+- [x] Commit state-transition audit changes.
+
+Task 4 checkpoint evidence:
+
+- `routing::tests::state_transition_characterization_matrix_covers_hard_soft_credential_and_request_scopes`
+  covers credential expiration, credential cooldown, credential quota,
+  upstream relay-balance hard channel cooldown, non-upstream relay-balance
+  no-op, provider/account degraded state, provider/account retry-after soft
+  cooldown, response-filter credential expiration, response-filter hard channel
+  cooldown, key-switch no-op, request/model client-error no-op, and
+  unsupported provider-adapter no-op.
+- No misclassification requiring production code changes was found.
+- `cargo test --locked routing::tests::state_transition_characterization_matrix_covers_hard_soft_credential_and_request_scopes -- --exact`
+  matched 1 test and passed.
 
 ### Task 5: Management Projection And Failure Evidence
 
