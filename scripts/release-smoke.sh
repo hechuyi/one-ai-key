@@ -400,6 +400,55 @@ assert_bounded_evidence() {
   ' "${report_path}" >/dev/null
 }
 
+assert_management_report_envelope() {
+  if [[ "$#" -gt 0 ]]; then
+    :
+  else
+    printf 'error: no management reports were provided for envelope scanning\n' >&2
+    exit 1
+  fi
+  local report
+  for report in "$@"; do
+    if [[ -s "${report}" ]]; then
+      :
+    else
+      printf 'error: management report is missing or empty: %s\n' "${report}" >&2
+      exit 1
+    fi
+    case "${report}" in
+      *.json) ;;
+      *) continue ;;
+    esac
+    if ! jq -e '
+      (type == "object")
+      and ((.status | type) == "string")
+      and (.status | length > 0)
+      and ((.reason | type) == "string")
+      and ((.reason_code | type) == "string")
+      and (.reason_code | length > 0)
+      and ((.side_effect_class | type) == "string")
+      and (.side_effect_class | length > 0)
+      and ((.effect_vector | type) == "object")
+      and ((.effect_vector.reads_local_files | type) == "boolean")
+      and ((.effect_vector.reads_management_runtime | type) == "boolean")
+      and ((.effect_vector.reads_management_store | type) == "boolean")
+      and ((.effect_vector.writes_local_files | type) == "boolean")
+      and ((.effect_vector.writes_management_store | type) == "boolean")
+      and ((.effect_vector.calls_upstream | type) == "boolean")
+      and ((.effect_vector.mutates_runtime | type) == "boolean")
+      and ((.next_action | type) == "object")
+      and ((.next_action.template_id | type) == "string")
+      and (.next_action.template_id | length > 0)
+      and ((.next_action.side_effect_class | type) == "string")
+      and ((.next_action.requires_confirmation | type) == "boolean")
+      and ((.next_action.safe_argv | type) == "array")
+    ' "${report}" >/dev/null; then
+      printf 'error: management report JSON envelope is invalid: %s\n' "${report}" >&2
+      exit 1
+    fi
+  done
+}
+
 assert_expected_management_reports_captured() {
   if [[ "${#MANAGEMENT_REPORTS[@]}" -ne "${#EXPECTED_MANAGEMENT_REPORTS[@]}" ]]; then
     printf 'error: management report list did not match expected captured reports\n' >&2
@@ -1098,6 +1147,7 @@ printf '%s\n' "${NEGATIVE_OUTPUT}" > negative-management-url.txt
 MANAGEMENT_REPORTS+=("negative-management-url.txt")
 
 assert_expected_management_reports_captured
+assert_management_report_envelope "${MANAGEMENT_REPORTS[@]}"
 assert_no_management_report_leaks "${MANAGEMENT_REPORTS[@]}"
 assert_no_legacy_management_report_labels "${MANAGEMENT_REPORTS[@]}"
 

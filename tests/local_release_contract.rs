@@ -714,6 +714,7 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
         "MANAGEMENT_REPORTS=(",
         "EXPECTED_MANAGEMENT_REPORTS=(",
         "assert_expected_management_reports_captured",
+        "assert_management_report_envelope",
         "assert_no_management_report_leaks",
         "LEGACY_MANAGEMENT_REPORT_LABELS=(",
         "assert_no_legacy_management_report_labels",
@@ -790,9 +791,23 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
         "assert_bounded_evidence",
         "bounded_evidence",
         "max_items",
+        "management report JSON envelope is invalid",
+        "reads_local_files",
+        "reads_management_runtime",
+        "reads_management_store",
+        "writes_local_files",
+        "writes_management_store",
+        "calls_upstream",
+        "mutates_runtime",
+        ".next_action.template_id",
+        ".next_action.side_effect_class",
+        ".next_action.requires_confirmation",
+        ".next_action.safe_argv",
+        r#"(.next_action.safe_argv | type) == "array""#,
         ".evidence.candidate_limit >= 0",
         ".evidence.endpoint_family_target_count >= 0",
         ".evidence.preview_candidate_count >= 0",
+        "assert_management_report_envelope \"${MANAGEMENT_REPORTS[@]}\"",
         "assert_no_legacy_management_report_labels \"${MANAGEMENT_REPORTS[@]}\"",
         "from urllib.parse import urlsplit",
         "failed to parse mock upstream event JSONL",
@@ -821,9 +836,16 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
     let legacy_label_scan = script
         .find("assert_no_legacy_management_report_labels \"${MANAGEMENT_REPORTS[@]}\"")
         .expect("release smoke must run legacy management label scan");
+    let envelope_scan = script
+        .find("assert_management_report_envelope \"${MANAGEMENT_REPORTS[@]}\"")
+        .expect("release smoke must run management report envelope scan");
     assert!(
         ordinary_leak_scan < legacy_label_scan,
         "{path} must scan management reports for ordinary leaks before legacy phase labels"
+    );
+    assert!(
+        envelope_scan < ordinary_leak_scan,
+        "{path} must validate management report envelopes before leak scans"
     );
 }
 
