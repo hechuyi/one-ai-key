@@ -20,7 +20,11 @@ non_empty_filtered_test_evidence: `pass: release_smoke_script_covers_local_admis
 
 local_ci_result: `pass: CARGO_TARGET_DIR outside the repository, scripts/local-ci.sh exit 0`
 
-release_artifact_result: `not_run_by_design: this is a source capability checkpoint; no release tarball or GitHub Release asset was produced in this M3 closure. Full release smoke remains the release-gate action after a fresh release artifact is built from the current source`
+release_artifact_result: `pass: package version bumped to 0.1.12; scripts/build-release-x86_64-linux-docker.sh exited 0; dist/one-ai-key-0.1.12-x86_64-unknown-linux-gnu.tar.gz and matching .sha256 were produced from current source; sidecar contains archive basename only; checksum verifies; tarball contains only one-ai-key`
+
+release_smoke_result: `pass: scripts/release-smoke.sh exited 0 against the freshly built 0.1.12 release artifact; smoke verified checksum, extracted binary execution, generated local config, authenticated /v1/models, one model-bearing request, operator reports, model publication workflow, redacted management reports, selected-upstream 503 evidence, local no-route admission 503 evidence, and client /v1 URL rejection for management-url misuse`
+
+artifact_sha: `12f181ba1d4c5b0c95c6550bf927a9840e9a53e5da6734a925fd105b2e2a3038`
 
 redaction_and_denylist_result: `pass: git diff --check exited 0; executable staged-path denylist exited 0; staged files are limited to README, docs, source, and tests and exclude dist/, target/, key-pool-router/, config/, data/, SQLite, logs, keys, raw fixtures, private scripts, and AGENTS.md`
 
