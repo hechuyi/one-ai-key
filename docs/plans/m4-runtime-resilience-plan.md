@@ -448,15 +448,30 @@ Task 2 checkpoint evidence:
 - Modify: `src/proxy.rs`
 - Test: `src/main.rs`
 
-- [ ] Replace duplicated local blocker reasoning in proxy with the shared
+- [x] Replace duplicated local blocker reasoning in proxy with the shared
   admission result or shared summary where feasible.
-- [ ] Audit `route_state_unavailable_response_for_attempt` so it does not
+- [x] Audit `route_state_unavailable_response_for_attempt` so it does not
   reject a legitimate provider-cooling last-resort selected by the route plan.
-- [ ] Preserve frozen fallback behavior when a later target remains.
-- [ ] Prove hard blockers cause zero upstream hits when no frozen target can be
+- [x] Preserve frozen fallback behavior when a later target remains.
+- [x] Prove hard blockers cause zero upstream hits when no frozen target can be
   used.
-- [ ] Prove M3 attempt budget does not increase.
-- [ ] Commit proxy alignment.
+- [x] Prove M3 attempt budget does not increase.
+- [x] Commit proxy alignment.
+
+Task 3 checkpoint evidence:
+
+- Proxy admission telemetry now uses the route-plan hard/soft reason helpers
+  instead of local duplicated taxonomy functions.
+- `cargo test --locked proxy::tests::attempt_gate --` matched 3 tests and
+  passed.
+- `cargo test --locked explicit_model_route_all_channel_cooldown_returns_no_route_candidate`
+  matched 1 test and passed.
+- `cargo test --locked provider_cooling_route_with_no_available_credentials_fails_without_upstream_hit`
+  matched 1 test and passed.
+- `cargo test --locked frozen_route_fallback_skips_attempt_time_provider_cooling_when_better_target_remains`
+  matched 1 test and passed.
+- `cargo test --locked --test pre_output_stability_boundary_contract stage1_task5_m3_retry_non_expansion_contract_is_explicit -- --exact`
+  matched 1 test and passed.
 
 ### Task 4: State Transition Hard/Soft Audit
 
