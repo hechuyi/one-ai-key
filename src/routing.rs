@@ -943,6 +943,258 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ExpectedMutation {
+        Noop(FailureReason),
+        CredentialCooldown(FailureReason, std::time::Duration),
+        CredentialExpired(FailureReason),
+        CredentialQuota(FailureReason),
+        RelayBalanceChannelCooldown(FailureReason, std::time::Duration),
+        ProviderAccountSoftState(FailureReason, Option<std::time::Duration>),
+        ChannelCooldown(FailureReason, std::time::Duration),
+    }
+
+    fn assert_expected_mutation(
+        case_name: &str,
+        mutation: &StateMutation,
+        snapshot: &RequestSelectionSnapshot,
+        now: std::time::Instant,
+        expected: ExpectedMutation,
+    ) {
+        match expected {
+            ExpectedMutation::Noop(expected_reason) => {
+                assert_eq!(
+                    mutation,
+                    &StateMutation::Noop {
+                        reason: expected_reason
+                    },
+                    "{case_name}"
+                );
+            }
+            ExpectedMutation::CredentialCooldown(expected_reason, expected_cooldown) => {
+                assert_eq!(
+                    mutation,
+                    &StateMutation::MarkCredentialCoolingDown {
+                        channel_id: snapshot.channel_id.clone(),
+                        credential_id: snapshot.credential_id.clone(),
+                        until: now + expected_cooldown,
+                        reason: expected_reason,
+                    },
+                    "{case_name}"
+                );
+            }
+            ExpectedMutation::CredentialExpired(expected_reason) => {
+                assert_eq!(
+                    mutation,
+                    &StateMutation::ExpireCredential {
+                        channel_id: snapshot.channel_id.clone(),
+                        credential_id: snapshot.credential_id.clone(),
+                        reason: expected_reason,
+                    },
+                    "{case_name}"
+                );
+            }
+            ExpectedMutation::CredentialQuota(expected_reason) => {
+                assert_eq!(
+                    mutation,
+                    &StateMutation::MarkCredentialQuotaExhausted {
+                        channel_id: snapshot.channel_id.clone(),
+                        credential_id: snapshot.credential_id.clone(),
+                        reason: expected_reason,
+                    },
+                    "{case_name}"
+                );
+            }
+            ExpectedMutation::RelayBalanceChannelCooldown(expected_reason, expected_cooldown) => {
+                assert_eq!(
+                    mutation,
+                    &StateMutation::MarkRelayBalanceChannelCoolingDown {
+                        channel_id: snapshot.channel_id.clone(),
+                        until: now + expected_cooldown,
+                        reason: expected_reason,
+                    },
+                    "{case_name}"
+                );
+            }
+            ExpectedMutation::ProviderAccountSoftState(expected_reason, expected_cooldown) => {
+                assert_eq!(
+                    mutation,
+                    &StateMutation::MarkProviderAccountChannelCoolingDownOrDegraded {
+                        channel_id: snapshot.channel_id.clone(),
+                        provider_id: snapshot.provider_id.clone(),
+                        account_id: snapshot.account_id.clone(),
+                        until: expected_cooldown.map(|cooldown| now + cooldown),
+                        reason: expected_reason,
+                    },
+                    "{case_name}"
+                );
+            }
+            ExpectedMutation::ChannelCooldown(expected_reason, expected_cooldown) => {
+                assert_eq!(
+                    mutation,
+                    &StateMutation::MarkChannelCoolingDown {
+                        channel_id: snapshot.channel_id.clone(),
+                        until: now + expected_cooldown,
+                        reason: expected_reason,
+                    },
+                    "{case_name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn state_transition_characterization_matrix_covers_hard_soft_credential_and_request_scopes() {
+        let mut pool = pool();
+        let selected = pool.select().unwrap();
+        let snapshot = snapshot_for(&selected);
+        let now = std::time::Instant::now();
+        let policy = policy();
+        let credential_cooldown = std::time::Duration::from_secs(7);
+        let relay_cooldown = std::time::Duration::from_secs(13);
+        let provider_cooldown = std::time::Duration::from_secs(17);
+
+        struct Case {
+            name: &'static str,
+            failure: ClassifiedFailure,
+            source: FailureSource,
+            expected: ExpectedMutation,
+        }
+
+        let cases = vec![
+            Case {
+                name: "auth invalid expires credential",
+                failure: failure(FailureKind::AuthInvalid, FailureScope::Credential),
+                source: FailureSource::UpstreamTransaction,
+                expected: ExpectedMutation::CredentialExpired(FailureReason::UpstreamAuthInvalid),
+            },
+            Case {
+                name: "credential rate limit cools only credential",
+                failure: failure_with_cooldown(
+                    FailureKind::RateLimited,
+                    FailureScope::Credential,
+                    credential_cooldown,
+                ),
+                source: FailureSource::UpstreamTransaction,
+                expected: ExpectedMutation::CredentialCooldown(
+                    FailureReason::UpstreamRateLimited,
+                    credential_cooldown,
+                ),
+            },
+            Case {
+                name: "credential quota exhaustion marks credential quota",
+                failure: failure(FailureKind::QuotaExhausted, FailureScope::Credential),
+                source: FailureSource::UpstreamTransaction,
+                expected: ExpectedMutation::CredentialQuota(FailureReason::UpstreamQuotaExhausted),
+            },
+            Case {
+                name: "upstream relay balance unavailable is hard channel cooldown",
+                failure: failure_with_cooldown(
+                    FailureKind::RelayBalanceUnavailable,
+                    FailureScope::Channel,
+                    relay_cooldown,
+                ),
+                source: FailureSource::UpstreamTransaction,
+                expected: ExpectedMutation::RelayBalanceChannelCooldown(
+                    FailureReason::RelayBalanceUnavailable,
+                    relay_cooldown,
+                ),
+            },
+            Case {
+                name: "non-upstream relay balance evidence is request-scoped noop",
+                failure: failure_with_cooldown(
+                    FailureKind::RelayBalanceUnavailable,
+                    FailureScope::Channel,
+                    relay_cooldown,
+                ),
+                source: FailureSource::ResponseFilterPrecommit,
+                expected: ExpectedMutation::Noop(FailureReason::RelayBalanceUnavailable),
+            },
+            Case {
+                name: "provider unavailable without retry-after is soft degraded state",
+                failure: failure(FailureKind::ProviderUnavailable, FailureScope::Channel),
+                source: FailureSource::UpstreamTransaction,
+                expected: ExpectedMutation::ProviderAccountSoftState(
+                    FailureReason::UpstreamProviderUnavailable,
+                    None,
+                ),
+            },
+            Case {
+                name: "provider unavailable with retry-after is provider-account soft cooldown",
+                failure: failure_with_cooldown(
+                    FailureKind::ProviderUnavailable,
+                    FailureScope::Channel,
+                    provider_cooldown,
+                ),
+                source: FailureSource::UpstreamTransaction,
+                expected: ExpectedMutation::ProviderAccountSoftState(
+                    FailureReason::UpstreamProviderUnavailable,
+                    Some(provider_cooldown),
+                ),
+            },
+            Case {
+                name: "response filter credential rejection expires only credential",
+                failure: failure(
+                    FailureKind::ResponseFilterRejected,
+                    FailureScope::Credential,
+                ),
+                source: FailureSource::ResponseFilterPrecommit,
+                expected: ExpectedMutation::CredentialExpired(
+                    FailureReason::ResponseFilterRejected,
+                ),
+            },
+            Case {
+                name: "response filter channel rejection is hard channel cooldown",
+                failure: failure(FailureKind::ResponseFilterRejected, FailureScope::Channel),
+                source: FailureSource::ResponseFilterPrecommit,
+                expected: ExpectedMutation::ChannelCooldown(
+                    FailureReason::ResponseFilterRejected,
+                    policy.default_credential_cooldown,
+                ),
+            },
+            Case {
+                name: "key switch cooldown does not mutate route availability",
+                failure: failure(FailureKind::KeySwitchCooldown, FailureScope::Credential),
+                source: FailureSource::UpstreamTransaction,
+                expected: ExpectedMutation::Noop(FailureReason::KeySwitchCooldown),
+            },
+            Case {
+                name: "request client error is no-op",
+                failure: failure(FailureKind::ClientError, FailureScope::RequestOnly),
+                source: FailureSource::UpstreamTransaction,
+                expected: ExpectedMutation::Noop(FailureReason::ClientOrModelError),
+            },
+            Case {
+                name: "model-group client error is no-op",
+                failure: failure(FailureKind::ClientError, FailureScope::ModelGroup),
+                source: FailureSource::UpstreamTransaction,
+                expected: ExpectedMutation::Noop(FailureReason::ClientOrModelError),
+            },
+            Case {
+                name: "provider-adapter failure remains unsupported no-op mutation",
+                failure: failure(
+                    FailureKind::ProviderUnavailable,
+                    FailureScope::ProviderAdapter,
+                ),
+                source: FailureSource::UpstreamTransaction,
+                expected: ExpectedMutation::Noop(FailureReason::Unknown),
+            },
+        ];
+
+        for case in cases {
+            let result = transition_after_failure(TransitionInput {
+                snapshot: &snapshot,
+                failure: case.failure,
+                failure_source: case.source,
+                now,
+                next_attempt_budget: Some(std::time::Duration::from_millis(50)),
+                policy,
+            });
+
+            assert_expected_mutation(case.name, &result.mutation, &snapshot, now, case.expected);
+        }
+    }
+
     #[test]
     fn auth_invalid_credential_expires_only_selected_credential() {
         let mut pool = pool();

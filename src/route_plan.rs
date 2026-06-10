@@ -485,6 +485,18 @@ mod tests {
     }
 
     #[test]
+    fn route_preview_last_resort_reasons_have_stable_codes() {
+        assert_eq!(
+            RoutePreviewReason::DegradedLastResort.as_str(),
+            "degraded_last_resort"
+        );
+        assert_eq!(
+            RoutePreviewReason::ProviderCoolingDownLastResort.as_str(),
+            "provider_cooling_down_last_resort"
+        );
+    }
+
+    #[test]
     fn route_admission_taxonomy_prefers_available_over_degraded_and_provider_account_cooling() {
         let route = route_with_targets(vec![
             ("provider-account-cooling", 0, 1),
@@ -530,6 +542,48 @@ mod tests {
         assert!(preview.candidates[2].included);
         assert!(preview.candidates[2].selected);
         assert!(preview.candidates[2].reasons.is_empty());
+    }
+
+    #[test]
+    fn plan_route_prefers_available_over_degraded_and_provider_account_cooling() {
+        let route = route_with_targets(vec![
+            ("provider-account-cooling", 0, 1),
+            ("degraded", 1, 1),
+            ("available", 2, 1),
+        ]);
+        let states = HashMap::from([
+            (
+                ChannelId("provider-account-cooling".to_string()),
+                ChannelRouteState::ProviderCoolingDown,
+            ),
+            (
+                ChannelId("degraded".to_string()),
+                ChannelRouteState::Degraded,
+            ),
+            (
+                ChannelId("available".to_string()),
+                ChannelRouteState::Available,
+            ),
+        ]);
+
+        let plan = plan_route(RoutePlanInput {
+            request_id: "req-plan-taxonomy".to_string(),
+            registry_generation: 1,
+            public_model: Some("gpt-x".to_string()),
+            route: Some(&route),
+            channel_states: &states,
+            allowed_channels: &[],
+            candidate_limit: 16,
+        })
+        .expect("available route target should be selected");
+
+        assert_eq!(plan.selected_index, 0);
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].target_index, 2);
+        assert_eq!(
+            plan.targets[0].channel_id,
+            ChannelId("available".to_string())
+        );
     }
 
     #[test]

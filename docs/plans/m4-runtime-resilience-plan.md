@@ -367,21 +367,42 @@ dependency.
 - Test: `src/main.rs`
 - Modify only if needed for test helpers.
 
-- [ ] Add targeted tests proving current candidate ordering:
+- [x] Add targeted tests proving current candidate ordering:
   `available > degraded > provider-cooling`.
-- [ ] Add tests proving all-provider-cooling otherwise-valid routes are
+- [x] Add tests proving all-provider-cooling otherwise-valid routes are
   included as last resort.
-- [ ] Add tests proving hard blockers are excluded and produce stable reasons.
-- [ ] Add runtime tests for proxy secondary gate behavior:
+- [x] Add tests proving hard blockers are excluded and produce stable reasons.
+- [x] Add runtime tests for proxy secondary gate behavior:
   provider-cooling last resort is attempted when selected by the route plan,
   but skipped when a better frozen target remains.
-- [ ] Add state-transition characterization tests for hard channel cooldown,
+- [x] Add state-transition characterization tests for hard channel cooldown,
   provider/account soft cooldown, degraded state, credential cooldown,
   credential quota exhaustion, and request-scoped no-op failures.
-- [ ] Prove every characterization filter matches non-zero tests before using
+- [x] Prove every characterization filter matches non-zero tests before using
   it as evidence.
-- [ ] Run the targeted tests and confirm each filter matches non-zero tests.
-- [ ] Commit characterization tests.
+- [x] Run the targeted tests and confirm each filter matches non-zero tests.
+- [x] Commit characterization tests.
+
+Task 1 checkpoint evidence:
+
+- `cargo test --locked route_plan::tests::route_preview_last_resort_reasons_have_stable_codes -- --exact`
+  matched 1 test and passed.
+- `cargo test --locked route_plan::tests::plan_route_prefers_available_over_degraded_and_provider_account_cooling -- --exact`
+  matched 1 test and passed.
+- `cargo test --locked route_plan::tests::provider_account_soft_cooling_is_last_resort_when_no_better_soft_tier_exists -- --exact`
+  matched 1 test and passed.
+- `cargo test --locked route_plan::tests::hard_blockers_fail_closed_and_never_become_last_resort -- --exact`
+  matched 1 test and passed.
+- `cargo test --locked proxy::tests::attempt_gate --` matched 3 tests and
+  passed.
+- `cargo test --locked routing::tests::state_transition_characterization_matrix_covers_hard_soft_credential_and_request_scopes -- --exact`
+  matched 1 test and passed.
+- `cargo test --locked provider_cooling_down_selected_target_is_not_rejected_when_fallback_exists`
+  matched 1 test and passed.
+- `cargo test --locked frozen_route_fallback_skips_attempt_time_provider_cooling_when_better_target_remains`
+  matched 1 test and passed.
+- `cargo test --locked provider_cooling_route_with_no_available_credentials_fails_without_upstream_hit`
+  matched 1 test and passed.
 
 ### Task 2: Shared Admission Summary
 

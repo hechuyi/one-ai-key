@@ -1808,6 +1808,47 @@ mod tests {
     };
 
     #[test]
+    fn attempt_gate_allows_frozen_provider_cooling_last_resort() {
+        assert!(
+            route_state_unavailable_response_for_attempt(
+                "soft-last-resort",
+                ChannelRouteState::ProviderCoolingDown,
+                ChannelRouteState::ProviderCoolingDown,
+                true,
+            )
+            .is_none(),
+            "a provider/account soft-cooling target selected by the frozen route plan is a legitimate last-resort first attempt"
+        );
+    }
+
+    #[test]
+    fn attempt_gate_skips_new_provider_cooling_when_better_frozen_target_remains() {
+        let response = route_state_unavailable_response_for_attempt(
+            "soft-now",
+            ChannelRouteState::ProviderCoolingDown,
+            ChannelRouteState::Available,
+            true,
+        )
+        .expect("new attempt-time provider cooling should fall through to later frozen targets");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn attempt_gate_allows_new_provider_cooling_when_no_better_frozen_target_remains() {
+        assert!(
+            route_state_unavailable_response_for_attempt(
+                "final-soft-target",
+                ChannelRouteState::ProviderCoolingDown,
+                ChannelRouteState::Available,
+                false,
+            )
+            .is_none(),
+            "attempt-time provider cooling is not a local admission denial when no later frozen route target remains"
+        );
+    }
+
+    #[test]
     fn record_response_filter_event_to_buffer_records_when_lock_available() {
         let events = Arc::new(Mutex::new(ResponseFilterEventBuffer::new(2)));
         let external_dropped = Arc::new(AtomicU64::new(0));
