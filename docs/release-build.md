@@ -153,7 +153,14 @@ The staged-path denylist is executable evidence. Human inspection of
 `git diff --cached --name-only` is only accepted after
 `scripts/check-staged-denylist.sh` exits 0. The gate rejects repository-local
 build output, runtime state, local config, database/log/key/token material,
-private scripts, `key-pool-router/`, and `AGENTS.md`.
+private scripts, `key-pool-router/`, and `AGENTS.md`. It also scans newly
+staged text for internal execution traces, long-form secret material, and
+promotional/injection residue. Product roadmaps, RFCs, ADRs, public stop cards,
+architecture notes, and operator documentation may be committed when they are
+written as durable user or contributor documentation. Private coordination
+notes, one-off support records, deployment-local facts, raw traces, and
+assistant/process transcripts stay local and must be reduced into a public
+contract before they enter the repository.
 
 Local `config/`, `data/`, `db/`, `logs/`, `dist/`, `target/`, and deployment
 state directories are operational or build outputs. Keep them ignored and out of
