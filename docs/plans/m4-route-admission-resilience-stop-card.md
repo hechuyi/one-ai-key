@@ -38,11 +38,11 @@ non_empty_filtered_test_evidence: `pass: all recorded filtered cargo commands ma
 
 local_ci_result: `pass: CARGO_TARGET_DIR=/tmp/one-ai-key-cargo-target scripts/local-ci.sh exited 0 after Task 8 documentation edits; reported 1152 unit tests, 16 local_release_contract tests, and 5 pre_output_stability_boundary_contract tests passing`
 
-release_artifact_result: `pass: scripts/build-release-x86_64-linux-docker.sh exited 0; dist/one-ai-key-0.1.12-x86_64-unknown-linux-gnu.tar.gz and matching .sha256 were produced from current source; checksum sidecar contains the archive basename only; checksum verifies; tarball contains only one-ai-key`
+release_artifact_result: `pass: package version bumped to 0.1.13; scripts/build-release-x86_64-linux-docker.sh exited 0; dist/one-ai-key-0.1.13-x86_64-unknown-linux-gnu.tar.gz and matching .sha256 were produced from current source; checksum sidecar contains the archive basename only; checksum verifies; tarball contains only one-ai-key`
 
-release_smoke_result: `pass: scripts/release-smoke.sh exited 0 against the freshly built 0.1.12 release artifact; smoke verified checksum, extracted binary execution, generated local config, authenticated /v1/models, model-bearing client requests, operator reports, model publication workflow, redacted management reports, selected-upstream 503 evidence, local no-route admission 503 evidence, provider/account soft-cooling last-resort behavior, and client /v1 URL rejection for management-url misuse`
+release_smoke_result: `pass: scripts/release-smoke.sh exited 0 against the freshly built 0.1.13 release artifact; smoke verified checksum, extracted binary execution, generated local config, authenticated /v1/models, model-bearing client requests, operator reports, model publication workflow, redacted management reports, selected-upstream 503 evidence, local no-route admission 503 evidence, provider/account soft-cooling last-resort behavior, and client /v1 URL rejection for management-url misuse`
 
-artifact_sha: `5d09ed34a66b63835b5d94737c9a4c39f931f1745d1c4dda197ccc84f0232d78`
+artifact_sha: `988f26043fabad52fb1ca34c05e8fdc14847e608b69a184d8bec017422de0065`
 
 production_smoke_result: `not_run_by_design: production smoke is an operator-run deployment check, not a source release dependency; no production host, DNS, token rotation, or systemd/NixOS mutation is part of this source closure`
 
