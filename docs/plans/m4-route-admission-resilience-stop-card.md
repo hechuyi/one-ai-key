@@ -38,9 +38,11 @@ non_empty_filtered_test_evidence: `pass: all recorded filtered cargo commands ma
 
 local_ci_result: `pass: CARGO_TARGET_DIR=/tmp/one-ai-key-cargo-target scripts/local-ci.sh exited 0 after Task 8 documentation edits; reported 1152 unit tests, 16 local_release_contract tests, and 5 pre_output_stability_boundary_contract tests passing`
 
-release_artifact_result: `not_run_yet: source closure stop card was created before running scripts/build-release-x86_64-linux-docker.sh for the final M4 release gate`
+release_artifact_result: `pass: scripts/build-release-x86_64-linux-docker.sh exited 0; dist/one-ai-key-0.1.12-x86_64-unknown-linux-gnu.tar.gz and matching .sha256 were produced from current source; checksum sidecar contains the archive basename only; checksum verifies; tarball contains only one-ai-key`
 
-release_smoke_result: `not_run_yet: extracted-artifact scripts/release-smoke.sh has not yet been run for the final M4 release artifact`
+release_smoke_result: `pass: scripts/release-smoke.sh exited 0 against the freshly built 0.1.12 release artifact; smoke verified checksum, extracted binary execution, generated local config, authenticated /v1/models, model-bearing client requests, operator reports, model publication workflow, redacted management reports, selected-upstream 503 evidence, local no-route admission 503 evidence, provider/account soft-cooling last-resort behavior, and client /v1 URL rejection for management-url misuse`
+
+artifact_sha: `5d09ed34a66b63835b5d94737c9a4c39f931f1745d1c4dda197ccc84f0232d78`
 
 production_smoke_result: `not_run_by_design: production smoke is an operator-run deployment check, not a source release dependency; no production host, DNS, token rotation, or systemd/NixOS mutation is part of this source closure`
 
@@ -52,6 +54,6 @@ support_residue_scan_result: `pass: changed public docs and plan text use stable
 
 deployment_boundary_result: `not_run_by_design: deployment hosts consume published release artifacts; no remote deployment mutation is included in M4 source closure`
 
-known_blockers: `release artifact build and extracted-artifact release smoke still need to run before full M4 release closure`
+known_blockers: `none for M4 source and release artifact closure`
 
 next_version_candidates: `route/app boundary extraction; config resolver/compiler extraction; endpoint-family compatibility plan; optional manual probe UX; operational diagnosis improvements that remain read-only and do not add request-path storage joins`
