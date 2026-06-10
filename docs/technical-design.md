@@ -281,6 +281,23 @@ Manual or configured disablement remains authoritative. Automatic cooldown
 expiry or success recovery must not re-enable disabled providers, accounts,
 channels, or credentials.
 
+Route admission uses four state categories. Hard route states fail closed before
+touching an upstream: configured disablement, hard channel cooldown, no
+available credentials, runtime-unavailable state, unknown channels, scope
+denial, missing routes, and candidate-limit exclusion. Soft route states are
+admission suppressions rather than hard blockers: degraded health and
+provider/account soft cooldown can be selected only as last resort after better
+candidates are removed. Credential states affect only credential lifecycle
+selection unless configuration explicitly scopes the evidence wider. Request
+scoped failures such as schema errors, endpoint-family mismatch, model/scope
+errors, or generic client errors do not mutate route availability.
+
+The route-admission resilience work does not add public YAML fields and does
+not broaden retry, streaming behavior, endpoint-family fallback,
+Responses-to-Chat conversion, or live model discovery. It only clarifies how
+existing compiled route state is admitted and how that decision is projected to
+management and CLI surfaces.
+
 ## Relay Error Semantics
 
 Relay behavior must be represented with typed structured evidence:

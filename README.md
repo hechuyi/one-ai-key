@@ -243,6 +243,14 @@ Default routing behavior is conservative:
 - duplicate-charge risk is recorded as telemetry when retrying after an upstream
   transaction whose charge status cannot be proven.
 
+`no_route_candidate` is a local admission failure, not an upstream response. It
+means the compiled runtime found no usable candidate after model scope, channel
+scope, configured enablement, hard channel cooldown, credential availability,
+and candidate-limit checks. Provider/account soft cooldown is intentionally
+different: it is skipped while better candidates remain, but it may be selected
+as a last-resort first upstream attempt when it is the only otherwise valid
+route state.
+
 Relay behavior is configured through structured evidence. The built-in
 `relay_profile` values are `official_openai`, `generic_relay`, and
 `untrusted_relay`. `balance_scope: credential` treats structured quota evidence

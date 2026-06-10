@@ -473,6 +473,16 @@ set state, and any provider/account cooldown evidence. Use read-only explain
 commands or management explain endpoints; do not expose the raw client token
 used by the failing caller.
 
+Treat hard blockers and soft suppressions differently. Hard blockers include
+missing routes, scope denial, disabled targets or channels, hard channel
+cooldown, empty credential pools, runtime-unavailable state, unknown channels,
+and route candidate-limit exclusion. Provider/account `Retry-After` cooldown is
+a soft suppression: normal and degraded targets are preferred first, but a
+provider-cooling target can still be attempted as the last-resort route state.
+Credential cooldown, credential expiration, and credential quota exhaustion are
+credential lifecycle states; request-only schema, endpoint-family, model-scope,
+or client-error failures should not mutate route availability.
+
 If a model was recently discovered or staged, confirm that sync apply and runtime
 reload actually happened. Discovery alone does not make a model visible to
 client traffic.
