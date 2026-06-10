@@ -44,6 +44,8 @@ release_smoke_result: `pass: scripts/release-smoke.sh exited 0 against the fresh
 
 artifact_sha: `988f26043fabad52fb1ca34c05e8fdc14847e608b69a184d8bec017422de0065`
 
+published_asset_verification: `pass: GitHub Release v0.1.13 was created at https://github.com/hechuyi/one-ai-key/releases/tag/v0.1.13; uploaded tarball and .sha256 assets were downloaded through the configured local proxy into a tempdir; checksum verified from the uploaded .sha256 sidecar; tarball contains only one-ai-key; release is not draft or prerelease`
+
 production_smoke_result: `not_run_by_design: production smoke is an operator-run deployment check, not a source release dependency; no production host, DNS, token rotation, or systemd/NixOS mutation is part of this source closure`
 
 redaction_and_denylist_result: `pass: git diff --check exited 0; scripts/check-staged-denylist.sh exited 0; staged files must remain limited to public docs and tracked source/test changes and exclude dist/, target/, key-pool-router/, config/, data/, SQLite, logs, keys, raw production fixtures, private scripts, and AGENTS.md`
