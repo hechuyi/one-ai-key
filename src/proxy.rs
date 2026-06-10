@@ -413,12 +413,7 @@ fn route_plan_for_openai_request(
             record_route_admission_denied(
                 state,
                 &preview,
-                endpoint,
-                Some(client_token_ref),
-                "explicit_model",
-                "no_route_candidate",
-                "route",
-                StatusCode::SERVICE_UNAVAILABLE,
+                no_route_candidate_denial(endpoint, Some(client_token_ref), "explicit_model"),
             );
             return Err(Box::new(no_route_candidate_response(&[
                 "channel_cooling_down",
@@ -429,12 +424,7 @@ fn route_plan_for_openai_request(
             record_route_admission_denied(
                 state,
                 &preview,
-                endpoint,
-                Some(client_token_ref),
-                "explicit_model",
-                "no_route_candidate",
-                "route",
-                StatusCode::SERVICE_UNAVAILABLE,
+                no_route_candidate_denial(endpoint, Some(client_token_ref), "explicit_model"),
             );
             return Err(Box::new(no_route_candidate_response(&reason_codes)));
         }
@@ -467,13 +457,8 @@ fn route_plan_for_openai_request(
             state,
             request_id,
             route_context.registry_generation,
-            endpoint,
+            no_route_candidate_denial(endpoint, Some(client_token_ref), "default_channel"),
             model,
-            Some(client_token_ref),
-            "default_channel",
-            "no_route_candidate",
-            "route",
-            StatusCode::SERVICE_UNAVAILABLE,
             &["channel_cooling_down"],
         );
         return Err(Box::new(no_route_candidate_response(&[
@@ -491,15 +476,34 @@ fn route_plan_for_openai_request(
     ))
 }
 
+struct RouteAdmissionDenial<'a> {
+    endpoint: EndpointKind,
+    client_token_ref: Option<&'a str>,
+    route_kind: &'a str,
+    reason_code: &'a str,
+    blocking_domain: &'a str,
+    client_visible_status: StatusCode,
+}
+
+fn no_route_candidate_denial<'a>(
+    endpoint: EndpointKind,
+    client_token_ref: Option<&'a str>,
+    route_kind: &'a str,
+) -> RouteAdmissionDenial<'a> {
+    RouteAdmissionDenial {
+        endpoint,
+        client_token_ref,
+        route_kind,
+        reason_code: "no_route_candidate",
+        blocking_domain: "route",
+        client_visible_status: StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
 fn record_route_admission_denied(
     state: &AppState,
     preview: &RoutePreview,
-    endpoint: EndpointKind,
-    client_token_ref: Option<&str>,
-    route_kind: &str,
-    reason_code: &str,
-    blocking_domain: &str,
-    client_visible_status: StatusCode,
+    denial: RouteAdmissionDenial<'_>,
 ) {
     let (hard_reason_codes, soft_reason_codes) = admission_reason_codes(preview);
     record_routing_telemetry(
@@ -507,13 +511,13 @@ fn record_route_admission_denied(
         RoutingTelemetry::RouteAdmissionDenied {
             request_id: preview.request_id.clone(),
             registry_generation: preview.registry_generation,
-            endpoint_family: endpoint_family_code(endpoint).to_string(),
+            endpoint_family: endpoint_family_code(denial.endpoint).to_string(),
             public_model: preview.public_model.clone(),
-            client_token_ref: client_token_ref.map(ToOwned::to_owned),
-            route_kind: route_kind.to_string(),
-            reason_code: reason_code.to_string(),
-            blocking_domain: blocking_domain.to_string(),
-            client_visible_status: client_visible_status.as_u16(),
+            client_token_ref: denial.client_token_ref.map(ToOwned::to_owned),
+            route_kind: denial.route_kind.to_string(),
+            reason_code: denial.reason_code.to_string(),
+            blocking_domain: denial.blocking_domain.to_string(),
+            client_visible_status: denial.client_visible_status.as_u16(),
             upstream_status: None,
             candidate_count: preview.candidates.len(),
             included_count: preview
@@ -544,18 +548,12 @@ fn record_route_admission_denied(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 fn record_single_route_admission_denied(
     state: &AppState,
     request_id: &str,
     registry_generation: u64,
-    endpoint: EndpointKind,
+    denial: RouteAdmissionDenial<'_>,
     public_model: Option<&str>,
-    client_token_ref: Option<&str>,
-    route_kind: &str,
-    reason_code: &str,
-    blocking_domain: &str,
-    client_visible_status: StatusCode,
     hard_reason_codes: &[&str],
 ) {
     record_routing_telemetry(
@@ -563,13 +561,13 @@ fn record_single_route_admission_denied(
         RoutingTelemetry::RouteAdmissionDenied {
             request_id: request_id.to_string(),
             registry_generation,
-            endpoint_family: endpoint_family_code(endpoint).to_string(),
+            endpoint_family: endpoint_family_code(denial.endpoint).to_string(),
             public_model: public_model.map(ToOwned::to_owned),
-            client_token_ref: client_token_ref.map(ToOwned::to_owned),
-            route_kind: route_kind.to_string(),
-            reason_code: reason_code.to_string(),
-            blocking_domain: blocking_domain.to_string(),
-            client_visible_status: client_visible_status.as_u16(),
+            client_token_ref: denial.client_token_ref.map(ToOwned::to_owned),
+            route_kind: denial.route_kind.to_string(),
+            reason_code: denial.reason_code.to_string(),
+            blocking_domain: denial.blocking_domain.to_string(),
+            client_visible_status: denial.client_visible_status.as_u16(),
             upstream_status: None,
             candidate_count: 1,
             included_count: 0,
@@ -751,13 +749,12 @@ pub async fn proxy_named_pool(
             &state,
             &request_id,
             route_context.registry_generation,
-            preliminary_context.endpoint,
+            no_route_candidate_denial(
+                preliminary_context.endpoint,
+                Some(&client.id),
+                "named_channel",
+            ),
             preliminary_context.requested_model.as_deref(),
-            Some(&client.id),
-            "named_channel",
-            "no_route_candidate",
-            "route",
-            StatusCode::SERVICE_UNAVAILABLE,
             &["channel_cooling_down"],
         );
         return no_route_candidate_response(&["channel_cooling_down"]);
