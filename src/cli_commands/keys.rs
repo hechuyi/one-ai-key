@@ -769,6 +769,7 @@ fn render_keys_disable_apply_report(options: &KeysDisableOptions, response: &Val
         }),
         serde_json::json!({
             "summary": "Review credential-set serving state after disabling the credential.",
+            "template_id": "keys_stats",
             "safe_argv": keys_stats_argv(Some(&options.credential_set_id), true),
             "side_effect_class": "runtime_readonly",
             "requires_confirmation": false,
@@ -847,6 +848,7 @@ fn render_keys_restore_apply_report(options: &KeysRestoreOptions, response: &Val
         }),
         serde_json::json!({
             "summary": "Review credential-set serving state after restoring the credential.",
+            "template_id": "keys_stats",
             "safe_argv": keys_stats_argv(Some(&options.credential_set_id), true),
             "side_effect_class": "runtime_readonly",
             "requires_confirmation": false,
@@ -944,6 +946,7 @@ fn keys_restore_effect_for_mode(mode: KeysRestoreMode) -> crate::cli_effects::Co
 fn keys_disable_next_action(options: &KeysDisableOptions) -> Value {
     serde_json::json!({
         "summary": "Re-run with explicit confirmation to disable this single credential.",
+        "template_id": "keys_disable_apply",
         "safe_argv": keys_disable_apply_argv(options),
         "side_effect_class": "management_write",
         "requires_confirmation": true,
@@ -955,6 +958,7 @@ fn keys_disable_next_action(options: &KeysDisableOptions) -> Value {
 fn keys_disable_blocked_next_action(summary: &str) -> Value {
     serde_json::json!({
         "summary": summary,
+        "template_id": "no_action_required",
         "safe_argv": Value::Null,
         "side_effect_class": Value::Null,
         "requires_confirmation": false,
@@ -989,6 +993,7 @@ fn keys_disable_apply_argv(options: &KeysDisableOptions) -> Value {
 fn keys_restore_next_action(options: &KeysRestoreOptions) -> Value {
     serde_json::json!({
         "summary": "Re-run with explicit confirmation to restore this single credential.",
+        "template_id": "keys_restore_apply",
         "safe_argv": keys_restore_apply_argv(options),
         "side_effect_class": "management_write",
         "requires_confirmation": true,
@@ -1000,6 +1005,7 @@ fn keys_restore_next_action(options: &KeysRestoreOptions) -> Value {
 fn keys_restore_blocked_next_action(summary: &str) -> Value {
     serde_json::json!({
         "summary": summary,
+        "template_id": "no_action_required",
         "safe_argv": Value::Null,
         "side_effect_class": Value::Null,
         "requires_confirmation": false,
@@ -1091,6 +1097,7 @@ pub fn render_keys_probe_apply_report(
         }),
         serde_json::json!({
             "summary": "Review the probe result before applying credential lifecycle changes.",
+            "template_id": "keys_stats",
             "safe_argv": keys_stats_argv(Some(&options.credential_set_id), true),
             "side_effect_class": "runtime_readonly",
             "requires_confirmation": false,
@@ -1139,6 +1146,7 @@ fn render_keys_probe_apply_apply_report(
         }),
         serde_json::json!({
             "summary": "Review credential-set state after applying probe evidence.",
+            "template_id": "keys_stats",
             "safe_argv": keys_stats_argv(Some(&options.credential_set_id), true),
             "side_effect_class": "runtime_readonly",
             "requires_confirmation": false,
@@ -1292,6 +1300,7 @@ fn keys_probe_apply_next_action(
 ) -> Value {
     serde_json::json!({
         "summary": "Review bounded credential state before choosing any lifecycle correction.",
+        "template_id": "keys_stats",
         "safe_argv": keys_stats_argv(Some(&options.credential_set_id), true),
         "side_effect_class": "runtime_readonly",
         "requires_confirmation": false,
@@ -1321,6 +1330,7 @@ fn keys_probe_apply_effect_for_mode(mode: KeysProbeApplyMode) -> crate::cli_effe
 fn keys_probe_apply_blocked_next_action(summary: &str) -> Value {
     serde_json::json!({
         "summary": summary,
+        "template_id": "keys_stats",
         "safe_argv": Value::Null,
         "side_effect_class": "runtime_readonly",
         "requires_confirmation": false,
@@ -1373,6 +1383,7 @@ fn keys_probe_effect_for_mode(mode: KeysProbeMode) -> crate::cli_effects::Comman
 fn keys_probe_next_action(options: &KeysProbeOptions) -> Value {
     serde_json::json!({
         "summary": "Re-run with explicit confirmation to probe this single credential.",
+        "template_id": "keys_probe_apply",
         "safe_argv": keys_probe_apply_argv(options),
         "side_effect_class": "upstream_touching",
         "requires_confirmation": true,
@@ -1384,6 +1395,7 @@ fn keys_probe_next_action(options: &KeysProbeOptions) -> Value {
 fn keys_probe_blocked_next_action(summary: &str) -> Value {
     serde_json::json!({
         "summary": summary,
+        "template_id": "no_action_required",
         "safe_argv": Value::Null,
         "side_effect_class": Value::Null,
         "requires_confirmation": false,
@@ -1604,6 +1616,7 @@ fn render_keys_import_apply_report(
         }),
         serde_json::json!({
             "summary": "Review credential-set serving state after import.",
+            "template_id": "keys_stats",
             "safe_argv": keys_stats_argv(Some(&options.credential_set_id), true),
             "side_effect_class": "runtime_readonly",
             "requires_confirmation": false,
@@ -1710,6 +1723,7 @@ fn keys_import_next_action(status: &str, options: &KeysImportOptions) -> Value {
     if status == "dry_run" {
         serde_json::json!({
             "summary": "Re-run with explicit confirmation to import these credentials.",
+            "template_id": "keys_import_apply",
             "safe_argv": keys_import_apply_argv(options),
             "side_effect_class": "management_write",
             "requires_confirmation": true,
@@ -1724,6 +1738,7 @@ fn keys_import_next_action(status: &str, options: &KeysImportOptions) -> Value {
 fn keys_import_blocked_next_action(summary: &str) -> Value {
     serde_json::json!({
         "summary": summary,
+        "template_id": "no_action_required",
         "safe_argv": Value::Null,
         "side_effect_class": Value::Null,
         "requires_confirmation": false,
@@ -2201,6 +2216,7 @@ fn replacement_plan_safe_next_actions(
 ) -> Value {
     let mut actions = vec![serde_json::json!({
         "summary": "Refresh credential-set stats from read-only management projections.",
+        "template_id": "keys_stats",
         "safe_argv": keys_stats_argv(Some(&options.credential_set_id), options.include_credential_refs),
         "side_effect_class": "runtime_readonly",
         "requires_confirmation": false,
@@ -2208,6 +2224,7 @@ fn replacement_plan_safe_next_actions(
     if route_projection_available {
         actions.push(serde_json::json!({
             "summary": "Re-check route impact through the read-only route explain projection.",
+            "template_id": "route_explain",
             "safe_argv": route_explain_argv(options),
             "side_effect_class": "runtime_readonly",
             "requires_confirmation": false,
@@ -2215,6 +2232,7 @@ fn replacement_plan_safe_next_actions(
     }
     actions.push(serde_json::json!({
         "summary": "Preview a replacement import locally; this does not send credentials to management.",
+        "template_id": "keys_import_dry_run",
         "safe_argv": keys_import_dry_run_argv(&options.credential_set_id),
         "side_effect_class": "local_preview",
         "requires_confirmation": false,
@@ -2226,6 +2244,7 @@ fn replacement_plan_next_action(options: &KeysReplacementPlanOptions, set_found:
     if set_found {
         serde_json::json!({
             "summary": "Review the safe next actions before any credential import or lifecycle change.",
+            "template_id": "keys_stats",
             "safe_argv": keys_stats_argv(Some(&options.credential_set_id), options.include_credential_refs),
             "side_effect_class": "runtime_readonly",
             "requires_confirmation": false,
@@ -2234,6 +2253,7 @@ fn replacement_plan_next_action(options: &KeysReplacementPlanOptions, set_found:
     } else {
         serde_json::json!({
             "summary": "List credential sets from the read-only management projection.",
+            "template_id": "keys_list",
             "safe_argv": ["one-ai-key", "keys", "list"],
             "side_effect_class": "runtime_readonly",
             "requires_confirmation": false,
@@ -2593,6 +2613,7 @@ fn keys_next_action(status: &str, credential_set_id: Option<&str>) -> Value {
     if status == "ok" {
         serde_json::json!({
             "summary": "Credential-set state is reported from bounded management projections.",
+            "template_id": "keys_stats",
             "dry_run_argv_status": crate::cli_report::BOUNDED_STATS_PROJECTION_AVAILABLE,
             "safe_argv": keys_stats_argv(credential_set_id, false),
             "side_effect_class": "runtime_readonly",
@@ -2601,6 +2622,7 @@ fn keys_next_action(status: &str, credential_set_id: Option<&str>) -> Value {
     } else {
         serde_json::json!({
             "summary": "No matching credential-set projection is available from the management API.",
+            "template_id": "keys_list",
             "dry_run_argv_status": Value::Null,
             "safe_argv": ["one-ai-key", "keys", "list"],
             "side_effect_class": "runtime_readonly",
@@ -2706,6 +2728,7 @@ fn operations_next_action(operations: &Value) -> Value {
     if !needs_operator_input {
         serde_json::json!({
             "summary": "Credential-set operations projection does not require operator input.",
+            "template_id": "no_action_required",
             "dry_run_argv_status": Value::Null,
             "safe_argv": Value::Null,
             "side_effect_class": "runtime_readonly",
@@ -2714,6 +2737,7 @@ fn operations_next_action(operations: &Value) -> Value {
     } else {
         serde_json::json!({
             "summary": "Some credentials are blocked. Request bounded credential_refs with keys stats before choosing an explicit probe or import workflow.",
+            "template_id": "keys_stats",
             "dry_run_argv_status": crate::cli_report::BOUNDED_CREDENTIAL_REFS_REQUIRED,
             "safe_argv": keys_stats_argv(operations.get("credential_set_id").and_then(Value::as_str), true),
             "side_effect_class": "runtime_readonly",
@@ -3108,6 +3132,127 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    fn operator_connection() -> crate::cli::OperatorConnectionOptions {
+        crate::cli::OperatorConnectionOptions {
+            management_url: Some("https://router.example".to_string()),
+            deprecated_base_url: None,
+            management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+            management_token_stdin: false,
+            timeout_seconds: 10,
+        }
+    }
+
+    fn assert_next_action_template(action: &Value, expected: &str) {
+        assert_eq!(action["template_id"], expected);
+        assert!(action["template_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+    }
+
+    #[test]
+    fn keys_maintenance_next_actions_have_stable_template_ids() {
+        let import_options = super::KeysImportOptions {
+            connection: operator_connection(),
+            credential_set_id: "relay-credentials".to_string(),
+            source: std::path::PathBuf::from("replacement.keys"),
+            mode: super::KeysImportMode::DryRun,
+            output: crate::cli_report::OutputFormat::Json,
+        };
+        let probe_options = super::KeysProbeOptions {
+            connection: operator_connection(),
+            credential_set_id: "relay-credentials".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+            model: "gpt-example".to_string(),
+            kind: super::KeysProbeKind::ModelRetrieve,
+            expected_output: None,
+            timeout_seconds: None,
+            mode: super::KeysProbeMode::DryRun,
+            output: crate::cli_report::OutputFormat::Json,
+        };
+        let disable_options = super::KeysDisableOptions {
+            connection: operator_connection(),
+            credential_set_id: "relay-credentials".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+            reason: "operator verified bad key".to_string(),
+            mode: super::KeysDisableMode::DryRun,
+            output: crate::cli_report::OutputFormat::Json,
+        };
+        let restore_options = super::KeysRestoreOptions {
+            connection: operator_connection(),
+            credential_set_id: "relay-credentials".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+            reason: "operator verified restored key".to_string(),
+            mode: super::KeysRestoreMode::DryRun,
+            output: crate::cli_report::OutputFormat::Json,
+        };
+        let probe_apply_options = super::KeysProbeApplyPlanOptions {
+            connection: operator_connection(),
+            credential_set_id: "relay-credentials".to_string(),
+            credential_ref: "cr:v1:pos:0".to_string(),
+            output: crate::cli_report::OutputFormat::Json,
+        };
+        let replacement_options = super::KeysReplacementPlanOptions {
+            connection: operator_connection(),
+            credential_set_id: "relay-credentials".to_string(),
+            model: Some("gpt-example".to_string()),
+            client_token_ref: Some("local-client".to_string()),
+            include_credential_refs: true,
+            credential_ref_limit: 8,
+            output: crate::cli_report::OutputFormat::Json,
+        };
+
+        assert_next_action_template(
+            &super::keys_next_action("ok", Some("relay-credentials")),
+            "keys_stats",
+        );
+        assert_next_action_template(&super::keys_next_action("blocked", None), "keys_list");
+        assert_next_action_template(
+            &super::keys_import_next_action("dry_run", &import_options),
+            "keys_import_apply",
+        );
+        assert_next_action_template(
+            &super::keys_probe_next_action(&probe_options),
+            "keys_probe_apply",
+        );
+        assert_next_action_template(
+            &super::keys_probe_apply_next_action(&probe_apply_options, Some("pr:v1:id:7")),
+            "keys_stats",
+        );
+        assert_next_action_template(
+            &super::keys_disable_next_action(&disable_options),
+            "keys_disable_apply",
+        );
+        assert_next_action_template(
+            &super::keys_restore_next_action(&restore_options),
+            "keys_restore_apply",
+        );
+        assert_next_action_template(
+            &super::replacement_plan_next_action(&replacement_options, true),
+            "keys_stats",
+        );
+        assert_next_action_template(
+            &super::replacement_plan_next_action(&replacement_options, false),
+            "keys_list",
+        );
+
+        let safe_next_actions =
+            super::replacement_plan_safe_next_actions(&replacement_options, true);
+        let action_templates = safe_next_actions
+            .as_array()
+            .expect("safe next actions must be an array")
+            .iter()
+            .map(|action| {
+                action["template_id"]
+                    .as_str()
+                    .expect("safe next action must include template_id")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            action_templates,
+            vec!["keys_stats", "route_explain", "keys_import_dry_run"]
+        );
     }
 
     #[test]
