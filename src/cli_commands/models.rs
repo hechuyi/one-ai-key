@@ -326,6 +326,14 @@ fn sanitized_models_explain_report(
         crate::cli_commands::model_availability_projection::invalid_model_availability_evidence,
     );
     let has_invalid_management_projection = invalid_management_projection.is_some();
+    let endpoint_family_status = if has_invalid_management_projection {
+        "projection_invalid"
+    } else if availability.is_some() {
+        "evaluated"
+    } else {
+        "not_requested"
+    };
+    let endpoint_family_note = models_explain_endpoint_family_note(endpoint_family_status);
     let availability_can_use = availability
         .as_ref()
         .and_then(|value| value.get("can_use"))
@@ -404,7 +412,11 @@ fn sanitized_models_explain_report(
             .filter(|value| !value.is_null())
             .cloned()
             .unwrap_or_else(|| {
-                models_explain_next_action(status, preview, client_scope_status, reason_code)
+                if endpoint_family_status == "not_requested" && status == "ok" {
+                    models_explain_endpoint_family_next_action(report_client_token_ref)
+                } else {
+                    models_explain_next_action(status, preview, client_scope_status, reason_code)
+                }
             })
     };
     let evidence = invalid_management_projection.or_else(|| {
@@ -426,6 +438,8 @@ fn sanitized_models_explain_report(
         "can_use": availability_can_use,
         "blocking_domain": blocking_domain,
         "endpoint_family": report_endpoint_family,
+        "endpoint_family_status": endpoint_family_status,
+        "endpoint_family_note": endpoint_family_note,
         "model": report_model,
         "client_token_ref": report_client_token_ref,
         "evidence": evidence,
@@ -449,10 +463,48 @@ fn sanitized_models_explain_report(
             "model": report_model,
             "client_token_ref": report_client_token_ref,
             "endpoint_family": report_endpoint_family,
+            "endpoint_family_status": endpoint_family_status,
         }),
         window: Value::Null,
         next_action,
         data,
+    })
+}
+
+fn models_explain_endpoint_family_note(status: &str) -> &'static str {
+    match status {
+        "evaluated" => "endpoint-family usability was evaluated by management model availability.",
+        "projection_invalid" => {
+            "endpoint-family usability was requested, but the management projection was invalid."
+        }
+        _ => "endpoint-family usability was not evaluated; pass --endpoint-family to check chat_completions, responses, or embeddings availability.",
+    }
+}
+
+fn models_explain_endpoint_family_next_action(client_token_ref: Option<&str>) -> Value {
+    let mut argv = vec![
+        Value::from("one-ai-key"),
+        Value::from("models"),
+        Value::from("explain"),
+        Value::from("--management-url"),
+        Value::from("<url>"),
+        Value::from("--management-token-env"),
+        Value::from("<env>"),
+        Value::from("--model"),
+        Value::from("<public-model>"),
+    ];
+    if client_token_ref.is_some() {
+        argv.push(Value::from("--client-token-ref"));
+        argv.push(Value::from("<client-token-ref>"));
+    }
+    argv.push(Value::from("--endpoint-family"));
+    argv.push(Value::from("<endpoint-family>"));
+    serde_json::json!({
+        "summary": "The public model has a selected runtime route candidate, but endpoint-family usability was not evaluated. Re-run models explain with --endpoint-family to check endpoint-specific availability.",
+        "template_id": "models_explain_endpoint_family",
+        "safe_argv": argv,
+        "side_effect_class": "runtime_readonly",
+        "requires_confirmation": false,
     })
 }
 
@@ -766,6 +818,16 @@ fn render_models_explain_table(
                 .unwrap_or("unknown")
         )
     ));
+    crate::cli_report::push_table_field(
+        &mut output,
+        "endpoint_family_status",
+        report.get("endpoint_family_status"),
+    );
+    crate::cli_report::push_table_field(
+        &mut output,
+        "endpoint_family_note",
+        report.get("endpoint_family_note"),
+    );
     if let Some(availability) = report.get("availability").filter(|value| !value.is_null()) {
         crate::cli_commands::model_availability_projection::append_availability_table_fields(
             &mut output,
@@ -1021,10 +1083,64 @@ mod tests {
         assert!(rendered.contains("side_effect_class: runtime_readonly"));
         assert!(rendered.contains("effect.reads_management_runtime: true"));
         assert!(rendered.contains("client_scope_status: unrestricted"));
+        assert!(rendered.contains("endpoint_family_status: not_requested"));
+        assert!(
+            rendered.contains("endpoint_family_note: endpoint-family usability was not evaluated")
+        );
         assert!(rendered.contains("selected_target: primary"));
         assert!(rendered.contains("reload_diff_status: unknown"));
         assert!(rendered.contains("capability_status: unknown"));
-        assert!(rendered.contains("next_action.safe_argv: []"));
+        assert!(rendered.contains("next_action.template_id: models_explain_endpoint_family"));
+        assert!(rendered.contains("next_action.safe_argv["));
+        assert!(rendered.contains("--endpoint-family"));
+    }
+
+    #[test]
+    fn models_explain_json_marks_endpoint_family_as_not_requested_without_availability_projection()
+    {
+        let input = serde_json::json!({
+            "model": "gpt-public",
+            "route_kind": "configured",
+            "client_token": {
+                "id": "local-client",
+                "name": "Local Client",
+                "unrestricted_model_groups": true,
+                "unrestricted_channels": true,
+                "allowed_model_groups": [],
+                "allowed_channels": []
+            },
+            "selected_target": {
+                "channel_id": "primary",
+                "plan_position": 0
+            },
+            "candidates": []
+        });
+
+        let rendered = render_models_explain_report(&input, crate::cli_report::OutputFormat::Json);
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["reason_code"], "model_visible_to_client");
+        assert_eq!(report["can_use"], serde_json::Value::Null);
+        assert_eq!(report["endpoint_family"], serde_json::Value::Null);
+        assert_eq!(report["availability"], serde_json::Value::Null);
+        assert_eq!(report["endpoint_family_status"], "not_requested");
+        assert_eq!(
+            report["endpoint_family_note"],
+            "endpoint-family usability was not evaluated; pass --endpoint-family to check chat_completions, responses, or embeddings availability."
+        );
+        assert_eq!(
+            report["next_action"]["template_id"],
+            "models_explain_endpoint_family"
+        );
+        assert_eq!(
+            report["next_action"]["side_effect_class"],
+            "runtime_readonly"
+        );
+        assert_eq!(report["next_action"]["requires_confirmation"], false);
+        let argv = report["next_action"]["safe_argv"].as_array().unwrap();
+        assert!(argv.iter().any(|arg| arg == "--endpoint-family"));
+        assert!(argv.iter().any(|arg| arg == "<endpoint-family>"));
     }
 
     #[test]

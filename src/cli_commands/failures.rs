@@ -2,6 +2,8 @@ use serde_json::Value;
 
 const DEFAULT_LAST: usize = 50;
 const MAX_LAST: usize = 200;
+const BOUNDED_EVIDENCE_AVAILABILITY_NOTE: &str =
+    "bounded historical evidence only; current availability was not evaluated";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureTailOptions {
@@ -375,6 +377,7 @@ fn report_envelope_with_data(
         "window": window.metadata(returned),
         "availability_source": "bounded_evidence",
         "current_availability": false,
+        "availability_note": BOUNDED_EVIDENCE_AVAILABILITY_NOTE,
         "next_action": aggregate_next_action(&failures),
         "data": data,
     })
@@ -796,12 +799,38 @@ fn render_failure_table(report: &Value) -> String {
         }
     }
     if let Some(window) = report.get("window") {
-        for field in ["kind", "limit", "returned", "truncated", "bounded_reason"] {
+        for field in [
+            "kind",
+            "limit",
+            "per_source_limit",
+            "returned",
+            "truncated",
+            "bounded_reason",
+        ] {
             crate::cli_report::push_table_field(
                 &mut output,
                 &format!("window.{field}"),
                 window.get(field),
             );
+        }
+        if let Some(sources) = window.get("sources").and_then(Value::as_object) {
+            for source in ["routing_telemetry", "response_filter_events"] {
+                if let Some(source_window) = sources.get(source) {
+                    for field in [
+                        "buffered_events",
+                        "capacity",
+                        "dropped_events",
+                        "offset",
+                        "limit",
+                    ] {
+                        crate::cli_report::push_table_field(
+                            &mut output,
+                            &format!("window.sources.{source}.{field}"),
+                            source_window.get(field),
+                        );
+                    }
+                }
+            }
         }
         output.push_str(&format!(
             "Window: kind={} limit={} returned={} truncated={}\n",
@@ -820,6 +849,11 @@ fn render_failure_table(report: &Value) -> String {
         &mut output,
         "current_availability",
         report.get("current_availability"),
+    );
+    crate::cli_report::push_table_field(
+        &mut output,
+        "availability_note",
+        report.get("availability_note"),
     );
     if let Some(summary) = report
         .get("next_action")
@@ -1247,6 +1281,12 @@ mod tests {
 
         assert!(rendered.contains("availability_source: bounded_evidence"));
         assert!(rendered.contains("current_availability: false"));
+        assert!(rendered.contains(
+            "availability_note: bounded historical evidence only; current availability was not evaluated"
+        ));
+        assert!(rendered.contains("window.per_source_limit: 50"));
+        assert!(rendered.contains("window.sources.routing_telemetry.dropped_events: 2"));
+        assert!(rendered.contains("window.sources.response_filter_events.dropped_events: 3"));
         assert!(rendered.contains("blocking_domain=upstream"));
     }
 
@@ -1428,6 +1468,12 @@ mod tests {
 
         assert!(rendered.contains("availability_source: bounded_evidence"));
         assert!(rendered.contains("current_availability: false"));
+        assert!(rendered.contains(
+            "availability_note: bounded historical evidence only; current availability was not evaluated"
+        ));
+        assert!(rendered.contains("window.per_source_limit: 50"));
+        assert!(rendered.contains("window.sources.routing_telemetry.dropped_events: 2"));
+        assert!(rendered.contains("window.sources.response_filter_events.dropped_events: 3"));
         assert!(rendered.contains("blocking_domain=upstream"));
     }
 
