@@ -105,7 +105,7 @@ answer:
 `v0.2` closes the operator-confidence surface. It may verify and characterize
 stability behavior already present in the codebase, but it must not broaden that
 behavior. Any upstream-jitter gap found during characterization becomes a
-`v0.3_blocker` or post-release debt, not a `v0.2` production-path patch.
+future stability-debt item, not a `v0.2` production-path patch.
 
 Allowed in `v0.2`:
 
@@ -254,12 +254,16 @@ Neither debt item authorizes request-path changes, new YAML fields, registry
 schema changes, live discovery, protocol behavior changes, or compatibility
 defaults.
 
-## `v0.3` Entry Criteria
+## Historical `v0.3` Entry Criteria
 
-Start `v0.3` only after `v0.2` is tagged or explicitly abandoned. `v0.3` should
-be one stability package, not a catch-all platform upgrade.
+This section records the original entry contract for conservative pre-output
+stability. The behavior is now part of the documented product surface; future
+work should evolve it through a new capability plan rather than treating the
+items below as unimplemented scope. The design constraints still apply: each
+future stability package should be one bounded capability, not a catch-all
+platform upgrade.
 
-Initial `v0.3` scope:
+Original `v0.3` scope:
 
 - named capability package: `Conservative Pre-Output Stability v1`;
 - no runtime YAML preset by default;
@@ -281,8 +285,8 @@ same channel, retry one eligible frozen route target, or retry the same target
 once as a last resort. These choices must not chain inside the same original
 client request.
 
-`v0.3` must distinguish route admission failures from selected-target pre-output
-transient failures. Missing scope, missing model route, disabled targets, empty
-credential pools, hard channel cooldown, unsupported endpoint family, and stale
-runtime state remain explainable local failures; retry must not manufacture a
-route candidate.
+The stability contract distinguishes route admission failures from
+selected-target pre-output transient failures. Missing scope, missing model
+route, disabled targets, empty credential pools, hard channel cooldown,
+unsupported endpoint family, and stale runtime state remain explainable local
+failures; retry must not manufacture a route candidate.

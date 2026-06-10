@@ -31,6 +31,12 @@ M3 is the only data-plane stability step in this roadmap; it may hide one small
 pre-output upstream failure when all retry gates pass, and it must record why it
 did or did not retry.
 
+The current public operator baseline also includes the M4 reload and staged
+model-publication closure described in the operations and release-build docs.
+This roadmap should therefore be read as the product baseline plus that M4
+operator closure, not as a claim that reload diff/apply or staged publication
+are future work.
+
 Do not use incident narratives, private deployment traces, temporary key
 replacement stories, or one-off support workarounds as product requirements.
 Convert recurring lessons into stable routing, reporting, or release rules, then
@@ -197,22 +203,23 @@ Keep:
 - a simple disable/retire action for bad keys when the existing management API
   supports it;
 - manual `keys probe` only as an explicit upstream-touching operator action;
+- explicit single-credential `keys probe-apply plan/apply` using an existing
+  probe result, with dry-run and confirmation gates;
 - bounded recent failure/attempt evidence for troubleshooting and retry audit;
 - a small status summary for recent failures and dropped telemetry.
 
 Park:
 
-- `probe-apply`;
+- batch probe-apply, automatic apply, or background probe promotion;
 - selector promotion workflows;
 - broad restore/promote lifecycle command sets;
 - usage ledger, billing-style top views, audit ledger, and cost tracking;
 - persistent failure ledger as a required prerequisite.
 
-If an implementation already exposes a probe-apply management path, this
-roadmap treats it as existing compatibility surface only. M2 does not expand it,
-promote it as a daily-maintenance dependency, add new action enums, add batch
-auto-apply, or let probe evidence mutate credentials without an explicit
-management action.
+The public `probe-apply` workflow remains narrow: one credential, one explicit
+probe result, read-only planning, dry-run preview, and confirmed management
+mutation only. M2 does not add batch auto-apply, background promotion, selector
+promotion, or any request-path use of probe evidence.
 
 Failure evidence is bounded recent decision evidence, not historical incident
 storage. It is not a routing input and must not be used to absorb upstream
@@ -410,8 +417,9 @@ plan with its own hot-path proof, user contract, and release gate.
 
 ## Completion Criteria
 
-This roadmap is complete when M1-M3 are implemented, documented, tested, and
-committed. Parked items are not part of completion.
+This roadmap baseline is complete when M1-M3 and the current M4 operator
+closure are implemented, documented, tested, and committed. Parked items are not
+part of completion.
 
 Before closing the roadmap:
 

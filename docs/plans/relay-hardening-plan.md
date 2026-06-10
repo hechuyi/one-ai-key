@@ -148,7 +148,7 @@ Add management health projections before any new channel suppression behavior:
 
 **Likely files:** `src/config.rs`, `src/error.rs`, `src/upstream_templates.rs`, `src/management_profiles.rs`, `docs/architecture.md`, tests in focused modules or `src/main.rs`.
 
-Add `relay_profile: official_openai | generic_relay | untrusted_relay` at template/config resolution. Existing configs keep current behavior unless they opt into a relay profile. Add `balance_scope`, defaulting to `credential`. In Phase 1A, `balance_scope: channel` may be parsed but must fail config resolution with a clear error until Phase 1B implements its state transition.
+Add `relay_profile: official_openai | generic_relay | untrusted_relay` at template/config resolution. Existing configs keep current behavior unless they opt into a relay profile. Add `balance_scope`, defaulting to `credential`. Earlier Phase 1A slices rejected `balance_scope: channel` until the Phase 1B state transition existed; the current public configuration contract supports `balance_scope: channel` as selected-channel transient suppression and continues to reject account, provider, credential-set, and client-token balance scopes.
 
 Classifier table for Phase 1A:
 
@@ -158,12 +158,12 @@ Classifier table for Phase 1A:
 | Structured invalid-key code | `AuthInvalid/Credential`, non-retryable, expire selected credential | Same | Same |
 | Bare `429` | `RateLimited/Credential`, retryable only through existing gates, credential cooldown | `RateLimited/Credential`, retryable only through existing gates, credential cooldown | `RateLimited/Credential`, no same-request retry unless explicitly enabled, credential cooldown |
 | Structured credential quota with `balance_scope: credential` | `QuotaExhausted/Credential`, non-retryable, durable quota-exhaust selected credential | Same | Same |
-| Structured channel balance with `balance_scope: channel` | Config rejected until Phase 1B | Config rejected until Phase 1B | Config rejected until Phase 1B |
+| Structured channel balance with `balance_scope: channel` | `RelayBalanceUnavailable/Channel`, suppress selected channel transiently | Same | Same |
 | Code-less top-level error object | `ClientError/RequestOnly`, non-retryable, no lifecycle mutation | Same | Same |
 
 Unsupported matcher fields such as free-form message contains/regex matching must fail config resolution rather than being ignored. Account/provider/client-token balance scopes remain rejected until a future runtime state machine and management projection exist.
 
-**Phase 1A acceptance gate:** red tests cover profile config resolution, current-config backward compatibility, each table row, unsupported field rejection, unsupported `balance_scope: channel` rejection, management policy projection fields, and absence of request-path free-form message parsing. Complete only when these tests pass under `scripts/local-ci.sh` and the local x86_64 build gate still passes.
+**Phase 1A acceptance gate:** red tests cover profile config resolution, current-config backward compatibility, each table row, unsupported field rejection, management policy projection fields, and absence of request-path free-form message parsing. The historical rejection of `balance_scope: channel` applied only before Phase 1B; current acceptance belongs to the Phase 1B selected-channel suppression contract. Complete only when these tests pass under `scripts/local-ci.sh` and the local x86_64 build gate still passes.
 
 **Status note:** Phase 1A documentation and acceptance scope is limited to the typed classifier semantics above. The current management acceptance surface is the existing `/management/channels/:id/error-rules` effective-rule projection plus `/management/policy-profiles` and `/management/policy-profiles/:id` profile projections. `/v1/models` remains a compiled runtime projection over explicit `model_routes`; Phase 1A does not add live upstream model aggregation, channel balance suppression, free-form message matchers, or new management endpoints.
 

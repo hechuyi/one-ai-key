@@ -485,9 +485,11 @@ Credential cooldown, credential expiration, and credential quota exhaustion are
 credential lifecycle states; request-only schema, endpoint-family, model-scope,
 or client-error failures should not mutate route availability.
 
-If a model was recently discovered or staged, confirm that sync apply and runtime
-reload actually happened. Discovery alone does not make a model visible to
-client traffic.
+If a model was recently discovered or staged, confirm that the relevant
+publication path completed. For management model-discovery/sync workflows,
+sync-apply must have run; for `models onboard-plan`, the staged route must be
+followed by runtime reload. Discovery or staging alone does not make a model
+visible to client traffic.
 
 ### `invalid router api key`
 
