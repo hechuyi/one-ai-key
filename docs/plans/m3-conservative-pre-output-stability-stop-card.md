@@ -8,7 +8,7 @@ closed_capability: `Conservative Pre-Output Stability v1`
 
 implemented_scope: `selected-target pre-output retry gate; endpoint-family allowlist for non-streaming Chat Completions and Responses; named-pool retry exclusion; one-extra-attempt budget across credential, route-target, and same-target continuations; redacted retry and denial telemetry; local route-admission 503 evidence separated from selected-upstream 503 evidence; README, operations, configuration, technical design, and roadmap behavior docs`
 
-deferred_scope: `deployment pin update; production deployment smoke; broader protocol conversion; endpoint fallback; active background health probing; persistent adaptive routing; usage or billing ledger`
+deferred_scope: `broader protocol conversion; endpoint fallback; active background health probing; persistent adaptive routing; usage or billing ledger`
 
 parked_or_rejected_items: `streaming retry; partial-output fallback; /v1/models retry; Embeddings retry; named-pool M3 retry; unknown endpoint retry; default 429 retry; cross-provider default fallback outside frozen route policy; YAML retry presets; live upstream catalog aggregation; background health scanning; UI, billing, multi-tenancy, and broad OpenAI protocol conversion`
 
@@ -34,7 +34,7 @@ anti_platform_gate_result: `pass: no live upstream catalog aggregation, backgrou
 
 support_residue_scan_result: `pass: changed docs use stable product behavior, placeholder terms, status codes, and reason codes rather than private deployment names, real gateway domains, raw keys, chat transcripts, or one-off replacement procedures`
 
-deployment_boundary_result: `not_run_by_design: no production server, DNS, systemd unit, gateway pin, token rotation, or public traffic was touched`
+deployment_boundary_result: `pass: operator-run NixOS deployment pin consumed the published v0.1.12 GitHub Release tarball by URL plus sha256-EvGBuh1MWwyVxlUL+SephA6aU+XaZzSpJf0QWy4qMDg=; nixos-rebuild test and switch exited 0; systemd ExecStart resolved to a one-ai-key-0.1.12 store path; local /health and /ready passed; public /v1/models returned one configured model; public /v1/responses smoke returned HTTP 200 with the expected short response and no configured advertisement marker; deployment repository commit 2337886 recorded the pin without raw tokens, keys, hostnames, private domains, or upstream response bodies`
 
 known_blockers: `none for M3 source and release artifact closure`
 
