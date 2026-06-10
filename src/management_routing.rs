@@ -1857,6 +1857,43 @@ mod tests {
     }
 
     #[test]
+    fn routing_preview_admission_summary_reports_unavailable_hard_blocker_without_selected_target()
+    {
+        let value = preview_response_with_candidates(
+            vec![candidate_status(
+                "cooling",
+                false,
+                false,
+                None,
+                vec!["channel_cooling_down"],
+            )],
+            route_admission_summary_for_test(
+                RouteAdmissionStatus::Unavailable,
+                "channel_cooling_down",
+                None,
+                1,
+                0,
+                0,
+                1,
+                None,
+            ),
+        );
+
+        assert!(value["selected_target"].is_null());
+        let summary = &value["admission_summary"];
+        assert_eq!(summary["status"], "unavailable");
+        assert_eq!(summary["reason_code"], "channel_cooling_down");
+        assert!(summary["selected_target"].is_null());
+        assert_eq!(summary["candidate_count"], 1);
+        assert_eq!(summary["included_count"], 0);
+        assert_eq!(summary["blocked_count"], 1);
+        assert_eq!(summary["soft_suppressed_count"], 0);
+        assert_eq!(summary["hard_blocked_count"], 1);
+        assert_eq!(summary["last_resort_used"], false);
+        assert!(summary["last_resort_reason"].is_null());
+    }
+
+    #[test]
     fn routing_preview_admission_summary_counts_hard_soft_and_last_resort_reasons() {
         let mut candidates = vec![
             candidate_status(

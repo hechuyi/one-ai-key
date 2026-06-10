@@ -427,7 +427,7 @@ Task 2 checkpoint evidence:
 - `cargo test --locked route_preview_reason_classification_is_centralized_and_stable --`
   matched 1 test and passed.
 - `cargo test --locked route_admission_summary --` matched 2 tests and passed.
-- `cargo test --locked routing_preview_admission_summary --` matched 2 tests
+- `cargo test --locked routing_preview_admission_summary --` matched 3 tests
   and passed.
 - `cargo test --locked routing_preview_exports_admission_summary_for_selected_route --`
   matched 1 test and passed.
@@ -517,17 +517,34 @@ Task 4 checkpoint evidence:
 - Modify if needed: management routing telemetry / failures projection modules.
 - Test: `src/main.rs`
 
-- [ ] Add `route_admission_summary` to routing preview responses.
-- [ ] Ensure the response uses stable reason codes and bounded counts.
-- [ ] Ensure unsafe route labels, token-like values, paths, URLs, and raw
+- [x] Add `route_admission_summary` to routing preview responses.
+- [x] Ensure the response uses stable reason codes and bounded counts.
+- [x] Ensure unsafe route labels, token-like values, paths, URLs, and raw
   upstream text are redacted or absent.
-- [ ] Add tests for admitted, provider-cooling last-resort, hard-blocked, and
+- [x] Add tests for admitted, provider-cooling last-resort, hard-blocked, and
   mixed candidate summaries.
-- [ ] Add or refine bounded admission-denial evidence only if route/models
+- [x] Add or refine bounded admission-denial evidence only if route/models
   explain cannot otherwise connect a recent client-visible local 503 to the
   shared admission taxonomy.
-- [ ] Prove admission evidence is not a routing input and remains bounded.
-- [ ] Commit management projection changes.
+- [x] Prove admission evidence is not a routing input and remains bounded.
+- [x] Commit management projection changes.
+
+Task 5 checkpoint evidence:
+
+- Management routing preview serializes `RouteAdmissionSummary` from
+  `route_plan.rs`; it no longer owns admission taxonomy helpers.
+- `cargo test --locked routing_preview_exports_admission_summary_for_selected_route --`
+  matched 1 test and passed.
+- `cargo test --locked routing_preview_admission_summary --` matched 2 tests
+  and passed.
+- `cargo test --locked routing_preview_admission_summary_reports_unavailable_hard_blocker_without_selected_target --`
+  matched 1 test and passed.
+- `cargo test --locked routing_failure_events_distinguish_local_admission_denial_from_upstream_503`
+  matched 1 test and passed.
+- `cargo test --locked --test local_release_contract release_smoke_script_covers_local_admission_and_upstream_503_failure_evidence -- --exact`
+  matched 1 test and passed.
+- `cargo test --locked --test local_release_contract release_smoke_script_checks_management_reports_are_redacted_and_bounded -- --exact`
+  matched 1 test and passed.
 
 ### Task 6: CLI Rendering
 
