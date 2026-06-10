@@ -463,6 +463,39 @@ fn release_smoke_script_covers_local_mock_data_plane_and_operator_commands() {
 }
 
 #[test]
+fn release_smoke_script_covers_local_admission_and_upstream_503_failure_evidence() {
+    let path = "scripts/release-smoke.sh";
+    let script = read_repo_file(path);
+
+    for required in [
+        "upstream-503.json",
+        "failures-tail-upstream-503.json",
+        "failures-explain-upstream-503.json",
+        "keys-disable-final-available.json",
+        "local-admission-503.json",
+        "failures-tail-local-admission-503.json",
+        "failures-explain-local-admission-503.json",
+        "mock_upstream_chat_completion_posts",
+        "POSTS_BEFORE_LOCAL_ADMISSION",
+        "POSTS_AFTER_LOCAL_ADMISSION",
+        "local admission smoke unexpectedly reached mock upstream chat completions",
+        r#".reason_code == "upstream_5xx""#,
+        r#".client_visible_status == "upstream_5xx""#,
+        r#".upstream_status == 503"#,
+        r#".event_kind == "route_admission_denied""#,
+        r#".client_visible_status == "local_503""#,
+        r#".upstream_status == null"#,
+        r#".admission.included_count == 0"#,
+        r#".reason_code == "no_route_candidate""#,
+    ] {
+        assert!(
+            script.contains(required),
+            "{path} must cover local/upstream 503 failure evidence token `{required}`"
+        );
+    }
+}
+
+#[test]
 fn release_smoke_models_explain_diagnosis_is_canonical_endpoint_family() {
     let path = "scripts/release-smoke.sh";
     let script = read_repo_file(path);
@@ -613,6 +646,10 @@ fn release_smoke_script_checks_management_reports_are_redacted_and_bounded() {
         "release-smoke-management-token",
         "release-smoke-upstream-token",
         "release-smoke-invalid-client-token",
+        "UPSTREAM_503_MARKER",
+        "LOCAL_ADMISSION_MARKER",
+        "${UPSTREAM_503_MARKER}",
+        "${LOCAL_ADMISSION_MARKER}",
         "${WORK_DIR}",
         "data/relay.keys",
         "127.0.0.1:${MOCK_PORT}",

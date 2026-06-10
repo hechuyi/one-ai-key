@@ -124,11 +124,15 @@ PY
 MOCK_UPSTREAM_URL="http://127.0.0.1:${MOCK_PORT}/v1"
 MOCK_UPSTREAM_EVENTS="${WORK_DIR}/mock-upstream-events.jsonl"
 RAW_BODY_TEXT="raw body text"
+UPSTREAM_503_MARKER="release smoke upstream 503"
+LOCAL_ADMISSION_MARKER="release smoke local admission 503"
 
 cat > mock_upstream.py <<'PY'
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+UPSTREAM_503_MARKER = "release smoke upstream 503"
 
 class Handler(BaseHTTPRequestHandler):
     def _log_event(self, method):
@@ -165,6 +169,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             request = {}
         if self.path == "/v1/chat/completions":
+            messages = request.get("messages", [])
+            if any(isinstance(message, dict) and message.get("content") == UPSTREAM_503_MARKER for message in messages):
+                self._send_json({"error": {"code": "provider_unavailable", "message": UPSTREAM_503_MARKER}}, status=503)
+                return
             self._send_json({
                 "id": "release-smoke-response",
                 "object": "chat.completion",
@@ -189,14 +197,18 @@ PY
 python3 mock_upstream.py "${MOCK_PORT}" "${MOCK_UPSTREAM_EVENTS}" >mock-upstream.log 2>&1 &
 MOCK_PID=$!
 
-mock_upstream_model_catalog_requests() {
-  python3 - <<'PY' "${MOCK_UPSTREAM_EVENTS}"
+mock_upstream_request_count() {
+  local method=$1
+  local request_path=$2
+  python3 - <<'PY' "${MOCK_UPSTREAM_EVENTS}" "${method}" "${request_path}"
 import json
 import pathlib
 import sys
 from urllib.parse import urlsplit
 
 path = pathlib.Path(sys.argv[1])
+method = sys.argv[2]
+request_path = sys.argv[3]
 count = 0
 if path.exists():
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -206,10 +218,18 @@ if path.exists():
             raise SystemExit(f"failed to parse mock upstream event JSONL line {line_number}: {error}") from error
         if not isinstance(event, dict) or not isinstance(event.get("method"), str) or not isinstance(event.get("path"), str):
             raise SystemExit(f"mock upstream event missing string method/path on JSONL line {line_number}")
-        if event["method"] == "GET" and urlsplit(event["path"]).path == "/v1/models":
+        if event["method"] == method and urlsplit(event["path"]).path == request_path:
             count += 1
 print(count)
 PY
+}
+
+mock_upstream_model_catalog_requests() {
+  mock_upstream_request_count GET /v1/models
+}
+
+mock_upstream_chat_completion_posts() {
+  mock_upstream_request_count POST /v1/chat/completions
 }
 
 python3 - <<'PY' "${SERVICE_PORT}" "${MOCK_UPSTREAM_URL}" "${CLIENT_TOKEN}" "${MANAGEMENT_TOKEN}" "config/local.yaml"
@@ -340,6 +360,11 @@ EXPECTED_MANAGEMENT_REPORTS=(
   "reload-diff-staged.json"
   "reload-apply.json"
   "models-explain-published.json"
+  "failures-tail-upstream-503.json"
+  "failures-explain-upstream-503.json"
+  "keys-disable-final-available.json"
+  "failures-tail-local-admission-503.json"
+  "failures-explain-local-admission-503.json"
   "negative-management-url.txt"
 )
 
@@ -406,6 +431,8 @@ assert_no_management_report_leaks() {
     "${MANAGEMENT_URL}"
     "${raw_management_url}"
     "${RAW_BODY_TEXT}"
+    "${UPSTREAM_503_MARKER}"
+    "${LOCAL_ADMISSION_MARKER}"
   )
   local report
   local forbidden
@@ -847,6 +874,131 @@ curl -fsS "http://127.0.0.1:${SERVICE_PORT}/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d "{\"model\":\"${PUBLISHED_PUBLIC_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
   | jq -e '.choices[0].message.content == "release smoke published model ok"' >/dev/null
+
+UPSTREAM_503_STATUS=$(curl -sS -o upstream-503.json -w "%{http_code}" \
+  "http://127.0.0.1:${SERVICE_PORT}/v1/chat/completions" \
+  -H "Authorization: Bearer ${CLIENT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg marker "${UPSTREAM_503_MARKER}" '{model:"gpt-example",messages:[{role:"user",content:$marker}]}')")
+if [[ "${UPSTREAM_503_STATUS}" != "503" ]]; then
+  printf 'error: upstream 503 smoke returned HTTP %s instead of 503\n' "${UPSTREAM_503_STATUS}" >&2
+  exit 1
+fi
+jq -e '.error.code == "provider_unavailable"' upstream-503.json >/dev/null
+capture_management_report failures-tail-upstream-503.json failures tail --last 20 --output json
+jq -e '
+  .status == "degraded"
+  and .availability_source == "bounded_evidence"
+  and .current_availability == false
+  and (.data.failures | any(
+    .reason_code == "upstream_5xx"
+    and .client_visible_status == "upstream_5xx"
+    and .upstream_status == 503
+    and .admission == null
+  ))
+' failures-tail-upstream-503.json >/dev/null
+UPSTREAM_503_REQUEST_ID=$(jq -r '
+  .data.failures
+  | reverse
+  | map(select(
+    .reason_code == "upstream_5xx"
+    and .client_visible_status == "upstream_5xx"
+    and .upstream_status == 503
+  ))
+  | .[0].request_id // empty
+' failures-tail-upstream-503.json)
+if [[ -z "${UPSTREAM_503_REQUEST_ID}" ]]; then
+  printf 'error: upstream 503 failure evidence did not include a request id\n' >&2
+  exit 1
+fi
+capture_management_report failures-explain-upstream-503.json failures explain "${UPSTREAM_503_REQUEST_ID}" --output json
+jq -e --arg request_id "${UPSTREAM_503_REQUEST_ID}" '
+  .status == "degraded"
+  and .reason_code == "upstream_5xx"
+  and .scope.request_id == $request_id
+  and .data.explanation.client_visible_status == "upstream_5xx"
+  and .data.explanation.upstream_status == 503
+  and .data.explanation.admission == null
+  and (.data.evidence | any(
+    .request_id == $request_id
+    and .reason_code == "upstream_5xx"
+    and .client_visible_status == "upstream_5xx"
+    and .upstream_status == 503
+  ))
+' failures-explain-upstream-503.json >/dev/null
+
+capture_management_report keys-disable-final-available.json keys disable --credential-set relay_credentials --credential-ref cr:v1:pos:0 --reason "release smoke final unavailable credential" --yes --output json
+jq -e '
+  .status == "ok"
+  and .reason_code == "keys_disable_applied"
+  and .side_effect_class == "management_write"
+  and .data.command == "keys disable"
+  and .data.credential_ref == "cr:v1:pos:0"
+  and .data.state_kind == "disabled"
+  and .data.mutating_disable_sent == true
+' keys-disable-final-available.json >/dev/null
+
+POSTS_BEFORE_LOCAL_ADMISSION=$(mock_upstream_chat_completion_posts)
+LOCAL_ADMISSION_STATUS=$(curl -sS -o local-admission-503.json -w "%{http_code}" \
+  "http://127.0.0.1:${SERVICE_PORT}/v1/chat/completions" \
+  -H "Authorization: Bearer ${CLIENT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg marker "${LOCAL_ADMISSION_MARKER}" '{model:"gpt-example",messages:[{role:"user",content:$marker}]}')")
+if [[ "${LOCAL_ADMISSION_STATUS}" != "503" ]]; then
+  printf 'error: local admission smoke returned HTTP %s instead of 503\n' "${LOCAL_ADMISSION_STATUS}" >&2
+  exit 1
+fi
+POSTS_AFTER_LOCAL_ADMISSION=$(mock_upstream_chat_completion_posts)
+if [[ "${POSTS_AFTER_LOCAL_ADMISSION}" != "${POSTS_BEFORE_LOCAL_ADMISSION}" ]]; then
+  printf 'error: local admission smoke unexpectedly reached mock upstream chat completions\n' >&2
+  exit 1
+fi
+jq -e '.error.code == "no_route_candidate"' local-admission-503.json >/dev/null
+capture_management_report failures-tail-local-admission-503.json failures tail --last 20 --output json
+jq -e '
+  .status == "degraded"
+  and .availability_source == "bounded_evidence"
+  and .current_availability == false
+  and (.data.failures | any(
+    .event_kind == "route_admission_denied"
+    and .reason_code == "no_route_candidate"
+    and .client_visible_status == "local_503"
+    and .upstream_status == null
+    and .admission.included_count == 0
+  ))
+' failures-tail-local-admission-503.json >/dev/null
+LOCAL_ADMISSION_REQUEST_ID=$(jq -r '
+  .data.failures
+  | reverse
+  | map(select(
+    .event_kind == "route_admission_denied"
+    and .reason_code == "no_route_candidate"
+    and .client_visible_status == "local_503"
+    and .upstream_status == null
+  ))
+  | .[0].request_id // empty
+' failures-tail-local-admission-503.json)
+if [[ -z "${LOCAL_ADMISSION_REQUEST_ID}" ]]; then
+  printf 'error: local admission failure evidence did not include a request id\n' >&2
+  exit 1
+fi
+capture_management_report failures-explain-local-admission-503.json failures explain "${LOCAL_ADMISSION_REQUEST_ID}" --output json
+jq -e --arg request_id "${LOCAL_ADMISSION_REQUEST_ID}" '
+  .status == "degraded"
+  and .reason_code == "no_route_candidate"
+  and .scope.request_id == $request_id
+  and .data.explanation.client_visible_status == "local_503"
+  and .data.explanation.upstream_status == null
+  and .data.explanation.admission.included_count == 0
+  and (.data.evidence | any(
+    .request_id == $request_id
+    and .event_kind == "route_admission_denied"
+    and .reason_code == "no_route_candidate"
+    and .client_visible_status == "local_503"
+    and .upstream_status == null
+    and .admission.included_count == 0
+  ))
+' failures-explain-local-admission-503.json >/dev/null
 
 UPSTREAM_MODELS_AFTER_WORKFLOW=$(mock_upstream_model_catalog_requests)
 if [[ "${UPSTREAM_MODELS_AFTER_WORKFLOW}" != "${UPSTREAM_MODELS_AFTER_AUTHENTICATED_MODELS}" ]]; then

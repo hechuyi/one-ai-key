@@ -452,6 +452,18 @@ recent routing telemetry or `failures tail` for `retry_same_target`,
 `503` after those gates means the conservative retry was either ineligible or
 already consumed.
 
+Use `failures tail --last 20` and `failures explain <request-id>` to distinguish
+local route admission failures from selected-upstream failures. A local capacity
+failure reports `event_kind=route_admission_denied`,
+`reason_code=no_route_candidate`, `client_visible_status=local_503`,
+`upstream_status=null`, and bounded admission counts such as
+`admission.included_count=0`. A selected upstream `503` reports
+`reason_code=upstream_5xx`, `client_visible_status=upstream_5xx`,
+`upstream_status=503`, and no admission object. Treat the former as route,
+credential, scope, or channel-state evidence; treat the latter as evidence that
+a route target was selected and the upstream boundary returned unavailable
+before any client bytes were sent.
+
 ### `no route candidate`
 
 `no route candidate` means the compiled runtime could not find a usable route
