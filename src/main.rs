@@ -7,6 +7,7 @@ mod cli_report;
 mod client_token_store;
 mod config;
 mod config_diagnostics;
+mod confirmation_gate;
 mod credential_probe;
 mod credential_repository;
 mod credentials;
@@ -80,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => error.exit(),
     };
     let _effect = cli_effects::classify_action(&action);
-    apply_confirmation_gate(&mut action)?;
+    confirmation_gate::apply(&mut action)?;
 
     match action {
         cli::CliAction::Serve { config_path } => serve(config_path).await,
@@ -172,99 +173,6 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
-}
-
-fn apply_confirmation_gate(action: &mut cli::CliAction) -> anyhow::Result<()> {
-    use std::io::IsTerminal;
-
-    match cli_effects::confirmation_outcome(action, std::io::stdin().is_terminal()) {
-        cli_effects::ConfirmationOutcome::Allowed => Ok(()),
-        cli_effects::ConfirmationOutcome::Denied {
-            exit_code,
-            reason_code,
-        } => {
-            eprintln!("Reason code: {reason_code}");
-            eprintln!("Confirmation is required for this command. Re-run with --yes or --dry-run.");
-            std::process::exit(exit_code);
-        }
-        cli_effects::ConfirmationOutcome::PromptRequired { reason_code } => {
-            if prompt_for_confirmation(reason_code)? {
-                apply_confirmed_confirmation_transition(action);
-                Ok(())
-            } else {
-                eprintln!("Reason code: {reason_code}");
-                std::process::exit(3);
-            }
-        }
-    }
-}
-
-fn apply_confirmed_confirmation_transition(action: &mut cli::CliAction) {
-    match action {
-        cli::CliAction::InitLocal(options)
-            if matches!(
-                options.mode,
-                operator_templates::InitLocalMode::NeedsConfirmation
-            ) =>
-        {
-            options.mode = operator_templates::InitLocalMode::Write;
-        }
-        cli::CliAction::ModelsOnboardPlan(options)
-            if matches!(
-                options.mode,
-                cli_commands::models_onboard::ModelsOnboardPlanMode::NeedsConfirmation
-            ) =>
-        {
-            options.mode = cli_commands::models_onboard::ModelsOnboardPlanMode::Apply;
-        }
-        cli::CliAction::Keys(cli_commands::keys::KeysCommand::Import(options))
-            if matches!(
-                options.mode,
-                cli_commands::keys::KeysImportMode::NeedsConfirmation
-            ) =>
-        {
-            options.mode = cli_commands::keys::KeysImportMode::Apply;
-        }
-        cli::CliAction::Keys(cli_commands::keys::KeysCommand::Probe(options))
-            if matches!(
-                options.mode,
-                cli_commands::keys::KeysProbeMode::NeedsConfirmation
-            ) =>
-        {
-            options.mode = cli_commands::keys::KeysProbeMode::Apply;
-        }
-        cli::CliAction::Keys(cli_commands::keys::KeysCommand::ProbeApply(
-            cli_commands::keys::KeysProbeApplyCommand::Apply(options),
-        )) if matches!(
-            options.mode,
-            cli_commands::keys::KeysProbeApplyMode::NeedsConfirmation
-        ) =>
-        {
-            options.mode = cli_commands::keys::KeysProbeApplyMode::Apply;
-        }
-        cli::CliAction::ReloadApply(options)
-            if matches!(
-                options.mode,
-                cli_commands::reload::ReloadApplyMode::NeedsConfirmation
-            ) =>
-        {
-            options.mode = cli_commands::reload::ReloadApplyMode::Apply;
-        }
-        _ => {}
-    }
-}
-
-fn prompt_for_confirmation(reason_code: &str) -> anyhow::Result<bool> {
-    use std::io::{self, Write};
-
-    print!("Reason code: {reason_code}\nThis command has side effects. Continue? [y/N] ");
-    io::stdout().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
 }
 
 async fn serve(config_path: String) -> anyhow::Result<()> {
@@ -489,7 +397,7 @@ mod tests {
             crate::cli_commands::models_onboard::ModelsOnboardPlanMode::NeedsConfirmation,
         );
 
-        apply_confirmed_confirmation_transition(&mut action);
+        crate::confirmation_gate::apply_confirmed_transition(&mut action);
 
         let crate::cli::CliAction::ModelsOnboardPlan(options) = action else {
             panic!("expected models onboard-plan action");
@@ -524,13 +432,79 @@ mod tests {
         ] {
             let mut action = models_onboard_plan_action(mode);
 
-            apply_confirmed_confirmation_transition(&mut action);
+            crate::confirmation_gate::apply_confirmed_transition(&mut action);
 
             let crate::cli::CliAction::ModelsOnboardPlan(options) = action else {
                 panic!("expected models onboard-plan action");
             };
             assert_eq!(options.mode, mode);
         }
+    }
+
+    #[test]
+    fn confirmation_gate_keys_disable_positive_prompt_transitions_to_apply() {
+        let mut action =
+            crate::cli::CliAction::Keys(crate::cli_commands::keys::KeysCommand::Disable(
+                crate::cli_commands::keys::KeysDisableOptions {
+                    connection: crate::cli::OperatorConnectionOptions {
+                        management_url: Some("https://router.example".to_string()),
+                        deprecated_base_url: None,
+                        management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                        management_token_stdin: false,
+                        timeout_seconds: 10,
+                    },
+                    credential_set_id: "relay-a".to_string(),
+                    credential_ref: "cr:v1:pos:0".to_string(),
+                    reason: "operator verified bad key".to_string(),
+                    mode: crate::cli_commands::keys::KeysDisableMode::NeedsConfirmation,
+                    output: crate::cli_report::OutputFormat::Table,
+                },
+            ));
+
+        crate::confirmation_gate::apply_confirmed_transition(&mut action);
+
+        let crate::cli::CliAction::Keys(crate::cli_commands::keys::KeysCommand::Disable(options)) =
+            action
+        else {
+            panic!("expected keys disable action");
+        };
+        assert_eq!(
+            options.mode,
+            crate::cli_commands::keys::KeysDisableMode::Apply
+        );
+    }
+
+    #[test]
+    fn confirmation_gate_keys_restore_positive_prompt_transitions_to_apply() {
+        let mut action =
+            crate::cli::CliAction::Keys(crate::cli_commands::keys::KeysCommand::Restore(
+                crate::cli_commands::keys::KeysRestoreOptions {
+                    connection: crate::cli::OperatorConnectionOptions {
+                        management_url: Some("https://router.example".to_string()),
+                        deprecated_base_url: None,
+                        management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                        management_token_stdin: false,
+                        timeout_seconds: 10,
+                    },
+                    credential_set_id: "relay-a".to_string(),
+                    credential_ref: "cr:v1:pos:0".to_string(),
+                    reason: "operator verified recovered credential".to_string(),
+                    mode: crate::cli_commands::keys::KeysRestoreMode::NeedsConfirmation,
+                    output: crate::cli_report::OutputFormat::Table,
+                },
+            ));
+
+        crate::confirmation_gate::apply_confirmed_transition(&mut action);
+
+        let crate::cli::CliAction::Keys(crate::cli_commands::keys::KeysCommand::Restore(options)) =
+            action
+        else {
+            panic!("expected keys restore action");
+        };
+        assert_eq!(
+            options.mode,
+            crate::cli_commands::keys::KeysRestoreMode::Apply
+        );
     }
 
     fn fixture_client_token() -> String {
