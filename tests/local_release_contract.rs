@@ -375,6 +375,56 @@ fn gitignore_and_dockerignore_cover_sensitive_runtime_and_release_patterns() {
 }
 
 #[test]
+fn local_ci_runs_repository_hygiene_self_tests_without_reading_git_index_state() {
+    let path = "scripts/local-ci.sh";
+    let script = read_repo_file(path);
+
+    for required in [
+        "scripts/check-staged-denylist.sh --self-test",
+        "scripts/check-staged-denylist.sh --check-public-plans",
+    ] {
+        assert!(
+            script.contains(required),
+            "{path} must run repository hygiene check `{required}` before Cargo verification"
+        );
+    }
+}
+
+#[test]
+fn staged_denylist_has_public_plan_hygiene_contract() {
+    let path = "scripts/check-staged-denylist.sh";
+    assert!(Path::new(path).is_file(), "{path} must exist");
+    assert_executable(path);
+
+    let script = read_repo_file(path);
+    for required in [
+        "--check-public-plans",
+        "git ls-files -- 'docs/plans/*.md'",
+        "PUBLIC_PLAN_DENY_REGEX",
+        "Task [0-9]+ checkpoint",
+        "deployment_boundary_result",
+        "chat/room",
+    ] {
+        assert!(
+            script.contains(required),
+            "{path} must contain public plan hygiene contract token `{required}`"
+        );
+    }
+
+    let output = Command::new(path)
+        .arg("--self-test")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {path} --self-test: {error}"));
+    assert!(
+        output.status.success(),
+        "{path} --self-test must pass: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn release_smoke_script_exists_is_executable_and_uses_released_binary() {
     let path = "scripts/release-smoke.sh";
     assert!(Path::new(path).is_file(), "{path} must exist");

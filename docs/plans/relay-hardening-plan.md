@@ -299,7 +299,7 @@ Scope:
 - `Retry-After` and typed channel-failure evidence may influence transient cooldown. They never override manual disablement or configured disablement.
 - Retry/fallback decisions do not parse free-form upstream text and do not record raw response bodies, request bodies, upstream keys, client tokens, or token-like values.
 
-Stop-card tests:
+Acceptance tests:
 
 - Bad selected key retries to a good credential in the same request without reusing the failed credential.
 - Credential candidate exhaustion falls through to the next eligible frozen

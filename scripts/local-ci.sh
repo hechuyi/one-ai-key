@@ -19,6 +19,8 @@ case "${CARGO_TARGET_DIR_ABS}" in
     ;;
 esac
 
+scripts/check-staged-denylist.sh --self-test
+scripts/check-staged-denylist.sh --check-public-plans
 cargo fmt -- --check
 cargo check --locked
 cargo clippy --locked -- -D warnings
