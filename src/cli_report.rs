@@ -1,6 +1,14 @@
 use clap::ValueEnum;
 use serde_json::Value;
 
+pub const LIST_RELOAD_STATUS_NOT_EVALUATED: &str = "not_evaluated_for_list_use_reload_status";
+pub const LIST_CAPABILITY_STATUS_NOT_EVALUATED: &str = "not_evaluated_for_list_use_models_explain";
+pub const MANUAL_FOLLOWUP_REQUIRED: &str = "manual_followup_required";
+pub const MANUAL_CONFIG_OR_REGISTRY_UPDATE_REQUIRED: &str =
+    "manual_config_or_registry_update_required";
+pub const BOUNDED_STATS_PROJECTION_AVAILABLE: &str = "bounded_stats_projection_available";
+pub const BOUNDED_CREDENTIAL_REFS_REQUIRED: &str = "bounded_credential_refs_required";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     #[default]

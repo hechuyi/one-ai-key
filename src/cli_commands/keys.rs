@@ -2593,7 +2593,7 @@ fn keys_next_action(status: &str, credential_set_id: Option<&str>) -> Value {
     if status == "ok" {
         serde_json::json!({
             "summary": "Credential-set state is reported from bounded management projections.",
-            "dry_run_argv_status": "keys_probe_unavailable_until_m3",
+            "dry_run_argv_status": crate::cli_report::BOUNDED_STATS_PROJECTION_AVAILABLE,
             "safe_argv": keys_stats_argv(credential_set_id, false),
             "side_effect_class": "runtime_readonly",
             "requires_confirmation": false,
@@ -2713,8 +2713,8 @@ fn operations_next_action(operations: &Value) -> Value {
         })
     } else {
         serde_json::json!({
-            "summary": "Some credentials are blocked. M2.4b is read-only; request bounded credential_refs with keys stats before M3 probe workflows.",
-            "dry_run_argv_status": "keys_probe_unavailable_until_m3",
+            "summary": "Some credentials are blocked. Request bounded credential_refs with keys stats before choosing an explicit probe or import workflow.",
+            "dry_run_argv_status": crate::cli_report::BOUNDED_CREDENTIAL_REFS_REQUIRED,
             "safe_argv": keys_stats_argv(operations.get("credential_set_id").and_then(Value::as_str), true),
             "side_effect_class": "runtime_readonly",
             "requires_confirmation": false,
@@ -4423,7 +4423,8 @@ mod tests {
         assert!(rendered.contains("\"credential_refs\""));
         assert!(rendered.contains("cr:v1:pos:0"));
         assert!(rendered.contains("cr:v1:pos:1"));
-        assert!(rendered.contains("keys_probe_unavailable_until_m3"));
+        assert!(rendered.contains("bounded_stats_projection_available"));
+        assert!(!rendered.contains("keys_probe_unavailable_until_m3"));
         assert!(!rendered.contains("cred_secret_internal"));
         assert!(!rendered.contains("cred_probe_secret"));
         assert!(!rendered.contains("fp-secret"));
@@ -5158,7 +5159,9 @@ mod tests {
         assert!(rendered.contains("\"summary\""));
         assert!(rendered.contains("\"next_action\""));
         assert!(rendered.contains("\"safe_argv\""));
-        assert!(rendered.contains("keys_probe_unavailable_until_m3"));
+        assert!(rendered.contains("bounded_credential_refs_required"));
+        assert!(!rendered.contains("keys_probe_unavailable_until_m3"));
+        assert!(!rendered.contains("before M3"));
         assert!(rendered.contains("\"shared-credentials\""));
         assert!(!rendered.contains("<credential-set-id>"));
         assert!(!rendered.contains("keys probe"));

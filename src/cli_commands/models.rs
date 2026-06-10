@@ -134,8 +134,8 @@ fn sanitized_models_list_report(model_routes: &Value, client_token_ref: Option<&
     };
     let data = serde_json::json!({
         "command": "models list",
-        "reload_diff_status": "unavailable_until_m4",
-        "capability_status": "unavailable_until_m4",
+        "reload_diff_status": crate::cli_report::LIST_RELOAD_STATUS_NOT_EVALUATED,
+        "capability_status": crate::cli_report::LIST_CAPABILITY_STATUS_NOT_EVALUATED,
         "client_token_ref": client_token_ref,
         "client_token_scope_status": models_list_client_scope_status(client_token_ref),
         "model_count": model_count,
@@ -188,12 +188,12 @@ fn models_list_client_scope_status(client_token_ref: Option<&str>) -> &'static s
 fn models_list_next_action(status: &str, client_token_ref: Option<&str>) -> Value {
     match status {
         "empty" => serde_json::json!({
-            "summary": "No compiled runtime model routes are available. Add explicit model routes, then run check-config. Reload status is unavailable until M4.",
+            "summary": "No compiled runtime model routes are available. Add explicit model routes, then run check-config. Use reload status or reload diff to inspect staged runtime changes.",
             "template_id": "check_config",
             "safe_argv": ["one-ai-key", "check-config", "--config", "<config>"],
             "side_effect_class": "offline_readonly",
             "requires_confirmation": false,
-            "reload_status": "unavailable_until_m4",
+            "reload_status": crate::cli_report::LIST_RELOAD_STATUS_NOT_EVALUATED,
         }),
         "blocked" => serde_json::json!({
             "summary": "Compiled model routes exist, but none have a runtime-visible enabled target in this bounded projection. Use models explain for a single public model.",
@@ -622,7 +622,7 @@ fn models_explain_next_action(
             "safe_argv": ["one-ai-key", "check-config", "--config", "<config>"],
             "side_effect_class": "offline_readonly",
             "requires_confirmation": false,
-            "repair_path": "deferred_by_m1_m4",
+            "repair_path": crate::cli_report::MANUAL_CONFIG_OR_REGISTRY_UPDATE_REQUIRED,
             "reload_status": "available",
         })
     } else {
@@ -968,10 +968,17 @@ mod tests {
             report["client_token_scope_status"],
             "not_evaluated_for_list_use_models_explain"
         );
-        assert_eq!(report["reload_diff_status"], "unavailable_until_m4");
-        assert_eq!(report["capability_status"], "unavailable_until_m4");
+        assert_eq!(
+            report["reload_diff_status"],
+            "not_evaluated_for_list_use_reload_status"
+        );
+        assert_eq!(
+            report["capability_status"],
+            "not_evaluated_for_list_use_models_explain"
+        );
         assert_eq!(report["models"][0]["model"], "gpt-public");
         assert_eq!(report["models"][0]["visible_target_count"], 1);
+        assert!(!rendered.contains("unavailable_until_m4"));
         assert!(!rendered.contains("SHOULD_NOT_RENDER_TOKEN_HASH"));
         assert!(!rendered.contains("client_tokens"));
     }
@@ -1141,6 +1148,26 @@ mod tests {
         let argv = report["next_action"]["safe_argv"].as_array().unwrap();
         assert!(argv.iter().any(|arg| arg == "--endpoint-family"));
         assert!(argv.iter().any(|arg| arg == "<endpoint-family>"));
+    }
+
+    #[test]
+    fn models_explain_scope_fallback_uses_stable_repair_path_without_phase_placeholder() {
+        let preview = serde_json::json!({
+            "model": "gpt-public"
+        });
+
+        let next_action = super::models_explain_next_action(
+            "blocked",
+            &preview,
+            "model_not_in_client_scope",
+            "unregistered_scope_reason_for_fallback",
+        );
+
+        assert_eq!(
+            next_action["repair_path"],
+            "manual_config_or_registry_update_required"
+        );
+        assert!(!next_action.to_string().contains("deferred_by_m1_m4"));
     }
 
     #[test]

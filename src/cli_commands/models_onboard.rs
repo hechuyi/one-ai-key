@@ -819,17 +819,17 @@ fn deferred_followups() -> Value {
     serde_json::json!([
         {
             "action": "edit_local_config_model_route",
-            "status": "deferred_by_m1_m4",
+            "status": crate::cli_report::MANUAL_FOLLOWUP_REQUIRED,
             "effect_class": "local_write"
         },
         {
             "action": "reload_runtime_after_manual_config_change",
-            "status": "deferred_by_m1_m4",
+            "status": crate::cli_report::MANUAL_FOLLOWUP_REQUIRED,
             "effect_class": "management_write"
         },
         {
             "action": "update_client_token_scope_if_needed",
-            "status": "deferred_by_m1_m4",
+            "status": crate::cli_report::MANUAL_FOLLOWUP_REQUIRED,
             "effect_class": "management_write"
         }
     ])
@@ -843,7 +843,7 @@ fn next_action_for_plan(status: &str) -> Value {
             "safe_argv": [],
             "side_effect_class": "runtime_readonly",
             "requires_confirmation": false,
-            "repair_path": "deferred_by_m1_m4",
+            "repair_path": crate::cli_report::MANUAL_CONFIG_OR_REGISTRY_UPDATE_REQUIRED,
         })
     } else {
         next_action_deferred()
@@ -857,7 +857,7 @@ fn next_action_deferred() -> Value {
         "safe_argv": [],
         "side_effect_class": "runtime_readonly",
         "requires_confirmation": false,
-        "repair_path": "deferred_by_m1_m4",
+        "repair_path": crate::cli_report::MANUAL_CONFIG_OR_REGISTRY_UPDATE_REQUIRED,
     })
 }
 
@@ -1204,8 +1204,9 @@ mod tests {
         assert_eq!(report["data"]["staged_registry_version"], 12);
         assert_eq!(
             report["data"]["required_followups"][0]["status"],
-            "deferred_by_m1_m4"
+            "manual_followup_required"
         );
+        assert!(!rendered.contains("deferred_by_m1_m4"));
         assert!(!rendered.contains("SHOULD_NOT_RENDER_TOKEN_HASH"));
         assert!(!rendered.contains("SHOULD_NOT_RENDER_LIVE_CATALOG"));
         assert!(!rendered.contains("SHOULD_NOT_RENDER_API_BASE"));
@@ -1260,7 +1261,11 @@ mod tests {
             "missing_visibility_args"
         );
         assert_eq!(report["data"]["reload_diff_status"], "unknown");
-        assert_eq!(report["next_action"]["repair_path"], "deferred_by_m1_m4");
+        assert_eq!(
+            report["next_action"]["repair_path"],
+            "manual_config_or_registry_update_required"
+        );
+        assert!(!rendered.contains("deferred_by_m1_m4"));
     }
 
     #[test]

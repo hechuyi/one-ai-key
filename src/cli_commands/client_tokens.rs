@@ -50,8 +50,8 @@ fn sanitized_client_tokens_list_report(tokens: &Value) -> Value {
     };
     let data = serde_json::json!({
         "command": "client-tokens list",
-        "reload_diff_status": "unavailable_until_m4",
-        "capability_status": "unavailable_until_m4",
+        "reload_diff_status": crate::cli_report::LIST_RELOAD_STATUS_NOT_EVALUATED,
+        "capability_status": crate::cli_report::LIST_CAPABILITY_STATUS_NOT_EVALUATED,
         "token_count": client_tokens.len(),
         "disabled_token_count": disabled_count,
         "client_tokens": client_tokens,
@@ -87,20 +87,20 @@ fn client_tokens_list_reason(status: &str) -> &'static str {
 fn client_tokens_list_next_action(status: &str) -> Value {
     match status {
         "empty" => serde_json::json!({
-            "summary": "No runtime client-token references are available. Add configured client tokens, then run check-config. Reload status is unavailable until M4.",
+            "summary": "No runtime client-token references are available. Add configured client tokens, then run check-config. Use reload status or reload diff to inspect staged runtime changes.",
             "template_id": "check_config",
             "safe_argv": ["one-ai-key", "check-config", "--config", "<config>"],
             "side_effect_class": "offline_readonly",
             "requires_confirmation": false,
-            "reload_status": "unavailable_until_m4",
+            "reload_status": crate::cli_report::LIST_RELOAD_STATUS_NOT_EVALUATED,
         }),
         "blocked" => serde_json::json!({
-            "summary": "All runtime client-token references are disabled. M2.3 is read-only; update the supported configuration or management workflow, then run check-config. Reload status is unavailable until M4.",
+            "summary": "All runtime client-token references are disabled. This command is read-only; update the supported configuration or management workflow, then run check-config. Use reload status or reload diff to inspect staged runtime changes.",
             "template_id": "check_config",
             "safe_argv": ["one-ai-key", "check-config", "--config", "<config>"],
             "side_effect_class": "offline_readonly",
             "requires_confirmation": false,
-            "reload_status": "unavailable_until_m4",
+            "reload_status": crate::cli_report::LIST_RELOAD_STATUS_NOT_EVALUATED,
         }),
         _ => serde_json::json!({
             "summary": "Runtime client-token references are available. Use models explain with a public model and client-token reference to inspect model visibility.",
@@ -143,8 +143,16 @@ fn render_client_tokens_list_table(tokens: &Value) -> String {
     let mut output = String::new();
     output.push_str("Client tokens\n");
     crate::cli_report::append_report_envelope_table_fields(&mut output, &report);
-    output.push_str("reload_diff_status: unavailable_until_m4\n");
-    output.push_str("capability_status: unavailable_until_m4\n");
+    crate::cli_report::push_table_field(
+        &mut output,
+        "reload_diff_status",
+        report.get("reload_diff_status"),
+    );
+    crate::cli_report::push_table_field(
+        &mut output,
+        "capability_status",
+        report.get("capability_status"),
+    );
     output.push_str(&format!(
         "token_count: {}\n",
         report
@@ -245,8 +253,14 @@ mod tests {
         assert_eq!(report["side_effect_class"], "runtime_readonly");
         assert_eq!(report["effect_vector"]["reads_management_runtime"], true);
         assert_eq!(report["window"], serde_json::Value::Null);
-        assert_eq!(report["reload_diff_status"], "unavailable_until_m4");
-        assert_eq!(report["capability_status"], "unavailable_until_m4");
+        assert_eq!(
+            report["reload_diff_status"],
+            "not_evaluated_for_list_use_reload_status"
+        );
+        assert_eq!(
+            report["capability_status"],
+            "not_evaluated_for_list_use_models_explain"
+        );
         assert_eq!(report["client_tokens"][0]["id"], "local-client");
         let legacy_safe_field = ["safe", "command"].join("_");
         let legacy_dry_run_field = ["dry", "run", "command"].join("_");
@@ -303,7 +317,9 @@ mod tests {
         assert!(rendered.contains("reason_code: all_client_tokens_disabled"));
         assert!(rendered.contains("side_effect_class: runtime_readonly"));
         assert!(rendered.contains("effect.reads_management_runtime: true"));
-        assert!(rendered.contains("capability_status: unavailable_until_m4"));
+        assert!(rendered.contains("capability_status: not_evaluated_for_list_use_models_explain"));
+        assert!(!rendered.contains("unavailable_until_m4"));
+        assert!(!rendered.contains("until M4"));
         assert!(rendered.contains("next_action.safe_argv[0]: one-ai-key"));
         assert!(rendered.contains("model_groups=unrestricted"));
         assert!(rendered.contains("channels=1"));
