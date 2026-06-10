@@ -452,9 +452,9 @@ matrix item or opening a separate accepted plan.
 
 ## Next Version Entry
 
-A next version starts only after the current stop card is closed or the current
-plan is explicitly abandoned. It must define one named capability package, not a
-catch-all upgrade. Its entry record must include:
+A next version starts only after the current release criteria are closed or the
+current plan is explicitly abandoned. It must define one named capability
+package, not a catch-all upgrade. Its entry record must include:
 
 - `version_name`;
 - `single_capability_package`;

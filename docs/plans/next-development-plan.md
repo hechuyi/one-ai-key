@@ -457,7 +457,7 @@ Every stage must include:
 - `scripts/check-staged-denylist.sh`;
 - local Docker/Nix x86_64 release build when publishing;
 - extracted-artifact release smoke;
-- stop card with implemented scope, deferred scope, explicit rejections,
+- release record with implemented scope, deferred scope, explicit rejections,
   local-ci result, release-smoke result, redaction result, compatibility result,
   and known blockers.
 

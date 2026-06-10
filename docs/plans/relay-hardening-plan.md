@@ -15,7 +15,7 @@ The original relay critique and early draft plan were reviewed from four enginee
 - State-machine/lifecycle review: Phase 1 lacked exact transition tables, failure-source ownership, reset scope, all-target suppression policy, and response-filter alert lifecycle.
 - Hot-path/protocol review: Phase 2 lacked a 2xx scope contract, latency cap, SSE parser contract, guarded classifier evidence path, guard/filter ordering, and header/framing rules for body mutation.
 - Operations/security review: management security was too late and too vague; local x86_64 NixOS container build, release artifact identity, repo hygiene, audit schema, allowlist behavior, and unknown-field rejection were not executable gates.
-- Test/phase-slicing review: phases were too large, stop nodes were concept-level rather than red/green stop cards, and endpoint/schema assertions were missing.
+- Test/phase-slicing review: phases were too large, stop nodes were concept-level rather than red/green acceptance gates, and endpoint/schema assertions were missing.
 
 The plan below adopts those blocking findings. It does not adopt scope-expanding ideas such as live upstream model aggregation, persistent model-discovery state machines, UI work, multi-tenant billing, heavyweight control-plane databases, active probe daemons, hedging, or alert/post-output response-filter-driven channel lifecycle mutation.
 
@@ -140,7 +140,7 @@ Add management health projections before any new channel suppression behavior:
 | `GET /management/health/serving` | Current ability to serve client traffic | `200` when service can accept at least one configured route; `503` otherwise | `status`, `serving`, `serving_channels`, `blocking_alerts`, `blocking_reasons[]`. |
 | `GET /management/health/resilience` | Spare capacity and degradation | Always `200` if management auth succeeds | `status: ok|degraded|blocked`, `operator_input_alerts`, `credential_sets_without_spare`, `channels_cooling_down`, `response_filter_alerts`. |
 
-**Phase 0 stop card:** write red tests for route role matrix coverage, allowlist fail-closed behavior, audit redaction/timestamp/replay, health endpoint schemas, unknown-field rejection, local CI script, local x86_64 build script, and release artifact hygiene. Complete only when those tests pass and the local build artifact plus SHA256 are produced locally. If the local x86_64 environment cannot run, stop the roadmap as blocked; do not continue into relay semantics.
+**Phase 0 acceptance gate:** write red tests for route role matrix coverage, allowlist fail-closed behavior, audit redaction/timestamp/replay, health endpoint schemas, unknown-field rejection, local CI script, local x86_64 build script, and release artifact hygiene. Complete only when those tests pass and the local build artifact plus SHA256 are produced locally. If the local x86_64 environment cannot run, stop the roadmap as blocked; do not continue into relay semantics.
 
 ## Phase 1A: Relay Profiles And Typed Classifier Semantics
 
@@ -163,7 +163,7 @@ Classifier table for Phase 1A:
 
 Unsupported matcher fields such as free-form message contains/regex matching must fail config resolution rather than being ignored. Account/provider/client-token balance scopes remain rejected until a future runtime state machine and management projection exist.
 
-**Phase 1A stop card:** red tests cover profile config resolution, current-config backward compatibility, each table row, unsupported field rejection, unsupported `balance_scope: channel` rejection, management policy projection fields, and absence of request-path free-form message parsing. Complete only when these tests pass under `scripts/local-ci.sh` and the local x86_64 build gate still passes.
+**Phase 1A acceptance gate:** red tests cover profile config resolution, current-config backward compatibility, each table row, unsupported field rejection, unsupported `balance_scope: channel` rejection, management policy projection fields, and absence of request-path free-form message parsing. Complete only when these tests pass under `scripts/local-ci.sh` and the local x86_64 build gate still passes.
 
 **Status note:** Phase 1A documentation and acceptance scope is limited to the typed classifier semantics above. The current management acceptance surface is the existing `/management/channels/:id/error-rules` effective-rule projection plus `/management/policy-profiles` and `/management/policy-profiles/:id` profile projections. `/v1/models` remains a compiled runtime projection over explicit `model_routes`; Phase 1A does not add live upstream model aggregation, channel balance suppression, free-form message matchers, or new management endpoints.
 
@@ -203,7 +203,7 @@ Endpoint/schema acceptance:
 | `POST /management/channels/:id/reset-health` | Clears only transient channel health and relay suppression counters; disabled/configured-disabled states remain excluded. |
 | `GET /management/alerts` | All-target suppression alert includes resource kind, public model id when available, channel ids, reason codes, severity. |
 
-**Phase 1B stop card:** red tests cover `balance_scope: channel` config acceptance, account/provider/credential-set scope rejection, transition table rows, no durable credential quota-exhaust from channel balance evidence, stale generation rejection, TTL expiry, success recovery, manual reset scope, disabled/configured-disabled exclusion, all-target `no_route_candidate`, management schemas, and local build gate. Stop as blocked if implementing account/provider/credential-set balance scope becomes necessary; do not widen scope inside this phase.
+**Phase 1B acceptance gate:** red tests cover `balance_scope: channel` config acceptance, account/provider/credential-set scope rejection, transition table rows, no durable credential quota-exhaust from channel balance evidence, stale generation rejection, TTL expiry, success recovery, manual reset scope, disabled/configured-disabled exclusion, all-target `no_route_candidate`, management schemas, and local build gate. Stop as blocked if implementing account/provider/credential-set balance scope becomes necessary; do not widen scope inside this phase.
 
 **Phase 1B documentation acceptance:** README and architecture docs must describe `balance_scope: channel` as selected-channel transient suppression, state that account/provider/credential-set suppression remains rejected, state that channel balance does not durably quota-exhaust credentials, state that disabled/configured-disabled channels are not auto-restored, state that all-target cooldown fails closed as `no_route_candidate`, and identify the management surfaces for channel health, routing preview, and alerts. They must also explicitly say that Phase 1B does not implement Phase 2 retry telemetry, Phase 3 2xx guard behavior, or Phase 4 response-filter lifecycle mutation.
 
@@ -237,7 +237,7 @@ The effective-deadline gate is evaluated before every fallback attempt. It uses 
 
 Retry-pressure observability is bounded. Implementations may use an in-memory ring, windowed counters, or equivalent capped structure, but `/management/runtime` must expose the configured capacity and recent counts without unbounded cardinality from model ids, upstream text, credentials, request ids, or raw provider payloads.
 
-**Phase 2 stop card:** red tests cover each denial reason, duplicate-charge risk for guarded and non-2xx fallback classes, effective-deadline denial, bounded retry-pressure capacity, schemas above, and existing same-request retry behavior. Tests must also assert that Phase 2 does not implement HTTP 2xx success-guard classification, response-filter lifecycle actions, or live `/v1/models` aggregation. Complete only when local CI and x86_64 build pass.
+**Phase 2 acceptance gate:** red tests cover each denial reason, duplicate-charge risk for guarded and non-2xx fallback classes, effective-deadline denial, bounded retry-pressure capacity, schemas above, and existing same-request retry behavior. Tests must also assert that Phase 2 does not implement HTTP 2xx success-guard classification, response-filter lifecycle actions, or live `/v1/models` aggregation. Complete only when local CI and x86_64 build pass.
 
 ## Phase 3: HTTP 2xx Success Guard
 
@@ -273,7 +273,7 @@ Pipeline order: upstream response -> 2xx guard -> reconstructed pass-through str
 
 Guard outcomes: `pass`, `classified`, `cap_exhausted`, `deadline_exhausted`, `parse_unsupported`. Classified fallback emits the Phase 2 retry decision event with `failure_source: guarded_success_envelope` and `duplicate_charge_risk: unknown` when a retry proceeds.
 
-**Phase 3 stop card:** red tests cover JSON error classification, code-less request-only behavior, body-bearing non-200 2xx responses, no-body status skip, first SSE error split across chunks, CRLF/comment/multiple-data-line SSE parsing, `[DONE]` pass-through, byte-exact prefix replay, no stale content length when filtered, cap and deadline pass-through, no fallback for streaming/non-replayable/partial-output paths, duplicate-charge-risk telemetry, and no false rejection of valid OpenAI Responses-style SSE. Complete only when local CI and x86_64 build pass.
+**Phase 3 acceptance gate:** red tests cover JSON error classification, code-less request-only behavior, body-bearing non-200 2xx responses, no-body status skip, first SSE error split across chunks, CRLF/comment/multiple-data-line SSE parsing, `[DONE]` pass-through, byte-exact prefix replay, no stale content length when filtered, cap and deadline pass-through, no fallback for streaming/non-replayable/partial-output paths, duplicate-charge-risk telemetry, and no false rejection of valid OpenAI Responses-style SSE. Complete only when local CI and x86_64 build pass.
 
 ## Phase 3B: Pre-Output Retry/Fallback Reliability Tightening
 
@@ -319,7 +319,7 @@ Stop-card tests:
 - Retry pressure remains bounded under repeated failures.
 - Routing preview explains skipped frozen candidates without leaking secrets or raw upstream payloads.
 
-**Phase 3B stop card:** complete only when the tests above pass under the normal local CI/build gates. Stop as blocked if the implementation needs mid-stream continuation fallback, free-text keyword disablement, live model aggregation, complex multi-tenant billing/UI behavior, active probe daemons, request-path storage joins, full successful-response buffering, or post-output transparent fallback.
+**Phase 3B acceptance gate:** complete only when the tests above pass under the normal local CI/build gates. Stop as blocked if the implementation needs mid-stream continuation fallback, free-text keyword disablement, live model aggregation, complex multi-tenant billing/UI behavior, active probe daemons, request-path storage joins, full successful-response buffering, or post-output transparent fallback.
 
 ## Phase 4: Response Filter Events And Protocol Framing
 
@@ -349,7 +349,7 @@ Framing/header contract:
 - Non-UTF-8 bytes pass through unchanged and do not create matched-text events.
 - Response-filter events never store matched text, raw chunks, request bodies, response bodies, upstream keys, client tokens, or absolute paths.
 
-**Phase 4 stop card:** red tests cover event schema/redaction, ring capacity, alert decay window, SSE redaction/rejection framing, non-SSE rejection headers, content-length stripping on mutation, guard-prefix filtering exactly once, no lifecycle/channel mutation from filter events or alerts, explicit pre-commit lifecycle actions through the unified retry gates, no routing telemetry writes from ordinary filter hits, and local build gates.
+**Phase 4 acceptance gate:** red tests cover event schema/redaction, ring capacity, alert decay window, SSE redaction/rejection framing, non-SSE rejection headers, content-length stripping on mutation, guard-prefix filtering exactly once, no lifecycle/channel mutation from filter events or alerts, explicit pre-commit lifecycle actions through the unified retry gates, no routing telemetry writes from ordinary filter hits, and local build gates.
 
 ## Phase 5: Explanation, Documentation, And Final Boundary Hardening
 
@@ -366,7 +366,7 @@ Framing/header contract:
 
 Explain endpoint schemas must be redacted: no raw tokens, token hashes, upstream keys, raw request/response bodies, matched text, absolute key paths, URL userinfo, or token-like query parameters.
 
-**Phase 5 stop card:** red tests cover explain runtime schema, staged-vs-runtime reporting, routing preview skip reasons for relay-suppressed channels, health serving/resilience truth table, README boundary, performance-budget updates, response-filter docs consistency, and final local build/release hygiene. Complete only when the full roadmap verification gate passes.
+**Phase 5 acceptance gate:** red tests cover explain runtime schema, staged-vs-runtime reporting, routing preview skip reasons for relay-suppressed channels, health serving/resilience truth table, README boundary, performance-budget updates, response-filter docs consistency, and final local build/release hygiene. Complete only when the full roadmap verification gate passes.
 
 ## Deferred Boundary: Model Discovery
 
@@ -446,5 +446,5 @@ Root issue ledger for this revision:
 | State-machine lifecycle underspecified | Added failure source terms, classifier table, channel transition table, reset scope, and all-target fail-closed policy. |
 | Hot-path protocol contract underspecified | Added 2xx scope, byte/time/event caps, SSE scanner rules, synthetic guarded evidence, prefix replay, and guard/filter ordering. |
 | Management and release gates too late/vague | Moved roles, allowlist, audit, unknown-field validation, local x86_64 build, and release hygiene into Phase 0. |
-| Tests not red/green enough | Added phase stop cards with endpoint/schema assertions and blocked conditions. |
+| Tests not red/green enough | Added phase acceptance gates with endpoint/schema assertions and blocked conditions. |
 | Model discovery scope drift | Reframed model discovery as deferred boundary only. |

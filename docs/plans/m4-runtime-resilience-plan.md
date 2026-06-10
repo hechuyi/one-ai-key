@@ -346,9 +346,9 @@ The script must:
 - avoid writing output inside the repository;
 - avoid SSH, systemd, NixOS rebuilds, or deployment mutation.
 
-Docs should describe the same workflow as an operator checklist. The stop card
-must record `production_smoke_result` as `pass`, `not_run_by_design`, or
-`blocked`; private production access must not become a repository release
+Docs should describe the same workflow as an operator checklist. The release
+record may state whether production smoke was operator-run, deliberately not
+run, or blocked; private production access must not become a repository release
 dependency.
 
 ## Delivery Requirements
