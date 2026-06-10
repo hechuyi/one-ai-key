@@ -1,12 +1,18 @@
+mod management_access;
+
 use axum::{
     middleware,
     routing::{any, get, patch, post, put},
     Router,
 };
 
-use crate::{
-    management, management_role_gate, proxy, state::AppState, unregistered_management_route,
+#[cfg(test)]
+pub(crate) use self::management_access::{
+    is_management_path, management_route_specs, ManagementRouteSpec,
 };
+use self::management_access::{management_role_gate, unregistered_management_route};
+
+use crate::{management, proxy, state::AppState};
 
 pub(crate) fn router_without_test_peer_default(state: AppState) -> Router {
     Router::new()

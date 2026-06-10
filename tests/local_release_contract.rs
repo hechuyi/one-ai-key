@@ -351,6 +351,13 @@ fn gitignore_and_dockerignore_cover_sensitive_runtime_and_release_patterns() {
         "golden/",
         "tests/snapshots/",
         "tests/golden/",
+        "__pycache__/",
+        ".pytest_cache/",
+        ".ruff_cache/",
+        ".mypy_cache/",
+        ".coverage",
+        "coverage/",
+        "htmlcov/",
     ];
 
     for (path, contents) in files {

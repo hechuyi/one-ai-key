@@ -37,6 +37,8 @@ config/*.yml
 config/*.json
 config/*.toml
 scripts/one_ai_key_keys.py
+scripts/one_ai_key_upload_key.py
+tests/test_one_ai_key_upload_key.py
 
 # Secret material.
 *.pem
@@ -54,6 +56,12 @@ scripts/one_ai_key_keys.py
 .DS_Store
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage/
+htmlcov/
 
 # Local documentation renders/exports.
 docs/export/
