@@ -23,8 +23,9 @@ use crate::{
     },
     response_filter::{ResponseFilterDecision, ResponseFilterMatch},
     route_plan::{
-        plan_route, preview_route, ChannelRouteState, RouteCandidate, RoutePlan, RoutePlanInput,
-        RoutePreview, RoutePreviewInput, RoutePreviewReason,
+        plan_route, preview_route, route_preview_reason_is_hard_blocker,
+        route_preview_reason_is_soft_suppression, ChannelRouteState, RouteCandidate, RoutePlan,
+        RoutePlanInput, RoutePreview, RoutePreviewInput, RoutePreviewReason,
     },
     routing::{
         apply_retry_directive_to_attempt_state, FailureSource, FrozenRetryCandidates,
@@ -589,9 +590,9 @@ fn admission_reason_codes(preview: &RoutePreview) -> (Vec<String>, Vec<String>) 
     let mut soft = BTreeSet::new();
     for candidate in &preview.candidates {
         for reason in &candidate.reasons {
-            if route_preview_reason_is_soft_suppression(reason) {
+            if route_preview_reason_is_soft_suppression(*reason) {
                 soft.insert(reason.as_str().to_string());
-            } else if !route_preview_reason_is_last_resort(reason) {
+            } else if route_preview_reason_is_hard_blocker(*reason) {
                 hard.insert(reason.as_str().to_string());
             }
         }
@@ -608,10 +609,10 @@ fn hard_blocked_candidate_count(preview: &RoutePreview) -> usize {
         .iter()
         .filter(|candidate| {
             !candidate.included
-                && candidate.reasons.iter().any(|reason| {
-                    !route_preview_reason_is_soft_suppression(reason)
-                        && !route_preview_reason_is_last_resort(reason)
-                })
+                && candidate
+                    .reasons
+                    .iter()
+                    .any(|reason| route_preview_reason_is_hard_blocker(*reason))
         })
         .count()
 }
@@ -626,23 +627,10 @@ fn soft_suppressed_candidate_count(preview: &RoutePreview) -> usize {
                 && candidate
                     .reasons
                     .iter()
+                    .copied()
                     .all(route_preview_reason_is_soft_suppression)
         })
         .count()
-}
-
-fn route_preview_reason_is_soft_suppression(reason: &RoutePreviewReason) -> bool {
-    matches!(
-        reason,
-        RoutePreviewReason::ChannelDegraded | RoutePreviewReason::ProviderCoolingDown
-    )
-}
-
-fn route_preview_reason_is_last_resort(reason: &RoutePreviewReason) -> bool {
-    matches!(
-        reason,
-        RoutePreviewReason::DegradedLastResort | RoutePreviewReason::ProviderCoolingDownLastResort
-    )
 }
 
 fn endpoint_family_code(endpoint: EndpointKind) -> &'static str {

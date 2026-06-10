@@ -13,7 +13,8 @@ use crate::{
     },
     provider::ProviderKind,
     route_plan::{
-        preview_route, ChannelRouteState, ModelRoute, RoutePreview, RoutePreviewCandidate,
+        preview_route, route_admission_summary, ChannelRouteState, ModelRoute,
+        RouteAdmissionSelectedTarget, RouteAdmissionSummary, RoutePreview, RoutePreviewCandidate,
         RoutePreviewInput, RoutePreviewReason, RouteStrategy, RouteTarget,
     },
     state::{AppState, ChannelHealth, ChannelId, ChannelRoutePlanContext},
@@ -128,6 +129,7 @@ pub struct RoutingPreviewResponseInput {
     pub candidate_limit: usize,
     pub policy_summary: RoutingPreviewPolicySummary,
     pub client_token: RoutingPreviewClientStatus,
+    pub admission_summary: RouteAdmissionSummary,
     pub candidates: Vec<RoutingPreviewCandidateStatus>,
 }
 
@@ -140,20 +142,12 @@ pub fn routing_preview_response(input: RoutingPreviewResponseInput) -> RoutingPr
         candidate_limit,
         policy_summary,
         client_token,
+        admission_summary,
         candidates,
     } = input;
-    let selected_target = candidates
-        .iter()
-        .find(|candidate| candidate.selected)
-        .and_then(|candidate| {
-            candidate
-                .plan_position
-                .map(|position| RoutingPreviewSelectedTarget {
-                    channel_id: candidate.channel_id.clone(),
-                    plan_position: position,
-                })
-        });
-    let admission_summary = routing_preview_admission_summary(&candidates, selected_target.clone());
+    let selected_target =
+        routing_preview_selected_target_from_route_summary(&admission_summary.selected_target);
+    let admission_summary = RoutingPreviewAdmissionSummary::from_route_summary(&admission_summary);
 
     RoutingPreviewResponse {
         request_id,
@@ -167,6 +161,25 @@ pub fn routing_preview_response(input: RoutingPreviewResponseInput) -> RoutingPr
         selected_target,
         candidates,
     }
+}
+
+fn no_route_admission_summary(
+    request_id: String,
+    registry_generation: u64,
+    model: &str,
+    candidate_limit: usize,
+) -> RouteAdmissionSummary {
+    let channel_states = HashMap::new();
+    let preview = preview_route(RoutePreviewInput {
+        request_id,
+        registry_generation,
+        public_model: Some(model.to_string()),
+        route: None,
+        channel_states: &channel_states,
+        allowed_channels: &[],
+        candidate_limit,
+    });
+    route_admission_summary(&preview)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Default)]
@@ -293,6 +306,12 @@ pub async fn routing_preview_for_model(
                 ..RoutingPreviewPolicySummary::default()
             },
             client_token: client_status,
+            admission_summary: no_route_admission_summary(
+                format!("preview:{model}:{}", client.id),
+                route_context.registry_generation,
+                model,
+                state.routing.max_route_candidates,
+            ),
             candidates: Vec::new(),
         }));
     }
@@ -311,6 +330,12 @@ pub async fn routing_preview_for_model(
                 ..RoutingPreviewPolicySummary::default()
             },
             client_token: client_status,
+            admission_summary: no_route_admission_summary(
+                format!("preview:{model}:{}", client.id),
+                route_context.registry_generation,
+                model,
+                state.routing.max_route_candidates,
+            ),
             candidates: Vec::new(),
         }));
     }
@@ -347,6 +372,7 @@ pub async fn routing_preview_for_model(
         &preview.candidates,
         preview.candidate_limit,
     );
+    let admission_summary = route_admission_summary(&preview);
     let candidates = routing_preview_candidate_statuses(&channel_statuses, preview.candidates);
     Ok(routing_preview_response(RoutingPreviewResponseInput {
         request_id,
@@ -356,6 +382,7 @@ pub async fn routing_preview_for_model(
         candidate_limit: preview.candidate_limit,
         policy_summary,
         client_token: client_status,
+        admission_summary,
         candidates,
     }))
 }
@@ -364,6 +391,15 @@ pub async fn routing_preview_for_model(
 pub struct RoutingPreviewSelectedTarget {
     pub channel_id: String,
     pub plan_position: usize,
+}
+
+fn routing_preview_selected_target_from_route_summary(
+    target: &Option<RouteAdmissionSelectedTarget>,
+) -> Option<RoutingPreviewSelectedTarget> {
+    target.as_ref().map(|target| RoutingPreviewSelectedTarget {
+        channel_id: target.channel_id.0.clone(),
+        plan_position: target.plan_position,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -380,107 +416,23 @@ pub struct RoutingPreviewAdmissionSummary {
     pub last_resort_reason: Option<&'static str>,
 }
 
-fn routing_preview_admission_summary(
-    candidates: &[RoutingPreviewCandidateStatus],
-    selected_target: Option<RoutingPreviewSelectedTarget>,
-) -> RoutingPreviewAdmissionSummary {
-    let candidate_count = candidates.len();
-    let included_count = candidates
-        .iter()
-        .filter(|candidate| candidate.included)
-        .count();
-    let blocked_count = candidate_count.saturating_sub(included_count);
-    let soft_suppressed_count = candidates
-        .iter()
-        .filter(|candidate| {
-            candidate
-                .reasons
-                .iter()
-                .any(|reason| routing_preview_soft_suppression_reason(reason))
-        })
-        .count();
-    let hard_blocked_count = candidates
-        .iter()
-        .filter(|candidate| {
-            candidate
-                .reasons
-                .iter()
-                .any(|reason| routing_preview_hard_blocker_reason(reason))
-        })
-        .count();
-    let last_resort_reason = candidates
-        .iter()
-        .find(|candidate| candidate.selected)
-        .and_then(|candidate| {
-            candidate
-                .reasons
-                .iter()
-                .copied()
-                .find(|reason| routing_preview_last_resort_reason(reason))
-        });
-    let (status, reason_code) = if let Some(reason) = last_resort_reason {
-        ("last_resort", reason)
-    } else if selected_target.is_some() {
-        ("available", "available")
-    } else {
-        (
-            "unavailable",
-            routing_preview_unavailable_reason(candidates),
-        )
-    };
-
-    RoutingPreviewAdmissionSummary {
-        status,
-        reason_code,
-        selected_target,
-        candidate_count,
-        included_count,
-        blocked_count,
-        soft_suppressed_count,
-        hard_blocked_count,
-        last_resort_used: last_resort_reason.is_some(),
-        last_resort_reason,
+impl RoutingPreviewAdmissionSummary {
+    fn from_route_summary(summary: &RouteAdmissionSummary) -> Self {
+        Self {
+            status: summary.status.as_str(),
+            reason_code: summary.reason_code,
+            selected_target: routing_preview_selected_target_from_route_summary(
+                &summary.selected_target,
+            ),
+            candidate_count: summary.candidate_count,
+            included_count: summary.included_count,
+            blocked_count: summary.blocked_count,
+            soft_suppressed_count: summary.soft_suppressed_count,
+            hard_blocked_count: summary.hard_blocked_count,
+            last_resort_used: summary.last_resort_used,
+            last_resort_reason: summary.last_resort_reason,
+        }
     }
-}
-
-fn routing_preview_unavailable_reason(
-    candidates: &[RoutingPreviewCandidateStatus],
-) -> &'static str {
-    candidates
-        .iter()
-        .flat_map(|candidate| candidate.reasons.iter().copied())
-        .find(|reason| routing_preview_hard_blocker_reason(reason))
-        .or_else(|| {
-            candidates
-                .iter()
-                .flat_map(|candidate| candidate.reasons.iter().copied())
-                .find(|reason| routing_preview_soft_suppression_reason(reason))
-        })
-        .unwrap_or("no_route_candidate")
-}
-
-fn routing_preview_hard_blocker_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        "target_disabled"
-            | "client_channel_scope"
-            | "channel_disabled"
-            | "channel_cooling_down"
-            | "no_available_credentials"
-            | "runtime_unavailable"
-            | "unknown_channel"
-    )
-}
-
-fn routing_preview_soft_suppression_reason(reason: &str) -> bool {
-    matches!(reason, "channel_degraded" | "provider_cooling_down")
-}
-
-fn routing_preview_last_resort_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        "degraded_last_resort" | "provider_cooling_down_last_resort"
-    )
 }
 
 #[derive(Debug, Serialize)]
@@ -1590,6 +1542,7 @@ impl EndpointFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::route_plan::RouteAdmissionStatus;
     use crate::{
         config::{
             AccountConfig, ClientTokenConfig, CredentialSetConfig, ErrorRulesConfig,
@@ -1820,6 +1773,7 @@ mod tests {
 
     fn preview_response_with_candidates(
         candidates: Vec<RoutingPreviewCandidateStatus>,
+        admission_summary: RouteAdmissionSummary,
     ) -> serde_json::Value {
         serde_json::to_value(routing_preview_response(RoutingPreviewResponseInput {
             request_id: "preview:gpt-public:client-a".to_string(),
@@ -1832,20 +1786,61 @@ mod tests {
                 ..RoutingPreviewPolicySummary::default()
             },
             client_token: routing_preview_client_status(&client("client-a", true)),
+            admission_summary,
             candidates,
         }))
         .unwrap()
     }
 
+    fn route_admission_selected_target(
+        channel_id: &str,
+        plan_position: usize,
+    ) -> RouteAdmissionSelectedTarget {
+        RouteAdmissionSelectedTarget {
+            channel_id: ChannelId(channel_id.to_string()),
+            plan_position,
+        }
+    }
+
+    fn route_admission_summary_for_test(
+        status: RouteAdmissionStatus,
+        reason_code: &'static str,
+        selected_target: Option<RouteAdmissionSelectedTarget>,
+        candidate_count: usize,
+        included_count: usize,
+        soft_suppressed_count: usize,
+        hard_blocked_count: usize,
+        last_resort_reason: Option<&'static str>,
+    ) -> RouteAdmissionSummary {
+        RouteAdmissionSummary {
+            status,
+            reason_code,
+            selected_target,
+            candidate_count,
+            included_count,
+            blocked_count: candidate_count.saturating_sub(included_count),
+            soft_suppressed_count,
+            hard_blocked_count,
+            last_resort_used: last_resort_reason.is_some(),
+            last_resort_reason,
+        }
+    }
+
     #[test]
     fn routing_preview_exports_admission_summary_for_selected_route() {
-        let value = preview_response_with_candidates(vec![candidate_status(
-            "ch1",
-            true,
-            true,
-            Some(0),
-            Vec::new(),
-        )]);
+        let value = preview_response_with_candidates(
+            vec![candidate_status("ch1", true, true, Some(0), Vec::new())],
+            route_admission_summary_for_test(
+                RouteAdmissionStatus::Available,
+                "available",
+                Some(route_admission_selected_target("ch1", 0)),
+                1,
+                1,
+                0,
+                0,
+                None,
+            ),
+        );
 
         let summary = &value["admission_summary"];
         assert_eq!(summary["status"], "available");
@@ -1929,7 +1924,19 @@ mod tests {
             Some(0),
             vec!["provider_cooling_down_last_resort"],
         ));
-        let value = preview_response_with_candidates(candidates);
+        let value = preview_response_with_candidates(
+            candidates,
+            route_admission_summary_for_test(
+                RouteAdmissionStatus::LastResort,
+                "provider_cooling_down_last_resort",
+                Some(route_admission_selected_target("last-resort", 0)),
+                10,
+                1,
+                2,
+                7,
+                Some("provider_cooling_down_last_resort"),
+            ),
+        );
 
         let summary = &value["admission_summary"];
         assert_eq!(summary["status"], "last_resort");
@@ -1949,16 +1956,28 @@ mod tests {
 
     #[test]
     fn routing_preview_admission_summary_preserves_candidate_reasons() {
-        let value = preview_response_with_candidates(vec![
-            candidate_status(
-                "blocked",
-                false,
-                false,
+        let value = preview_response_with_candidates(
+            vec![
+                candidate_status(
+                    "blocked",
+                    false,
+                    false,
+                    None,
+                    vec!["client_channel_scope", "channel_degraded"],
+                ),
+                candidate_status("selected", true, true, Some(0), Vec::new()),
+            ],
+            route_admission_summary_for_test(
+                RouteAdmissionStatus::Available,
+                "available",
+                Some(route_admission_selected_target("selected", 0)),
+                2,
+                1,
+                1,
+                1,
                 None,
-                vec!["client_channel_scope", "channel_degraded"],
             ),
-            candidate_status("selected", true, true, Some(0), Vec::new()),
-        ]);
+        );
 
         assert_eq!(value["candidates"][0]["reasons"][0], "client_channel_scope");
         assert_eq!(value["candidates"][0]["reasons"][1], "channel_degraded");

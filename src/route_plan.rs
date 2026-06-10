@@ -117,6 +117,43 @@ impl RoutePreviewReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteAdmissionStatus {
+    Available,
+    LastResort,
+    Unavailable,
+}
+
+impl RouteAdmissionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteAdmissionStatus::Available => "available",
+            RouteAdmissionStatus::LastResort => "last_resort",
+            RouteAdmissionStatus::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteAdmissionSelectedTarget {
+    pub channel_id: ChannelId,
+    pub plan_position: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteAdmissionSummary {
+    pub status: RouteAdmissionStatus,
+    pub reason_code: &'static str,
+    pub selected_target: Option<RouteAdmissionSelectedTarget>,
+    pub candidate_count: usize,
+    pub included_count: usize,
+    pub blocked_count: usize,
+    pub soft_suppressed_count: usize,
+    pub hard_blocked_count: usize,
+    pub last_resort_used: bool,
+    pub last_resort_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelRouteState {
     Available,
     /// Provider/account failure-domain soft cooldowns are normalized to this
@@ -220,6 +257,128 @@ pub fn plan_route(input: RoutePlanInput<'_>) -> Result<RoutePlan, RoutePlanError
         targets,
         selected_index: 0,
     })
+}
+
+pub fn route_admission_summary(preview: &RoutePreview) -> RouteAdmissionSummary {
+    let candidate_count = preview.candidates.len();
+    let included_count = preview
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.included)
+        .count();
+    let blocked_count = candidate_count.saturating_sub(included_count);
+    let soft_suppressed_count = preview
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .reasons
+                .iter()
+                .any(|reason| route_preview_reason_is_soft_suppression(*reason))
+        })
+        .count();
+    let hard_blocked_count = preview
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .reasons
+                .iter()
+                .any(|reason| route_preview_reason_is_hard_blocker(*reason))
+        })
+        .count();
+    let selected_candidate = preview
+        .candidates
+        .iter()
+        .find(|candidate| candidate.selected);
+    let selected_target = selected_candidate.and_then(|candidate| {
+        candidate
+            .plan_position
+            .map(|plan_position| RouteAdmissionSelectedTarget {
+                channel_id: candidate.channel_id.clone(),
+                plan_position,
+            })
+    });
+    let last_resort_reason = selected_candidate.and_then(|candidate| {
+        candidate
+            .reasons
+            .iter()
+            .copied()
+            .find(|reason| route_preview_reason_is_last_resort(*reason))
+            .map(RoutePreviewReason::as_str)
+    });
+    let status = if last_resort_reason.is_some() {
+        RouteAdmissionStatus::LastResort
+    } else if selected_target.is_some() {
+        RouteAdmissionStatus::Available
+    } else {
+        RouteAdmissionStatus::Unavailable
+    };
+    let reason_code = last_resort_reason.unwrap_or_else(|| {
+        if selected_target.is_some() {
+            "available"
+        } else {
+            route_admission_unavailable_reason(preview)
+        }
+    });
+
+    RouteAdmissionSummary {
+        status,
+        reason_code,
+        selected_target,
+        candidate_count,
+        included_count,
+        blocked_count,
+        soft_suppressed_count,
+        hard_blocked_count,
+        last_resort_used: last_resort_reason.is_some(),
+        last_resort_reason,
+    }
+}
+
+fn route_admission_unavailable_reason(preview: &RoutePreview) -> &'static str {
+    preview
+        .candidates
+        .iter()
+        .flat_map(|candidate| candidate.reasons.iter().copied())
+        .find(|reason| route_preview_reason_is_hard_blocker(*reason))
+        .or_else(|| {
+            preview
+                .candidates
+                .iter()
+                .flat_map(|candidate| candidate.reasons.iter().copied())
+                .find(|reason| route_preview_reason_is_soft_suppression(*reason))
+        })
+        .map(RoutePreviewReason::as_str)
+        .unwrap_or("no_route_candidate")
+}
+
+pub fn route_preview_reason_is_hard_blocker(reason: RoutePreviewReason) -> bool {
+    matches!(
+        reason,
+        RoutePreviewReason::TargetDisabled
+            | RoutePreviewReason::ClientChannelScope
+            | RoutePreviewReason::ChannelDisabled
+            | RoutePreviewReason::ChannelCoolingDown
+            | RoutePreviewReason::NoAvailableCredentials
+            | RoutePreviewReason::RuntimeUnavailable
+            | RoutePreviewReason::UnknownChannel
+            | RoutePreviewReason::CandidateLimit
+    )
+}
+
+pub fn route_preview_reason_is_soft_suppression(reason: RoutePreviewReason) -> bool {
+    matches!(
+        reason,
+        RoutePreviewReason::ChannelDegraded | RoutePreviewReason::ProviderCoolingDown
+    )
+}
+
+pub fn route_preview_reason_is_last_resort(reason: RoutePreviewReason) -> bool {
+    matches!(
+        reason,
+        RoutePreviewReason::DegradedLastResort | RoutePreviewReason::ProviderCoolingDownLastResort
+    )
 }
 
 pub fn preview_route(input: RoutePreviewInput<'_>) -> RoutePreview {
@@ -484,6 +643,28 @@ mod tests {
         }
     }
 
+    fn preview_candidate(
+        channel: &str,
+        included: bool,
+        selected: bool,
+        plan_position: Option<usize>,
+        reasons: Vec<RoutePreviewReason>,
+    ) -> RoutePreviewCandidate {
+        RoutePreviewCandidate {
+            target_index: 0,
+            channel_id: ChannelId(channel.to_string()),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            upstream_model: None,
+            priority: 0,
+            weight: 1,
+            target_enabled: true,
+            included,
+            selected,
+            plan_position,
+            reasons,
+        }
+    }
+
     #[test]
     fn route_preview_last_resort_reasons_have_stable_codes() {
         assert_eq!(
@@ -494,6 +675,137 @@ mod tests {
             RoutePreviewReason::ProviderCoolingDownLastResort.as_str(),
             "provider_cooling_down_last_resort"
         );
+    }
+
+    #[test]
+    fn route_preview_reason_classification_is_centralized_and_stable() {
+        for reason in [
+            RoutePreviewReason::TargetDisabled,
+            RoutePreviewReason::ClientChannelScope,
+            RoutePreviewReason::ChannelDisabled,
+            RoutePreviewReason::ChannelCoolingDown,
+            RoutePreviewReason::NoAvailableCredentials,
+            RoutePreviewReason::RuntimeUnavailable,
+            RoutePreviewReason::UnknownChannel,
+            RoutePreviewReason::CandidateLimit,
+        ] {
+            assert!(route_preview_reason_is_hard_blocker(reason));
+            assert!(!route_preview_reason_is_soft_suppression(reason));
+            assert!(!route_preview_reason_is_last_resort(reason));
+        }
+
+        for reason in [
+            RoutePreviewReason::ChannelDegraded,
+            RoutePreviewReason::ProviderCoolingDown,
+        ] {
+            assert!(!route_preview_reason_is_hard_blocker(reason));
+            assert!(route_preview_reason_is_soft_suppression(reason));
+            assert!(!route_preview_reason_is_last_resort(reason));
+        }
+
+        for reason in [
+            RoutePreviewReason::DegradedLastResort,
+            RoutePreviewReason::ProviderCoolingDownLastResort,
+        ] {
+            assert!(!route_preview_reason_is_hard_blocker(reason));
+            assert!(!route_preview_reason_is_soft_suppression(reason));
+            assert!(route_preview_reason_is_last_resort(reason));
+        }
+    }
+
+    #[test]
+    fn route_admission_summary_counts_hard_soft_and_last_resort_reasons() {
+        let preview = RoutePreview {
+            request_id: "req-summary".to_string(),
+            registry_generation: 1,
+            public_model: Some("gpt-x".to_string()),
+            route_found: true,
+            candidate_limit: 16,
+            selected_target_index: Some(2),
+            candidates: vec![
+                preview_candidate(
+                    "hard",
+                    false,
+                    false,
+                    None,
+                    vec![RoutePreviewReason::ChannelCoolingDown],
+                ),
+                preview_candidate(
+                    "soft",
+                    false,
+                    false,
+                    None,
+                    vec![RoutePreviewReason::ProviderCoolingDown],
+                ),
+                preview_candidate(
+                    "last-resort",
+                    true,
+                    true,
+                    Some(0),
+                    vec![RoutePreviewReason::ProviderCoolingDownLastResort],
+                ),
+            ],
+        };
+
+        let summary = route_admission_summary(&preview);
+
+        assert_eq!(summary.status, RouteAdmissionStatus::LastResort);
+        assert_eq!(summary.status.as_str(), "last_resort");
+        assert_eq!(summary.reason_code, "provider_cooling_down_last_resort");
+        assert_eq!(
+            summary.selected_target,
+            Some(RouteAdmissionSelectedTarget {
+                channel_id: ChannelId("last-resort".to_string()),
+                plan_position: 0,
+            })
+        );
+        assert_eq!(summary.candidate_count, 3);
+        assert_eq!(summary.included_count, 1);
+        assert_eq!(summary.blocked_count, 2);
+        assert_eq!(summary.hard_blocked_count, 1);
+        assert_eq!(summary.soft_suppressed_count, 1);
+        assert!(summary.last_resort_used);
+        assert_eq!(
+            summary.last_resort_reason,
+            Some("provider_cooling_down_last_resort")
+        );
+    }
+
+    #[test]
+    fn route_admission_summary_prefers_hard_reason_for_unavailable_preview() {
+        let preview = RoutePreview {
+            request_id: "req-unavailable-summary".to_string(),
+            registry_generation: 1,
+            public_model: Some("gpt-x".to_string()),
+            route_found: true,
+            candidate_limit: 16,
+            selected_target_index: None,
+            candidates: vec![
+                preview_candidate(
+                    "soft",
+                    false,
+                    false,
+                    None,
+                    vec![RoutePreviewReason::ProviderCoolingDown],
+                ),
+                preview_candidate(
+                    "hard",
+                    false,
+                    false,
+                    None,
+                    vec![RoutePreviewReason::CandidateLimit],
+                ),
+            ],
+        };
+
+        let summary = route_admission_summary(&preview);
+
+        assert_eq!(summary.status, RouteAdmissionStatus::Unavailable);
+        assert_eq!(summary.status.as_str(), "unavailable");
+        assert_eq!(summary.reason_code, "candidate_limit");
+        assert_eq!(summary.selected_target, None);
+        assert!(!summary.last_resort_used);
+        assert_eq!(summary.last_resort_reason, None);
     }
 
     #[test]

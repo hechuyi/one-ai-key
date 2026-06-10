@@ -412,15 +412,34 @@ Task 1 checkpoint evidence:
 - Optional Create: `src/route_admission.rs`
 - Modify: `src/main.rs` module declarations only if a new module is justified.
 
-- [ ] Add pure reason classification helpers for hard blockers, soft
+- [x] Add pure reason classification helpers for hard blockers, soft
   suppression, and last-resort markers.
-- [ ] Add `AdmissionBlockerSummary` or equivalent stable DTO.
-- [ ] Generate the summary from the same route preview used by `plan_route`.
-- [ ] Keep the summary independent of HTTP, CLI, management serialization,
+- [x] Add `AdmissionBlockerSummary` or equivalent stable DTO.
+- [x] Generate the summary from the same route preview used by `plan_route`.
+- [x] Keep the summary independent of HTTP, CLI, management serialization,
   YAML, SQLite, credential stores, and upstream I/O.
-- [ ] Add unit tests for classification, counts, primary reason selection, and
+- [x] Add unit tests for classification, counts, primary reason selection, and
   redaction-safe reason strings.
-- [ ] Commit the shared admission summary.
+- [x] Commit the shared admission summary.
+
+Task 2 checkpoint evidence:
+
+- `cargo test --locked route_preview_reason_classification_is_centralized_and_stable --`
+  matched 1 test and passed.
+- `cargo test --locked route_admission_summary --` matched 2 tests and passed.
+- `cargo test --locked routing_preview_admission_summary --` matched 2 tests
+  and passed.
+- `cargo test --locked routing_preview_exports_admission_summary_for_selected_route --`
+  matched 1 test and passed.
+- `cargo test --locked explicit_model_route_all_channel_cooldown_returns_no_route_candidate`
+  matched 1 test and passed.
+- `cargo test --locked proxy::tests::attempt_gate --` matched 3 tests and
+  passed.
+- `cargo test --locked routing_failure_events_distinguish_local_admission_denial_from_upstream_503`
+  matched 1 test and passed.
+- `rg` scan found no remaining `routing_preview_*_reason` duplicate taxonomy
+  helpers in management/proxy; management serializes `RouteAdmissionSummary`
+  from `route_plan.rs`.
 
 ### Task 3: Proxy Admission Alignment
 
