@@ -324,6 +324,8 @@ pub async fn proxy_openai_compatible(State(state): State<AppState>, req: Request
         model,
         &client.allowed_channels,
         &request_id,
+        context.endpoint,
+        &client.id,
         &route_context,
     ) {
         Ok(targets) => targets,
@@ -379,6 +381,8 @@ fn route_plan_for_openai_request(
     model: Option<&str>,
     allowed_channels: &[String],
     request_id: &str,
+    endpoint: EndpointKind,
+    client_token_ref: &str,
     route_context: &crate::state::ChannelRoutePlanContext,
 ) -> Result<FrozenRoutePlan, Box<Response>> {
     if let Some(route) = route_context.model_route.as_ref() {
@@ -406,12 +410,32 @@ fn route_plan_for_openai_request(
             ));
         }
         if all_relevant_route_candidates_are_cooling_down(&preview) {
+            record_route_admission_denied(
+                state,
+                &preview,
+                endpoint,
+                Some(client_token_ref),
+                "explicit_model",
+                "no_route_candidate",
+                "route",
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
             return Err(Box::new(no_route_candidate_response(&[
                 "channel_cooling_down",
             ])));
         }
         let reason_codes = relevant_route_candidate_reason_codes(&preview);
         if !reason_codes.is_empty() {
+            record_route_admission_denied(
+                state,
+                &preview,
+                endpoint,
+                Some(client_token_ref),
+                "explicit_model",
+                "no_route_candidate",
+                "route",
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
             return Err(Box::new(no_route_candidate_response(&reason_codes)));
         }
         return Ok(FrozenRoutePlan {
@@ -438,6 +462,24 @@ fn route_plan_for_openai_request(
     let route_state = route_context
         .default_channel_route_state
         .unwrap_or(ChannelRouteState::UnknownChannel);
+    if matches!(route_state, ChannelRouteState::CoolingDown) {
+        record_single_route_admission_denied(
+            state,
+            request_id,
+            route_context.registry_generation,
+            endpoint,
+            model,
+            Some(client_token_ref),
+            "default_channel",
+            "no_route_candidate",
+            "route",
+            StatusCode::SERVICE_UNAVAILABLE,
+            &["channel_cooling_down"],
+        );
+        return Err(Box::new(no_route_candidate_response(&[
+            "channel_cooling_down",
+        ])));
+    }
     if let Some(response) = route_state_unavailable_response(pool_name, route_state) {
         return Err(Box::new(response));
     }
@@ -447,6 +489,172 @@ fn route_plan_for_openai_request(
         pool_name.to_string(),
         route_state,
     ))
+}
+
+fn record_route_admission_denied(
+    state: &AppState,
+    preview: &RoutePreview,
+    endpoint: EndpointKind,
+    client_token_ref: Option<&str>,
+    route_kind: &str,
+    reason_code: &str,
+    blocking_domain: &str,
+    client_visible_status: StatusCode,
+) {
+    let (hard_reason_codes, soft_reason_codes) = admission_reason_codes(preview);
+    record_routing_telemetry(
+        state,
+        RoutingTelemetry::RouteAdmissionDenied {
+            request_id: preview.request_id.clone(),
+            registry_generation: preview.registry_generation,
+            endpoint_family: endpoint_family_code(endpoint).to_string(),
+            public_model: preview.public_model.clone(),
+            client_token_ref: client_token_ref.map(ToOwned::to_owned),
+            route_kind: route_kind.to_string(),
+            reason_code: reason_code.to_string(),
+            blocking_domain: blocking_domain.to_string(),
+            client_visible_status: client_visible_status.as_u16(),
+            upstream_status: None,
+            candidate_count: preview.candidates.len(),
+            included_count: preview
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.included)
+                .count(),
+            blocked_count: preview
+                .candidates
+                .iter()
+                .filter(|candidate| !candidate.included)
+                .count(),
+            hard_blocked_count: hard_blocked_candidate_count(preview),
+            soft_suppressed_count: soft_suppressed_candidate_count(preview),
+            last_resort_used: preview.candidates.iter().any(|candidate| {
+                candidate.included
+                    && candidate.reasons.iter().any(|reason| {
+                        matches!(
+                            reason,
+                            RoutePreviewReason::DegradedLastResort
+                                | RoutePreviewReason::ProviderCoolingDownLastResort
+                        )
+                    })
+            }),
+            hard_reason_codes,
+            soft_reason_codes,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_single_route_admission_denied(
+    state: &AppState,
+    request_id: &str,
+    registry_generation: u64,
+    endpoint: EndpointKind,
+    public_model: Option<&str>,
+    client_token_ref: Option<&str>,
+    route_kind: &str,
+    reason_code: &str,
+    blocking_domain: &str,
+    client_visible_status: StatusCode,
+    hard_reason_codes: &[&str],
+) {
+    record_routing_telemetry(
+        state,
+        RoutingTelemetry::RouteAdmissionDenied {
+            request_id: request_id.to_string(),
+            registry_generation,
+            endpoint_family: endpoint_family_code(endpoint).to_string(),
+            public_model: public_model.map(ToOwned::to_owned),
+            client_token_ref: client_token_ref.map(ToOwned::to_owned),
+            route_kind: route_kind.to_string(),
+            reason_code: reason_code.to_string(),
+            blocking_domain: blocking_domain.to_string(),
+            client_visible_status: client_visible_status.as_u16(),
+            upstream_status: None,
+            candidate_count: 1,
+            included_count: 0,
+            blocked_count: 1,
+            hard_blocked_count: 1,
+            soft_suppressed_count: 0,
+            last_resort_used: false,
+            hard_reason_codes: hard_reason_codes
+                .iter()
+                .map(|code| (*code).to_string())
+                .collect(),
+            soft_reason_codes: Vec::new(),
+        },
+    );
+}
+
+fn admission_reason_codes(preview: &RoutePreview) -> (Vec<String>, Vec<String>) {
+    let mut hard = BTreeSet::new();
+    let mut soft = BTreeSet::new();
+    for candidate in &preview.candidates {
+        for reason in &candidate.reasons {
+            if route_preview_reason_is_soft_suppression(reason) {
+                soft.insert(reason.as_str().to_string());
+            } else if !route_preview_reason_is_last_resort(reason) {
+                hard.insert(reason.as_str().to_string());
+            }
+        }
+    }
+    (
+        hard.into_iter().take(8).collect(),
+        soft.into_iter().take(8).collect(),
+    )
+}
+
+fn hard_blocked_candidate_count(preview: &RoutePreview) -> usize {
+    preview
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate.included
+                && candidate.reasons.iter().any(|reason| {
+                    !route_preview_reason_is_soft_suppression(reason)
+                        && !route_preview_reason_is_last_resort(reason)
+                })
+        })
+        .count()
+}
+
+fn soft_suppressed_candidate_count(preview: &RoutePreview) -> usize {
+    preview
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate.included
+                && !candidate.reasons.is_empty()
+                && candidate
+                    .reasons
+                    .iter()
+                    .all(route_preview_reason_is_soft_suppression)
+        })
+        .count()
+}
+
+fn route_preview_reason_is_soft_suppression(reason: &RoutePreviewReason) -> bool {
+    matches!(
+        reason,
+        RoutePreviewReason::ChannelDegraded | RoutePreviewReason::ProviderCoolingDown
+    )
+}
+
+fn route_preview_reason_is_last_resort(reason: &RoutePreviewReason) -> bool {
+    matches!(
+        reason,
+        RoutePreviewReason::DegradedLastResort | RoutePreviewReason::ProviderCoolingDownLastResort
+    )
+}
+
+fn endpoint_family_code(endpoint: EndpointKind) -> &'static str {
+    match endpoint {
+        EndpointKind::Models => "models",
+        EndpointKind::ChatCompletions => "chat_completions",
+        EndpointKind::Responses => "responses",
+        EndpointKind::Embeddings => "embeddings",
+        EndpointKind::Generic => "generic",
+    }
 }
 
 fn route_preview_reason_excludes_candidate_from_cooling_denominator(
@@ -536,13 +744,30 @@ pub async fn proxy_named_pool(
             format!("unknown pool {}", route_plan.targets[0].channel_id),
         );
     };
+    let adapter = ProviderAdapter::new(pool_state.provider_kind);
+    if matches!(route_context.route_state, ChannelRouteState::CoolingDown) {
+        let preliminary_context = adapter.request_context(&parts.method, &path, &[]);
+        record_single_route_admission_denied(
+            &state,
+            &request_id,
+            route_context.registry_generation,
+            preliminary_context.endpoint,
+            preliminary_context.requested_model.as_deref(),
+            Some(&client.id),
+            "named_channel",
+            "no_route_candidate",
+            "route",
+            StatusCode::SERVICE_UNAVAILABLE,
+            &["channel_cooling_down"],
+        );
+        return no_route_candidate_response(&["channel_cooling_down"]);
+    }
     if let Some(response) = route_state_unavailable_response(
         &route_plan.targets[0].channel_id,
         route_context.route_state,
     ) {
         return response;
     }
-    let adapter = ProviderAdapter::new(pool_state.provider_kind);
     if adapter.named_pool_request_mode() == NamedPoolRequestMode::ReplayableWithModelContext {
         let body = match axum::body::to_bytes(raw_body, state.max_request_body_bytes).await {
             Ok(body) => body,

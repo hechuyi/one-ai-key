@@ -229,6 +229,7 @@ fn failure_transition_summaries(snapshot: &[RoutingTelemetry]) -> Vec<FailureTra
                 }
             }
             RoutingTelemetry::RouteSelected { .. }
+            | RoutingTelemetry::RouteAdmissionDenied { .. }
             | RoutingTelemetry::TransitionApplied { .. }
             | RoutingTelemetry::CredentialLifecyclePersistenceDropped { .. } => {}
         }
@@ -338,10 +339,25 @@ fn channel_transition_action(state: &str, reason: &str) -> String {
 }
 
 fn routing_failure_events(snapshot: &[RoutingTelemetry]) -> Vec<Value> {
-    failure_transition_summaries(snapshot)
-        .into_iter()
-        .map(project_routing_failure_event)
-        .collect()
+    let summaries = failure_transition_summaries(snapshot);
+    let mut summary_iter = summaries.into_iter();
+    let mut events = Vec::with_capacity(snapshot.len().min(128));
+    for event in snapshot {
+        match event {
+            RoutingTelemetry::UpstreamFailureObserved { .. } => {
+                if let Some(summary) = summary_iter.next() {
+                    events.push(project_routing_failure_event(summary));
+                }
+            }
+            RoutingTelemetry::RouteAdmissionDenied { .. } => {
+                if let Some(event) = project_route_admission_denied_event(event) {
+                    events.push(event);
+                }
+            }
+            _ => {}
+        }
+    }
+    events
 }
 
 fn project_routing_failure_event(summary: FailureTransitionSummary) -> Value {
@@ -371,6 +387,7 @@ fn project_routing_failure_event(summary: FailureTransitionSummary) -> Value {
         "retry_eligibility": retry_eligibility,
         "retry_blocked_reason": retry_blocked_reason,
         "client_visible_status": client_visible_status,
+        "upstream_status": summary.status,
         "final_outcome": final_outcome(&client_visible_status),
         "reason_code": reason_code,
         "blocking_domain": contract.blocking_domain,
@@ -378,6 +395,66 @@ fn project_routing_failure_event(summary: FailureTransitionSummary) -> Value {
         "attempt": summary.attempt,
         "next_action": contract.next_action,
     })
+}
+
+fn project_route_admission_denied_event(event: &RoutingTelemetry) -> Option<Value> {
+    let RoutingTelemetry::RouteAdmissionDenied {
+        request_id,
+        registry_generation,
+        endpoint_family,
+        public_model,
+        client_token_ref,
+        route_kind,
+        reason_code,
+        blocking_domain,
+        client_visible_status,
+        candidate_count,
+        included_count,
+        blocked_count,
+        hard_blocked_count,
+        soft_suppressed_count,
+        last_resort_used,
+        hard_reason_codes,
+        soft_reason_codes,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let reason_code = stable_admission_reason_code(reason_code);
+    let contract = diagnostic_contract_for(reason_code);
+    let client_visible_status = local_client_visible_status(*client_visible_status);
+    Some(json!({
+        "source": "routing_telemetry",
+        "event_kind": "route_admission_denied",
+        "request_id": safe_management_id(request_id),
+        "stage": "route_admission",
+        "endpoint_family": safe_management_code(endpoint_family),
+        "public_model": public_model.as_deref().and_then(safe_management_id).unwrap_or_else(|| "unknown".to_string()),
+        "client_token_ref": client_token_ref.as_deref().and_then(safe_management_id),
+        "route_kind": safe_management_code(route_kind),
+        "failure_class": "route_admission_denied",
+        "router_action": "returned_local_error",
+        "retry_eligibility": "not_applicable",
+        "retry_blocked_reason": Value::Null,
+        "client_visible_status": client_visible_status,
+        "upstream_status": Value::Null,
+        "final_outcome": final_outcome(&client_visible_status),
+        "reason_code": reason_code,
+        "blocking_domain": safe_management_code(blocking_domain),
+        "admission": {
+            "registry_generation": registry_generation,
+            "candidate_count": candidate_count,
+            "included_count": included_count,
+            "blocked_count": blocked_count,
+            "hard_blocked_count": hard_blocked_count,
+            "soft_suppressed_count": soft_suppressed_count,
+            "last_resort_used": last_resort_used,
+            "hard_reason_codes": safe_reason_codes(hard_reason_codes),
+            "soft_reason_codes": safe_reason_codes(soft_reason_codes),
+        },
+        "next_action": contract.next_action,
+    }))
 }
 
 fn response_filter_failure_events(events: &[ResponseFilterEvent]) -> Vec<Value> {
@@ -547,12 +624,35 @@ fn reason_code_for_failure_class(failure_class: &str) -> &'static str {
     }
 }
 
+fn stable_admission_reason_code(value: &str) -> &'static str {
+    match value {
+        "no_route_candidate" => "no_route_candidate",
+        "unsupported_endpoint_family" => "unsupported_endpoint_family",
+        "credential_unavailable" => "credential_unavailable",
+        _ => "no_route_candidate",
+    }
+}
+
 fn stable_reason_code(value: &str, fallback: &'static str) -> &'static str {
     match value {
         "response_filter_rejected" => "response_filter_rejected",
         "stream_committed_failure" => "stream_committed_failure",
         _ => fallback,
     }
+}
+
+fn local_client_visible_status(status: u16) -> String {
+    match status {
+        400 => "local_400",
+        401 => "local_401",
+        403 => "local_403",
+        404 => "local_404",
+        429 => "local_429",
+        502 => "local_502",
+        503 => "local_503",
+        _ => "local_error",
+    }
+    .to_string()
 }
 
 fn response_filter_router_action(action: &str) -> &'static str {
@@ -618,6 +718,46 @@ fn sanitize_routing_telemetry(event: RoutingTelemetry) -> Value {
             "request_id": safe_management_id(&request_id),
             "channel_id": safe_management_id(&channel_id),
             "failure": sanitize_upstream_failure(*failure),
+        }),
+        RoutingTelemetry::RouteAdmissionDenied {
+            request_id,
+            registry_generation,
+            endpoint_family,
+            public_model,
+            client_token_ref,
+            route_kind,
+            reason_code,
+            blocking_domain,
+            client_visible_status,
+            candidate_count,
+            included_count,
+            blocked_count,
+            hard_blocked_count,
+            soft_suppressed_count,
+            last_resort_used,
+            hard_reason_codes,
+            soft_reason_codes,
+            ..
+        } => json!({
+            "kind": "route_admission_denied",
+            "request_id": safe_management_id(&request_id),
+            "registry_generation": registry_generation,
+            "endpoint_family": safe_management_id(&endpoint_family),
+            "public_model": public_model.as_deref().and_then(safe_management_id),
+            "client_token_ref": client_token_ref.as_deref().and_then(safe_management_id),
+            "route_kind": safe_management_id(&route_kind),
+            "reason_code": safe_management_id(&reason_code),
+            "blocking_domain": safe_management_id(&blocking_domain),
+            "client_visible_status": client_visible_status,
+            "upstream_status": Value::Null,
+            "candidate_count": candidate_count,
+            "included_count": included_count,
+            "blocked_count": blocked_count,
+            "hard_blocked_count": hard_blocked_count,
+            "soft_suppressed_count": soft_suppressed_count,
+            "last_resort_used": last_resort_used,
+            "hard_reason_codes": safe_reason_codes(&hard_reason_codes),
+            "soft_reason_codes": safe_reason_codes(&soft_reason_codes),
         }),
         RoutingTelemetry::TransitionApplied {
             request_id,
@@ -740,6 +880,14 @@ fn safe_management_id(value: &str) -> Option<String> {
 
 fn safe_management_code(value: &str) -> String {
     safe_management_id(value).unwrap_or_else(|| "unknown".to_string())
+}
+
+fn safe_reason_codes(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(|value| safe_management_id(value))
+        .take(8)
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -1940,6 +2088,128 @@ mod tests {
         assert_eq!(summary["mutation_kind"], "noop");
         assert_eq!(summary["affected_resource_kind"], "none");
         assert_eq!(summary["resulting_state"], "noop");
+    }
+
+    #[test]
+    fn routing_failure_events_distinguish_local_admission_denial_from_upstream_503() {
+        let mut upstream_503 =
+            failure_telemetry("provider_unavailable", "channel", "upstream_transaction");
+        upstream_503.status = Some(503);
+
+        let response = routing_telemetry_response(
+            vec![
+                RoutingTelemetry::RouteAdmissionDenied {
+                    request_id: "req_local_503".to_string(),
+                    registry_generation: 9,
+                    endpoint_family: "chat_completions".to_string(),
+                    public_model: Some("gpt-test".to_string()),
+                    client_token_ref: Some("local-client".to_string()),
+                    route_kind: "explicit_model".to_string(),
+                    reason_code: "no_route_candidate".to_string(),
+                    blocking_domain: "route".to_string(),
+                    client_visible_status: 503,
+                    upstream_status: None,
+                    candidate_count: 2,
+                    included_count: 0,
+                    blocked_count: 2,
+                    hard_blocked_count: 2,
+                    soft_suppressed_count: 0,
+                    last_resort_used: false,
+                    hard_reason_codes: vec![
+                        "channel_disabled".to_string(),
+                        "no_available_credentials".to_string(),
+                    ],
+                    soft_reason_codes: Vec::new(),
+                },
+                upstream_failure_event("req_upstream_503", "test", upstream_503),
+            ],
+            64,
+            0,
+            0,
+            50,
+        );
+        let value = serde_json::to_value(response).unwrap();
+        let failures = value["failure_events"].as_array().unwrap();
+
+        assert_eq!(failures.len(), 2);
+        let local = failures
+            .iter()
+            .find(|failure| failure["request_id"] == "req_local_503")
+            .expect("local admission denial should be projected");
+        assert_eq!(local["event_kind"], "route_admission_denied");
+        assert_eq!(local["stage"], "route_admission");
+        assert_eq!(local["reason_code"], "no_route_candidate");
+        assert_eq!(local["blocking_domain"], "route");
+        assert_eq!(local["client_visible_status"], "local_503");
+        assert!(local["upstream_status"].is_null());
+        assert_eq!(local["admission"]["candidate_count"], 2);
+        assert_eq!(local["admission"]["included_count"], 0);
+        assert_eq!(
+            local["admission"]["hard_reason_codes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            local["next_action"]["side_effect_class"],
+            "runtime_readonly"
+        );
+
+        let upstream = failures
+            .iter()
+            .find(|failure| failure["request_id"] == "req_upstream_503")
+            .expect("upstream failure should be projected");
+        assert_eq!(upstream["event_kind"], "upstream_failure_observed");
+        assert_eq!(upstream["stage"], "upstream_transport");
+        assert_eq!(upstream["client_visible_status"], "upstream_5xx");
+        assert_eq!(upstream["upstream_status"], 503);
+        assert_eq!(upstream["reason_code"], "upstream_5xx");
+    }
+
+    #[test]
+    fn routing_failure_events_preserve_telemetry_order_for_primary_tie_breaks() {
+        let mut upstream_503 =
+            failure_telemetry("provider_unavailable", "channel", "upstream_transaction");
+        upstream_503.status = Some(503);
+
+        let response = routing_telemetry_response(
+            vec![
+                RoutingTelemetry::RouteAdmissionDenied {
+                    request_id: "req_local_earlier".to_string(),
+                    registry_generation: 9,
+                    endpoint_family: "chat_completions".to_string(),
+                    public_model: Some("gpt-test".to_string()),
+                    client_token_ref: Some("local-client".to_string()),
+                    route_kind: "explicit_model".to_string(),
+                    reason_code: "no_route_candidate".to_string(),
+                    blocking_domain: "route".to_string(),
+                    client_visible_status: 503,
+                    upstream_status: None,
+                    candidate_count: 1,
+                    included_count: 0,
+                    blocked_count: 1,
+                    hard_blocked_count: 1,
+                    soft_suppressed_count: 0,
+                    last_resort_used: false,
+                    hard_reason_codes: vec!["channel_cooling_down".to_string()],
+                    soft_reason_codes: Vec::new(),
+                },
+                upstream_failure_event("req_upstream_later", "test", upstream_503),
+            ],
+            64,
+            0,
+            0,
+            50,
+        );
+        let value = serde_json::to_value(response).unwrap();
+        let failures = value["failure_events"].as_array().unwrap();
+
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0]["request_id"], "req_local_earlier");
+        assert_eq!(failures[0]["event_kind"], "route_admission_denied");
+        assert_eq!(failures[1]["request_id"], "req_upstream_later");
+        assert_eq!(failures[1]["event_kind"], "upstream_failure_observed");
     }
 
     #[test]

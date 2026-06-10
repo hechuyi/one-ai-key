@@ -148,6 +148,28 @@ pub enum RoutingTelemetry {
         channel_id: String,
         failure: Box<UpstreamFailureTelemetry>,
     },
+    RouteAdmissionDenied {
+        request_id: String,
+        registry_generation: u64,
+        endpoint_family: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        public_model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client_token_ref: Option<String>,
+        route_kind: String,
+        reason_code: String,
+        blocking_domain: String,
+        client_visible_status: u16,
+        upstream_status: Option<u16>,
+        candidate_count: usize,
+        included_count: usize,
+        blocked_count: usize,
+        hard_blocked_count: usize,
+        soft_suppressed_count: usize,
+        last_resort_used: bool,
+        hard_reason_codes: Vec<String>,
+        soft_reason_codes: Vec<String>,
+    },
     TransitionApplied {
         request_id: String,
         channel_id: String,
@@ -1691,6 +1713,57 @@ mod tests {
         assert!(value["failure"].get("upstream_code").is_none());
         assert!(value["failure"].get("upstream_limit_type").is_none());
         assert!(!value.to_string().contains("sk-"));
+    }
+
+    #[test]
+    fn route_admission_denied_routing_telemetry_serializes_closed_redacted_schema() {
+        let event = RoutingTelemetry::RouteAdmissionDenied {
+            request_id: "req-denied".to_string(),
+            registry_generation: 7,
+            endpoint_family: "chat_completions".to_string(),
+            public_model: Some("gpt-test".to_string()),
+            client_token_ref: Some("local-client".to_string()),
+            route_kind: "explicit_model".to_string(),
+            reason_code: "no_route_candidate".to_string(),
+            blocking_domain: "route".to_string(),
+            client_visible_status: 503,
+            upstream_status: None,
+            candidate_count: 3,
+            included_count: 0,
+            blocked_count: 3,
+            hard_blocked_count: 2,
+            soft_suppressed_count: 1,
+            last_resort_used: false,
+            hard_reason_codes: vec![
+                "client_channel_scope".to_string(),
+                "channel_disabled".to_string(),
+            ],
+            soft_reason_codes: vec!["provider_cooling_down".to_string()],
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        let body = value.to_string();
+
+        assert_eq!(value["kind"], "route_admission_denied");
+        assert_eq!(value["request_id"], "req-denied");
+        assert_eq!(value["registry_generation"], 7);
+        assert_eq!(value["endpoint_family"], "chat_completions");
+        assert_eq!(value["public_model"], "gpt-test");
+        assert_eq!(value["client_token_ref"], "local-client");
+        assert_eq!(value["reason_code"], "no_route_candidate");
+        assert_eq!(value["blocking_domain"], "route");
+        assert_eq!(value["client_visible_status"], 503);
+        assert!(value["upstream_status"].is_null());
+        assert_eq!(value["candidate_count"], 3);
+        assert_eq!(value["included_count"], 0);
+        assert_eq!(value["blocked_count"], 3);
+        assert_eq!(value["hard_blocked_count"], 2);
+        assert_eq!(value["soft_suppressed_count"], 1);
+        assert_eq!(value["last_resort_used"], false);
+        assert_eq!(value["hard_reason_codes"].as_array().unwrap().len(), 2);
+        assert_eq!(value["soft_reason_codes"].as_array().unwrap().len(), 1);
+        assert!(!body.contains("sk-"));
+        assert!(body.len() < 2048);
     }
 
     #[test]

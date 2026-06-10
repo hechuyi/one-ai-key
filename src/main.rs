@@ -30656,7 +30656,7 @@ model_routes:
             reason: "relay balance unavailable".to_string(),
         };
 
-        let response = app(state)
+        let response = app(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -30678,6 +30678,42 @@ model_routes:
         assert_eq!(value["error"]["code"], "no_route_candidate");
         assert_eq!(value["error"]["reasons"][0], "channel_cooling_down");
         assert!(!value.to_string().contains("cooling-key"));
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .snapshot();
+        let admission_denial = telemetry
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    RoutingTelemetry::RouteAdmissionDenied {
+                        request_id,
+                        reason_code,
+                        client_visible_status,
+                        upstream_status,
+                        ..
+                    } if request_id.starts_with("req_")
+                        && reason_code == "no_route_candidate"
+                        && *client_visible_status == 503
+                        && upstream_status.is_none()
+                )
+            })
+            .expect("local no_route_candidate should record bounded route admission denial");
+        if let RoutingTelemetry::RouteAdmissionDenied {
+            public_model,
+            hard_reason_codes,
+            candidate_count,
+            included_count,
+            ..
+        } = admission_denial
+        {
+            assert_eq!(public_model.as_deref(), Some("gpt-route"));
+            assert_eq!(*candidate_count, 1);
+            assert_eq!(*included_count, 0);
+            assert_eq!(hard_reason_codes, &vec!["channel_cooling_down".to_string()]);
+        }
     }
 
     #[tokio::test]
@@ -31941,7 +31977,7 @@ model_routes:
             reason: "test cooldown".to_string(),
         };
 
-        let response = app(state)
+        let response = app(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -31962,6 +31998,28 @@ model_routes:
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"]["code"], "no_route_candidate");
         assert_eq!(value["error"]["reasons"][0], "channel_cooling_down");
+        assert!(
+            state
+                .routing_telemetry
+                .lock()
+                .expect("routing telemetry mutex poisoned")
+                .snapshot()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    RoutingTelemetry::RouteAdmissionDenied {
+                        reason_code,
+                        route_kind,
+                        public_model,
+                        hard_reason_codes,
+                        ..
+                    } if reason_code == "no_route_candidate"
+                        && route_kind == "default_channel"
+                        && public_model.as_deref() == Some("unmapped")
+                        && hard_reason_codes == &vec!["channel_cooling_down".to_string()]
+                )),
+            "default-channel no_route_candidate should record route admission denial"
+        );
     }
 
     #[tokio::test]
@@ -31991,7 +32049,7 @@ model_routes:
             reason: "test cooldown".to_string(),
         };
 
-        let response = app(state)
+        let response = app(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -32012,6 +32070,26 @@ model_routes:
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"]["code"], "no_route_candidate");
         assert_eq!(value["error"]["reasons"][0], "channel_cooling_down");
+        assert!(
+            state
+                .routing_telemetry
+                .lock()
+                .expect("routing telemetry mutex poisoned")
+                .snapshot()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    RoutingTelemetry::RouteAdmissionDenied {
+                        reason_code,
+                        route_kind,
+                        hard_reason_codes,
+                        ..
+                    } if reason_code == "no_route_candidate"
+                        && route_kind == "named_channel"
+                        && hard_reason_codes == &vec!["channel_cooling_down".to_string()]
+                )),
+            "named-channel no_route_candidate should record route admission denial"
+        );
     }
 
     #[tokio::test]

@@ -389,6 +389,8 @@ fn request_explanation(failures: &[Value]) -> Value {
             "retry_eligibility": "not_applicable",
             "retry_blocked_reason": Value::Null,
             "client_visible_status": "not_found_in_window",
+            "upstream_status": Value::Null,
+            "admission": Value::Null,
             "final_outcome": "not_found_in_window",
         });
     };
@@ -402,6 +404,8 @@ fn request_explanation(failures: &[Value]) -> Value {
         "retry_eligibility": taxonomy_string(primary, "retry_eligibility", "not_applicable"),
         "retry_blocked_reason": primary.get("retry_blocked_reason").cloned().unwrap_or(Value::Null),
         "client_visible_status": taxonomy_string(primary, "client_visible_status", "unknown"),
+        "upstream_status": primary.get("upstream_status").cloned().unwrap_or(Value::Null),
+        "admission": primary.get("admission").cloned().unwrap_or(Value::Null),
         "final_outcome": taxonomy_string(primary, "final_outcome", "unknown"),
     })
 }
@@ -517,12 +521,14 @@ fn projected_failure_event(event: &Value) -> Option<Value> {
         "retry_eligibility": projected_string(event, "retry_eligibility", "not_applicable"),
         "retry_blocked_reason": projected_nullable_string(event, "retry_blocked_reason"),
         "client_visible_status": projected_string(event, "client_visible_status", "unknown"),
+        "upstream_status": projected_nullable_status(event, "upstream_status"),
         "final_outcome": projected_string(event, "final_outcome", "unknown"),
         "reason_code": projected_string(event, "reason_code", "unknown_failure_class"),
         "blocking_domain": projected_string(event, "blocking_domain", "unknown"),
         "directive": projected_nullable_string(event, "directive"),
         "attempt": event.get("attempt").and_then(Value::as_u64),
         "content_kind": projected_nullable_string(event, "content_kind"),
+        "admission": projected_admission(event.get("admission")),
         "next_action": projected_next_action(event.get("next_action")),
     }))
 }
@@ -544,6 +550,15 @@ fn projected_nullable_string(event: &Value, field: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn projected_nullable_status(event: &Value, field: &str) -> Value {
+    event
+        .get(field)
+        .and_then(Value::as_u64)
+        .filter(|status| (100..=599).contains(status))
+        .map(Value::from)
+        .unwrap_or(Value::Null)
+}
+
 fn projected_selected_target(value: Option<&Value>) -> Value {
     value
         .and_then(|target| target.get("channel_id"))
@@ -551,6 +566,54 @@ fn projected_selected_target(value: Option<&Value>) -> Value {
         .and_then(sanitize_local_string)
         .map(|channel_id| serde_json::json!({ "channel_id": channel_id }))
         .unwrap_or(Value::Null)
+}
+
+fn projected_admission(value: Option<&Value>) -> Value {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return Value::Null;
+    };
+    let Some(candidate_count) = object.get("candidate_count").and_then(Value::as_u64) else {
+        return Value::Null;
+    };
+    let Some(included_count) = object.get("included_count").and_then(Value::as_u64) else {
+        return Value::Null;
+    };
+    let Some(blocked_count) = object.get("blocked_count").and_then(Value::as_u64) else {
+        return Value::Null;
+    };
+    let Some(hard_blocked_count) = object.get("hard_blocked_count").and_then(Value::as_u64) else {
+        return Value::Null;
+    };
+    let Some(soft_suppressed_count) = object.get("soft_suppressed_count").and_then(Value::as_u64)
+    else {
+        return Value::Null;
+    };
+    let Some(last_resort_used) = object.get("last_resort_used").and_then(Value::as_bool) else {
+        return Value::Null;
+    };
+
+    serde_json::json!({
+        "registry_generation": object.get("registry_generation").and_then(Value::as_u64),
+        "candidate_count": candidate_count,
+        "included_count": included_count,
+        "blocked_count": blocked_count,
+        "hard_blocked_count": hard_blocked_count,
+        "soft_suppressed_count": soft_suppressed_count,
+        "last_resort_used": last_resort_used,
+        "hard_reason_codes": projected_reason_code_array(object.get("hard_reason_codes")),
+        "soft_reason_codes": projected_reason_code_array(object.get("soft_reason_codes")),
+    })
+}
+
+fn projected_reason_code_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(sanitize_local_string)
+        .take(8)
+        .collect()
 }
 
 fn projected_next_action(value: Option<&Value>) -> Value {
@@ -816,7 +879,7 @@ fn render_failure_table(report: &Value) -> String {
         .unwrap_or_default();
     for failure in failures {
         output.push_str(&format!(
-            "- request_id={} stage={} failure_class={} blocking_domain={} router_action={} retry_eligibility={} retry_blocked_reason={} client_visible_status={} reason_code={} model={} channel={} directive={}\n",
+            "- request_id={} stage={} failure_class={} blocking_domain={} router_action={} retry_eligibility={} retry_blocked_reason={} client_visible_status={} upstream_status={} reason_code={} model={} channel={} directive={} admission_candidate_count={} admission_included_count={}\n",
             table_str(failure.get("request_id")),
             table_str(failure.get("stage")),
             table_str(failure.get("failure_class")),
@@ -825,10 +888,21 @@ fn render_failure_table(report: &Value) -> String {
             table_str(failure.get("retry_eligibility")),
             table_str(failure.get("retry_blocked_reason")),
             table_str(failure.get("client_visible_status")),
+            table_str(failure.get("upstream_status")),
             table_str(failure.get("reason_code")),
             table_str(failure.get("public_model")),
             table_str(failure.get("channel_id")),
             table_str(failure.get("directive")),
+            table_str(
+                failure
+                    .get("admission")
+                    .and_then(|admission| admission.get("candidate_count"))
+            ),
+            table_str(
+                failure
+                    .get("admission")
+                    .and_then(|admission| admission.get("included_count"))
+            ),
         ));
     }
     output
@@ -1208,6 +1282,138 @@ mod tests {
             report["data"]["explanation"]["final_outcome"],
             "client_visible_failure"
         );
+    }
+
+    #[test]
+    fn failures_explain_preserves_local_admission_denial_evidence_and_upstream_status_boundary() {
+        let routing = serde_json::json!({
+            "buffered_events": 2,
+            "offset": 0,
+            "limit": 50,
+            "failure_events": [
+                {
+                    "source": "routing_telemetry",
+                    "event_kind": "route_admission_denied",
+                    "request_id": "req_local_503",
+                    "stage": "route_admission",
+                    "endpoint_family": "chat_completions",
+                    "public_model": "gpt-route",
+                    "client_token_ref": "local-client",
+                    "route_kind": "explicit_model",
+                    "failure_class": "route_admission_denied",
+                    "router_action": "returned_local_error",
+                    "retry_eligibility": "not_applicable",
+                    "retry_blocked_reason": null,
+                    "client_visible_status": "local_503",
+                    "upstream_status": null,
+                    "final_outcome": "client_visible_failure",
+                    "reason_code": "no_route_candidate",
+                    "blocking_domain": "route",
+                    "admission": {
+                        "registry_generation": 9,
+                        "candidate_count": 3,
+                        "included_count": 0,
+                        "blocked_count": 3,
+                        "hard_blocked_count": 2,
+                        "soft_suppressed_count": 1,
+                        "last_resort_used": false,
+                        "hard_reason_codes": ["channel_cooling_down", "no_available_credentials"],
+                        "soft_reason_codes": ["provider_cooling_down"]
+                    },
+                    "next_action": {
+                        "summary": "Inspect route explanation.",
+                        "template_id": "route_explain",
+                        "safe_argv": ["one-ai-key", "route", "explain", "<model>"],
+                        "side_effect_class": "runtime_readonly",
+                        "requires_confirmation": false
+                    }
+                },
+                {
+                    "source": "routing_telemetry",
+                    "event_kind": "upstream_failure_observed",
+                    "request_id": "req_upstream_503",
+                    "stage": "upstream_transport",
+                    "public_model": "gpt-route",
+                    "client_token_ref": "local-client",
+                    "selected_target": {"channel_id": "relay-a"},
+                    "channel_id": "relay-a",
+                    "failure_class": "upstream_5xx",
+                    "router_action": "returned_local_error",
+                    "retry_eligibility": "not_applicable",
+                    "retry_blocked_reason": null,
+                    "client_visible_status": "upstream_5xx",
+                    "upstream_status": 503,
+                    "final_outcome": "client_visible_failure",
+                    "reason_code": "upstream_5xx",
+                    "blocking_domain": "upstream_provider",
+                    "directive": "return_error",
+                    "attempt": 0,
+                    "next_action": {
+                        "summary": "Inspect recent failures.",
+                        "template_id": "failures_tail",
+                        "safe_argv": ["one-ai-key", "failures", "tail"],
+                        "side_effect_class": "runtime_readonly",
+                        "requires_confirmation": false
+                    }
+                }
+            ],
+            "events": []
+        });
+        let empty_filter = serde_json::json!({
+            "buffered_events": 0,
+            "offset": 0,
+            "limit": 50,
+            "failure_events": [],
+            "events": []
+        });
+
+        let local_rendered = render_explain_report(
+            &routing,
+            &empty_filter,
+            "req_local_503",
+            &FailureFilters::default(),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let local_report: Value = serde_json::from_str(&local_rendered).unwrap();
+        let local_failure = &local_report["data"]["evidence"][0];
+
+        assert_eq!(local_report["reason_code"], "no_route_candidate");
+        assert_eq!(local_failure["event_kind"], "route_admission_denied");
+        assert_eq!(local_failure["stage"], "route_admission");
+        assert_eq!(local_failure["client_visible_status"], "local_503");
+        assert!(local_failure["upstream_status"].is_null());
+        assert_eq!(local_failure["admission"]["candidate_count"], 3);
+        assert_eq!(local_failure["admission"]["included_count"], 0);
+        assert_eq!(
+            local_failure["admission"]["hard_reason_codes"][0],
+            "channel_cooling_down"
+        );
+
+        let upstream_rendered = render_explain_report(
+            &routing,
+            &empty_filter,
+            "req_upstream_503",
+            &FailureFilters::default(),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let upstream_report: Value = serde_json::from_str(&upstream_rendered).unwrap();
+        let upstream_failure = &upstream_report["data"]["evidence"][0];
+
+        assert_eq!(upstream_report["reason_code"], "upstream_5xx");
+        assert_eq!(upstream_failure["client_visible_status"], "upstream_5xx");
+        assert_eq!(upstream_failure["upstream_status"], 503);
+        assert!(upstream_failure["admission"].is_null());
+
+        let local_table = render_explain_report(
+            &routing,
+            &empty_filter,
+            "req_local_503",
+            &FailureFilters::default(),
+            crate::cli_report::OutputFormat::Table,
+        );
+        assert!(local_table.contains("upstream_status=null"));
+        assert!(local_table.contains("admission_candidate_count=3"));
+        assert!(local_table.contains("admission_included_count=0"));
     }
 
     #[test]
