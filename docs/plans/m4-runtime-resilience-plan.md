@@ -592,19 +592,35 @@ Task 6 checkpoint evidence:
 - Modify: `docs/release-build.md`
 - Test: `tests/local_release_contract.rs`
 
-- [ ] Add one local mock release-smoke path for provider/account soft-cooling
+- [x] Add one local mock release-smoke path for provider/account soft-cooling
   last-resort success.
-- [ ] Add one local mock negative sanity path for a representative hard blocker
+- [x] Add one local mock negative sanity path for a representative hard blocker
   returning local `no_route_candidate` with zero upstream hits.
-- [ ] Do not expand release smoke into the full admission matrix.
-- [ ] If adding `scripts/production-smoke.sh`, require explicit
+- [x] Do not expand release smoke into the full admission matrix.
+- [x] If adding `scripts/production-smoke.sh`, require explicit
   `--allow-production`, parameterize all values, and reject missing env/token
   references without printing secrets.
-- [ ] Document production smoke as an operator-run deployment check, not a CI or
+- [x] Document production smoke as an operator-run deployment check, not a CI or
   source release gate.
-- [ ] Update local release contract tests for the new script boundaries and
+- [x] Update local release contract tests for the new script boundaries and
   denylist expectations.
-- [ ] Commit release and operator smoke changes.
+- [x] Commit release and operator smoke changes.
+
+Task 7 checkpoint evidence:
+
+- `scripts/release-smoke.sh` now distinguishes selected upstream 503 from local
+  route admission 503 with symmetric mock upstream POST counters.
+- `scripts/release-smoke.sh` now creates a provider/account soft-cooling state
+  from a local mock upstream 503 with `Retry-After`, verifies
+  `provider_cooling_down_last_resort` in `route explain`, and proves the
+  last-resort request reaches the mock upstream exactly once.
+- No `scripts/production-smoke.sh` was added; production smoke remains an
+  operator-run deployment boundary documented outside source release tests.
+- `bash -n scripts/release-smoke.sh` exited 0.
+- `cargo test --locked --test local_release_contract release_smoke_script_covers_local_admission_and_upstream_503_failure_evidence -- --exact`
+  matched 1 test and passed.
+- `cargo test --locked --test local_release_contract docs_make_models_explain_endpoint_family_the_canonical_first_diagnosis -- --exact`
+  matched 1 test and passed.
 
 ### Task 8: Documentation And Stop Card
 

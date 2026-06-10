@@ -139,10 +139,12 @@ class Handler(BaseHTTPRequestHandler):
         with open(sys.argv[2], "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"method": method, "path": self.path}) + "\n")
 
-    def _send_json(self, payload, status=200):
+    def _send_json(self, payload, status=200, headers=None):
         raw = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -171,7 +173,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/chat/completions":
             messages = request.get("messages", [])
             if any(isinstance(message, dict) and message.get("content") == UPSTREAM_503_MARKER for message in messages):
-                self._send_json({"error": {"code": "provider_unavailable", "message": UPSTREAM_503_MARKER}}, status=503)
+                self._send_json({"error": {"code": "provider_unavailable", "message": UPSTREAM_503_MARKER}}, status=503, headers={"Retry-After": "30"})
                 return
             self._send_json({
                 "id": "release-smoke-response",
@@ -362,6 +364,7 @@ EXPECTED_MANAGEMENT_REPORTS=(
   "models-explain-published.json"
   "failures-tail-upstream-503.json"
   "failures-explain-upstream-503.json"
+  "route-explain-provider-cooling-last-resort.json"
   "keys-disable-final-available.json"
   "failures-tail-local-admission-503.json"
   "failures-explain-local-admission-503.json"
@@ -875,6 +878,7 @@ curl -fsS "http://127.0.0.1:${SERVICE_PORT}/v1/chat/completions" \
   -d "{\"model\":\"${PUBLISHED_PUBLIC_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
   | jq -e '.choices[0].message.content == "release smoke published model ok"' >/dev/null
 
+POSTS_BEFORE_UPSTREAM_503=$(mock_upstream_chat_completion_posts)
 UPSTREAM_503_STATUS=$(curl -sS -o upstream-503.json -w "%{http_code}" \
   "http://127.0.0.1:${SERVICE_PORT}/v1/chat/completions" \
   -H "Authorization: Bearer ${CLIENT_TOKEN}" \
@@ -882,6 +886,11 @@ UPSTREAM_503_STATUS=$(curl -sS -o upstream-503.json -w "%{http_code}" \
   -d "$(jq -n --arg marker "${UPSTREAM_503_MARKER}" '{model:"gpt-example",messages:[{role:"user",content:$marker}]}')")
 if [[ "${UPSTREAM_503_STATUS}" != "503" ]]; then
   printf 'error: upstream 503 smoke returned HTTP %s instead of 503\n' "${UPSTREAM_503_STATUS}" >&2
+  exit 1
+fi
+POSTS_AFTER_UPSTREAM_503=$(mock_upstream_chat_completion_posts)
+if (( POSTS_AFTER_UPSTREAM_503 != POSTS_BEFORE_UPSTREAM_503 + 1 )); then
+  printf 'error: upstream 503 smoke did not reach mock upstream exactly once\n' >&2
   exit 1
 fi
 jq -e '.error.code == "provider_unavailable"' upstream-503.json >/dev/null
@@ -926,6 +935,34 @@ jq -e --arg request_id "${UPSTREAM_503_REQUEST_ID}" '
     and .upstream_status == 503
   ))
 ' failures-explain-upstream-503.json >/dev/null
+
+capture_management_report route-explain-provider-cooling-last-resort.json route explain gpt-example --client-token-ref local-client --output json
+jq -e '
+  .status == "last_resort"
+  and .reason_code == "provider_cooling_down_last_resort"
+  and .admission_summary.status == "last_resort"
+  and .admission_summary.reason_code == "provider_cooling_down_last_resort"
+  and .admission_summary.last_resort_used == true
+  and .admission_summary.last_resort_reason == "provider_cooling_down_last_resort"
+  and .admission_summary.included_count == 1
+  and .selected_target.channel_id == "relay"
+' route-explain-provider-cooling-last-resort.json >/dev/null
+POSTS_BEFORE_SOFT_LAST_RESORT=$(mock_upstream_chat_completion_posts)
+SOFT_LAST_RESORT_STATUS=$(curl -sS -o provider-cooling-last-resort.json -w "%{http_code}" \
+  "http://127.0.0.1:${SERVICE_PORT}/v1/chat/completions" \
+  -H "Authorization: Bearer ${CLIENT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-example","messages":[{"role":"user","content":"ping"}]}')
+if [[ "${SOFT_LAST_RESORT_STATUS}" != "200" ]]; then
+  printf 'error: provider-cooling last-resort smoke returned HTTP %s instead of 200\n' "${SOFT_LAST_RESORT_STATUS}" >&2
+  exit 1
+fi
+POSTS_AFTER_SOFT_LAST_RESORT=$(mock_upstream_chat_completion_posts)
+if (( POSTS_AFTER_SOFT_LAST_RESORT != POSTS_BEFORE_SOFT_LAST_RESORT + 1 )); then
+  printf 'error: provider-cooling last-resort smoke did not reach mock upstream exactly once\n' >&2
+  exit 1
+fi
+jq -e '.choices[0].message.content == "release smoke ok"' provider-cooling-last-resort.json >/dev/null
 
 capture_management_report keys-disable-final-available.json keys disable --credential-set relay_credentials --credential-ref cr:v1:pos:0 --reason "release smoke final unavailable credential" --yes --output json
 jq -e '
