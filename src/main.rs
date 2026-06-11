@@ -34879,6 +34879,227 @@ model_routes:
     }
 
     #[tokio::test]
+    async fn response_filter_rejects_upstream_error_json_before_forwarding_body() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "rate_limit_cooldown",
+                            "message": "blocked-marker"
+                        },
+                        "message": "blocked-marker",
+                        "code": "rate_limit_cooldown"
+                    })),
+                )
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state = test_state_with_response_filter(
+            &api_base,
+            crate::config::ResponseFilterConfig {
+                enabled: true,
+                replacement: Some("[filtered]".to_string()),
+                event_window_capacity: None,
+                alert_window_seconds: None,
+                rules: vec![crate::config::ResponseFilterRuleConfig {
+                    id: "error-envelope-marker".to_string(),
+                    enabled: true,
+                    kind: crate::config::ResponseFilterRuleKindConfig::Literal,
+                    action: crate::config::ResponseFilterActionConfig::Reject,
+                    case_sensitive: false,
+                    value: Some("blocked-marker".to_string()),
+                    pattern: None,
+                }],
+            },
+        );
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "response_filter_rejected");
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body_text.contains("blocked-marker"));
+        assert!(!body_text.contains("rate_limit_cooldown"));
+
+        let filter_events =
+            management_response_json(&app(state.clone()), "/management/response-filter-events")
+                .await;
+        let events = filter_events["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["rule_id"], "error-envelope-marker");
+        assert_eq!(events[0]["action"], "reject");
+        assert_eq!(events[0]["content_kind"], "json");
+        assert_eq!(events[0]["outcome"], "rejected");
+        assert_eq!(events[0]["body_committed"], false);
+        let serialized_filter_events = serde_json::to_string(&filter_events).unwrap();
+        assert!(!serialized_filter_events.contains("blocked-marker"));
+        assert!(!serialized_filter_events.contains("rate_limit_cooldown"));
+    }
+
+    #[tokio::test]
+    async fn response_filter_redacts_upstream_error_json_before_forwarding_body() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let body = r#"{"error":{"code":"synthetic_error","message":"blocked-marker"}}"#;
+                Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap()
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state = test_state_with_response_filter(
+            &api_base,
+            crate::config::ResponseFilterConfig {
+                enabled: true,
+                replacement: Some("[filtered]".to_string()),
+                event_window_capacity: None,
+                alert_window_seconds: None,
+                rules: vec![crate::config::ResponseFilterRuleConfig {
+                    id: "error-redact-marker".to_string(),
+                    enabled: true,
+                    kind: crate::config::ResponseFilterRuleKindConfig::Literal,
+                    action: crate::config::ResponseFilterActionConfig::Redact,
+                    case_sensitive: false,
+                    value: Some("blocked-marker".to_string()),
+                    pattern: None,
+                }],
+            },
+        );
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_text.contains("[filtered]"));
+        assert!(!body_text.contains("blocked-marker"));
+
+        let filter_events =
+            management_response_json(&app(state.clone()), "/management/response-filter-events")
+                .await;
+        let events = filter_events["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["rule_id"], "error-redact-marker");
+        assert_eq!(events[0]["action"], "redact");
+        assert_eq!(events[0]["outcome"], "redacted");
+        assert_eq!(events[0]["body_committed"], false);
+    }
+
+    #[tokio::test]
+    async fn response_filter_error_json_cooldown_action_marks_channel_without_forwarding_body() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "synthetic_error",
+                            "message": "blocked-marker"
+                        }
+                    })),
+                )
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state = test_state_with_response_filter(
+            &api_base,
+            crate::config::ResponseFilterConfig {
+                enabled: true,
+                replacement: Some("[filtered]".to_string()),
+                event_window_capacity: None,
+                alert_window_seconds: None,
+                rules: vec![crate::config::ResponseFilterRuleConfig {
+                    id: "error-cooldown-marker".to_string(),
+                    enabled: true,
+                    kind: crate::config::ResponseFilterRuleKindConfig::Literal,
+                    action: crate::config::ResponseFilterActionConfig::RejectAndCooldownChannel,
+                    case_sensitive: false,
+                    value: Some("blocked-marker".to_string()),
+                    pattern: None,
+                }],
+            },
+        );
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body_text.contains("blocked-marker"));
+
+        let channel = pool_status_for_channel(&state, "test").await.unwrap();
+        let value = serde_json::to_value(channel).unwrap();
+        assert_eq!(value["health"]["kind"], "cooling_down");
+        assert_eq!(
+            value["health"]["reason"],
+            "response filter rejected upstream response"
+        );
+
+        let telemetry =
+            management_response_json(&app(state.clone()), "/management/routing-telemetry").await;
+        let failure = telemetry["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event["kind"] == "upstream_failure_observed"
+                    && event["failure"]["failure_source"] == "response_filter_precommit"
+            })
+            .expect("response-filter precommit failure telemetry");
+        assert_eq!(failure["failure"]["failure_scope"], "channel");
+        assert_eq!(failure["failure"]["status"], 429);
+    }
+
+    #[tokio::test]
     async fn response_filter_committed_event_does_not_mutate_lifecycle_or_retry() {
         const TEST_SUCCESS_GUARD_MAX_BYTES: usize = 8192;
         let primary_hits = Arc::new(AtomicU64::new(0));

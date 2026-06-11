@@ -1,8 +1,17 @@
 # Response Filter
 
-`response_filter` is a gateway-side safety boundary for successful upstream responses. It is intended for relay contamination cases where an upstream or intermediate service injects unwanted text into otherwise valid model output. The filter is configured in YAML, compiled at startup or runtime reload, and applied on the streaming response boundary before bytes are returned to the client.
+`response_filter` is a gateway-side safety boundary for upstream response
+content. It is intended for relay contamination cases where an upstream or
+intermediate service injects unwanted text into otherwise valid model output or
+into a structured upstream error body. The filter is configured in YAML,
+compiled at startup or runtime reload, and applied before matching response
+bytes are returned to the client whenever the response path is still bounded.
 
-The feature is deliberately separate from provider adapters and routing policy. Provider adapters still own protocol and auth rewriting; routing still owns retry and lifecycle state. Response filtering only inspects successful response bytes and decides whether to pass them through, redact matching content, or replace blocked content with a local error payload.
+The feature is deliberately separate from provider adapters and routing policy.
+Provider adapters still own protocol and auth rewriting; routing still owns
+retry and lifecycle state. Response filtering only inspects bytes already being
+returned through the proxy boundary and decides whether to pass them through,
+redact matching content, or replace blocked content with a local error payload.
 
 ## Configuration
 
@@ -53,9 +62,19 @@ Literal matching removes common zero-width format characters before matching, so
 
 ## Runtime Behavior
 
-The filter is stored in `AppState` as a compiled policy. `POST /management/runtime/reload` replaces the compiled policy along with the rest of the resolved runtime configuration. Proxy forwarding reads an immutable snapshot of the current filter when a successful upstream response begins.
+The filter is stored in `AppState` as a compiled policy. `POST
+/management/runtime/reload` replaces the compiled policy along with the rest of
+the resolved runtime configuration. Proxy forwarding reads an immutable
+snapshot of the current filter when an upstream response reaches a filterable
+boundary.
 
-Filtering is applied only to successful upstream responses. Error responses are still handled by the existing bounded error-body classifier path.
+Successful responses use streaming filtering. Upstream error responses first go
+through the existing bounded error-body classifier path. If the request is
+terminal after retry/fallback decisions and the error body was fully retained
+under `max_error_body_bytes`, the same filter policy is applied before that
+error body can be forwarded to the client. This catches contamination inside
+JSON error envelopes without adding live upstream probes or unbounded body
+buffering.
 
 When no effective rules are configured, successful responses use the same direct streaming path as before. When rules are configured, the response stream is filtered without buffering the complete response:
 
@@ -90,9 +109,16 @@ Streaming requests, non-replayable bodies, matches after any body bytes have
 been committed, compressed/non-UTF-8 responses, and prefix misses remain bounded
 content filtering only; they do not perform post-output transparent fallback.
 
+For retained upstream error bodies, `literal` and `regex` rules can redact or
+reject matched text before forwarding. `required_literal` and `required_regex`
+rules are not evaluated as missing on error bodies, because an ordinary upstream
+error is not expected to have the same shape as a successful model response.
+Rejecting lifecycle actions can still synthesize `response_filter_rejected`
+evidence before any client output, but they do not trigger transparent retry.
+
 ## Event Boundary
 
-When response-filter event capture is enabled, the proxy writes only bounded metadata to the in-memory `response_filter_events` ring after a rule outcome is known. The event is not itself replayed into routing or lifecycle decisions. Only the explicit `reject_and_expire_credential` and `reject_and_cooldown_channel` actions can create lifecycle evidence, and only while the guarded prefix is still pre-commit. `GET /management/response-filter-events` exposes:
+When response-filter event capture is enabled, the proxy writes only bounded metadata to the in-memory `response_filter_events` ring after a rule outcome is known. The event is not itself replayed into routing or lifecycle decisions. Only the explicit `reject_and_expire_credential` and `reject_and_cooldown_channel` actions can create lifecycle evidence, and only while the response is still at a bounded pre-commit boundary. `GET /management/response-filter-events` exposes:
 
 `capacity`, `dropped_events`, and `events`. Each event contains `event_id`, `created_at_unix_seconds`, `request_id`, `channel_id`, `public_model`, `rule_id`, `action`, `content_kind`, `reason_code`, `outcome`, and `body_committed`.
 

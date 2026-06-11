@@ -31,6 +31,7 @@ postgres_data/
 .env*
 config.yaml
 config/
+keys/
 docker-compose.override.yml
 config/*.yaml
 config/*.yml

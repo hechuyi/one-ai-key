@@ -29,7 +29,8 @@ support bundle.
 - Applies relay-specific error semantics through typed profiles and structured
   rules instead of free-form upstream text matching.
 - Streams successful responses while keeping bounded pre-output guards for
-  obvious upstream error envelopes and configured response-filter rejections.
+  obvious upstream error envelopes, retained error bodies, and configured
+  response-filter rejections.
 - Serves `/v1/models` from the compiled local public catalog. It does not call
   upstream `/v1/models` or aggregate live provider catalogs on the request path.
 - Provides redacted operator commands for `doctor`, `models`, `route`, `keys`,
@@ -213,7 +214,7 @@ Important resource types:
 - `policy_profiles`: upstream error classification and relay semantics.
 - `routing_profiles`: key selection, same-request credential retry, and
   route-target retry behavior.
-- `response_filter`: optional successful-response redaction or rejection rules.
+- `response_filter`: optional upstream-response redaction or rejection rules.
 
 Local mutable files should stay out of Git. Keep runtime config, key files,
 SQLite databases, JSONL logs, and generated release artifacts under ignored
@@ -466,7 +467,7 @@ release artifact instead of compiling locally. Details are in
   shortcuts, profiles, stores, limits, and local secret handling.
 - [Architecture notes](docs/architecture.md): deeper module-level design and
   management API boundaries.
-- [Response filter](docs/response-filter.md): successful-response filtering,
+- [Response filter](docs/response-filter.md): bounded response filtering,
   pre-commit rejection actions, event boundaries, and alert semantics.
 - [Operations](docs/operations.md): deployment boundaries, persistent state,
   safe diagnostics, and release smoke checks.

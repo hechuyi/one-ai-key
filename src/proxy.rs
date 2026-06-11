@@ -136,6 +136,11 @@ struct PrecommitFilterRejection {
     response: Response,
 }
 
+enum BufferedBodyFilterDecision {
+    Redacted(Bytes),
+    Rejected(Box<PrecommitFilterRejection>),
+}
+
 fn inspect_response_filter_before_commit(
     state: &AppState,
     route_plan: &FrozenRoutePlan,
@@ -160,7 +165,9 @@ fn inspect_response_filter_before_commit(
     else {
         return None;
     };
-    emit_precommit_response_filter_events(state, route_plan, snapshot, headers, &matches);
+    emit_precommit_response_filter_events(
+        state, route_plan, snapshot, headers, &matches, "rejected",
+    );
     let failure =
         (snapshot.body_replayable && !snapshot.streaming && !snapshot.partial_output_started)
             .then(|| {
@@ -172,7 +179,7 @@ fn inspect_response_filter_before_commit(
                             .lifecycle_failure_scope()
                             .map(|scope| (matched, scope))
                     })
-                    .map(|(matched, scope)| response_filter_failure(snapshot, matched, scope))
+                    .map(|(matched, scope)| response_filter_failure(snapshot, matched, scope, 200))
             })
             .flatten();
     Some(PrecommitFilterRejection {
@@ -181,12 +188,76 @@ fn inspect_response_filter_before_commit(
     })
 }
 
+fn inspect_response_filter_buffered_body_before_commit(
+    state: &AppState,
+    route_plan: &FrozenRoutePlan,
+    snapshot: &RequestSelectionSnapshot,
+    headers: &HeaderMap,
+    upstream_status: StatusCode,
+    body: &Bytes,
+) -> Option<BufferedBodyFilterDecision> {
+    if has_non_identity_content_encoding(headers) {
+        return None;
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return None;
+    };
+    let policy = state
+        .response_filter
+        .read()
+        .expect("response filter lock poisoned")
+        .clone();
+    match policy.inspect_text_for_precommit(text, false) {
+        ResponseFilterDecision::Unchanged => None,
+        ResponseFilterDecision::Redacted { text, matches } => {
+            emit_precommit_response_filter_events(
+                state, route_plan, snapshot, headers, &matches, "redacted",
+            );
+            Some(BufferedBodyFilterDecision::Redacted(Bytes::from(text)))
+        }
+        ResponseFilterDecision::Rejected { matches } => {
+            emit_precommit_response_filter_events(
+                state, route_plan, snapshot, headers, &matches, "rejected",
+            );
+            let failure = (snapshot.body_replayable
+                && !snapshot.streaming
+                && !snapshot.partial_output_started)
+                .then(|| {
+                    matches
+                        .iter()
+                        .find_map(|matched| {
+                            matched
+                                .action
+                                .lifecycle_failure_scope()
+                                .map(|scope| (matched, scope))
+                        })
+                        .map(|(matched, scope)| {
+                            response_filter_failure(
+                                snapshot,
+                                matched,
+                                scope,
+                                upstream_status.as_u16(),
+                            )
+                        })
+                })
+                .flatten();
+            Some(BufferedBodyFilterDecision::Rejected(Box::new(
+                PrecommitFilterRejection {
+                    failure,
+                    response: response_filter_precommit_rejected_response(),
+                },
+            )))
+        }
+    }
+}
+
 fn emit_precommit_response_filter_events(
     state: &AppState,
     route_plan: &FrozenRoutePlan,
     snapshot: &RequestSelectionSnapshot,
     headers: &HeaderMap,
     matches: &[ResponseFilterMatch],
+    outcome: &str,
 ) {
     let context = response_filter_event_options(state, route_plan, snapshot).context;
     let content_kind = response_filter_content_kind(headers);
@@ -202,7 +273,7 @@ fn emit_precommit_response_filter_events(
                 action: matched_rule.action.as_str().to_string(),
                 content_kind: content_kind.to_string(),
                 reason_code: matched_rule.reason_code.to_string(),
-                outcome: "rejected".to_string(),
+                outcome: outcome.to_string(),
                 body_committed: false,
             },
         );
@@ -244,6 +315,7 @@ fn response_filter_failure(
     snapshot: &RequestSelectionSnapshot,
     matched: &ResponseFilterMatch,
     scope: FailureScope,
+    upstream_status: u16,
 ) -> ClassifiedFailure {
     ClassifiedFailure {
         kind: FailureKind::ResponseFilterRejected,
@@ -252,7 +324,7 @@ fn response_filter_failure(
         cooldown: None,
         retry_after_source: None,
         confidence: FailureConfidence::High,
-        upstream_status: Some(200),
+        upstream_status: Some(upstream_status),
         upstream_code: None,
         upstream_limit_type: None,
         classifier_id: snapshot.classifier_id.clone(),
@@ -267,6 +339,18 @@ fn response_filter_precommit_rejected_response() -> Response {
         "response_filter_rejected",
         "upstream response content was blocked by response filter",
     )
+}
+
+fn response_with_filtered_buffered_body(
+    status: StatusCode,
+    mut headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    headers.remove(header::CONTENT_LENGTH);
+    if !has_non_identity_content_encoding(&headers) {
+        headers.remove(header::CONTENT_ENCODING);
+    }
+    response_with_headers(status, headers, Body::from(body))
 }
 
 pub async fn proxy_openai_compatible(State(state): State<AppState>, req: Request) -> Response {
@@ -1305,6 +1389,33 @@ async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response 
         &bytes,
     );
     let _ = transition_observed_upstream_failure(&state, &pool_state, &snapshot, failure).await;
+    if let Some(decision) = inspect_response_filter_buffered_body_before_commit(
+        &state,
+        &route_plan,
+        &snapshot,
+        &response_headers,
+        status,
+        &bytes,
+    ) {
+        match decision {
+            BufferedBodyFilterDecision::Redacted(bytes) => {
+                return response_with_filtered_buffered_body(status, response_headers, bytes);
+            }
+            BufferedBodyFilterDecision::Rejected(rejection) => {
+                if let Some(failure) = rejection.failure {
+                    let _ = transition_observed_failure(
+                        &state,
+                        &pool_state,
+                        &snapshot,
+                        failure,
+                        FailureSource::ResponseFilterPrecommit,
+                    )
+                    .await;
+                }
+                return rejection.response;
+            }
+        }
+    }
     response_with_headers(status, response_headers, Body::from(bytes))
 }
 
@@ -1779,6 +1890,36 @@ async fn forward_with_pool(
             }
             RetryAttemptContinuation::ReturnCurrentError { .. }
             | RetryAttemptContinuation::FrozenCandidateDrift { .. } => {}
+        }
+
+        if let Some(decision) = inspect_response_filter_buffered_body_before_commit(
+            state,
+            route_plan,
+            &snapshot,
+            &response_headers,
+            status,
+            &bytes,
+        ) {
+            match decision {
+                BufferedBodyFilterDecision::Redacted(bytes) => {
+                    let response =
+                        response_with_filtered_buffered_body(status, response_headers, bytes);
+                    return PoolForwardResult::Response(response);
+                }
+                BufferedBodyFilterDecision::Rejected(rejection) => {
+                    if let Some(failure) = rejection.failure {
+                        let _ = transition_observed_failure(
+                            state,
+                            &pool_state,
+                            &snapshot,
+                            failure,
+                            FailureSource::ResponseFilterPrecommit,
+                        )
+                        .await;
+                    }
+                    return PoolForwardResult::Response(rejection.response);
+                }
+            }
         }
 
         let response = response_with_headers(status, response_headers, Body::from(bytes));

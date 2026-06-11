@@ -47,7 +47,7 @@ or call upstream model catalogs.
 | `max_request_body_bytes` | Maximum client request body size accepted by the proxy. |
 | `max_model_catalog_body_bytes` | Maximum management model-discovery response body. |
 | `max_error_body_bytes` | Maximum upstream error body retained for classification. |
-| `response_filter` | Optional successful-response filtering policy. |
+| `response_filter` | Optional bounded upstream-response filtering policy. |
 
 These fields are process/runtime settings. They are not route targets by
 themselves.

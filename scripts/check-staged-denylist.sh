@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PATH_DENY_REGEX='^(dist|target|config|data|db|logs|keys|key-pool-router)/|(^|/)AGENTS\.md$|(^|/)docker-compose\.override\.yml$|(^|/)\.env($|\.)|(^|/)scripts/one_ai_key_keys\.py$|(\.sqlite3?|\.db|\.db-[^/]*|\.wal|\.shm|\.keys|\.key|\.pem|\.log|\.pid|\.tmp)$|(^|/)[^/]*(key|keys|secret|secrets|token|tokens)[^/]*\.txt$'
+PATH_DENY_REGEX='^(dist|target|config|data|db|logs|keys|key-pool-router)/|(^|/)AGENTS\.md$|(^|/)docker-compose\.override\.yml$|(^|/)\.env($|\.)|(^|/)scripts/one_ai_key_(keys|upload_key)\.py$|(^|/)tests/test_one_ai_key_upload_key\.py$|(\.sqlite3?|\.db|\.db-[^/]*|\.wal|\.shm|\.keys|\.key|\.pem|\.log|\.pid|\.tmp)$|(^|/)[^/]*(key|keys|secret|secrets|token|tokens)[^/]*\.txt$'
 INTERNAL_TRACE_REGEX='(For agentic workers|[Aa]gentic workers?|[Ss]ubagents?|[Ss]uperpowers:|plan-status|implementation workers?|main controller|子代理|主控|多轮[[:space:]]*质询|相互[[:space:]]*质询|内部审议|内部审查)'
 SECRET_MATERIAL_REGEX='(sk-[A-Za-z0-9_-]{20,}|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9_]{20,}|-----BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)'
 PROMO_INJECTION_REGEX='(邀请码|拉群|备用网址|欢迎加入|购买套餐|低价[[:space:]]*API|公益.*换[[:space:]]*key)'
@@ -48,6 +48,9 @@ run_self_test() {
 
   is_denied_path "target/debug/app" || failed=1
   is_denied_path "AGENTS.md" || failed=1
+  is_denied_path "keys/local.keys" || failed=1
+  is_denied_path "scripts/one_ai_key_upload_key.py" || failed=1
+  is_denied_path "tests/test_one_ai_key_upload_key.py" || failed=1
   is_denied_path "docs/architecture.md" && failed=1
   is_denied_path "docs/plans/product-improvement-roadmap.md" && failed=1
 
