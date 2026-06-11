@@ -148,6 +148,20 @@ fi
 cd "${WORK_DIR}"
 
 "${BIN}" --help >/dev/null
+ONBOARD_HELP=$("${BIN}" models onboard-plan --help)
+FORBIDDEN_ONBOARD_HELP_FLAGS=(
+  "--discover"
+  "--sync-plan"
+  "--sync-apply"
+  "--reload"
+  "--reload-apply"
+)
+for forbidden_flag in "${FORBIDDEN_ONBOARD_HELP_FLAGS[@]}"; do
+  if grep -F -- "${forbidden_flag}" <<<"${ONBOARD_HELP}" >/dev/null; then
+    printf 'error: release binary exposes legacy models onboard-plan flag: %s\n' "${forbidden_flag}" >&2
+    exit 1
+  fi
+done
 "${BIN}" init local --out config/local.yaml --keys data/relay.keys --dry-run --output json \
   | jq -e '.status == "dry_run" and .reason_code == "init_local_dry_run" and (.next_action.safe_argv | length > 0)' >/dev/null
 "${BIN}" init local --out config/local.yaml --keys data/relay.keys --yes --output json \

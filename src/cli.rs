@@ -288,20 +288,10 @@ struct ModelsOnboardPlanArgs {
     #[arg(long, conflicts_with = "yes")]
     dry_run: bool,
     #[arg(long)]
-    discover: bool,
-    #[arg(long = "sync-plan")]
-    sync_plan: bool,
-    #[arg(long = "sync-apply")]
-    sync_apply: bool,
-    #[arg(long)]
     apply: bool,
     #[arg(long, requires = "apply")]
     expected_staged_registry_version: Option<u64>,
-    #[arg(long)]
-    reload: bool,
-    #[arg(long = "reload-apply")]
-    reload_apply: bool,
-    #[arg(long)]
+    #[arg(long, requires = "apply")]
     yes: bool,
     #[arg(long, value_enum, default_value_t = crate::cli_report::OutputFormat::Table)]
     output: crate::cli_report::OutputFormat,
@@ -748,14 +738,7 @@ where
                 upstream_model: args.upstream_model,
                 client_token_ref: args.client_token_ref,
                 endpoint_family: args.endpoint_family,
-                mode: if args.discover
-                    || args.sync_plan
-                    || args.sync_apply
-                    || args.reload
-                    || args.reload_apply
-                {
-                    crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DeferredToSeparatePlan
-                } else if args.apply && args.dry_run {
+                mode: if args.apply && args.dry_run {
                     crate::cli_commands::models_onboard::ModelsOnboardPlanMode::ApplyDryRun
                 } else if args.apply && args.yes {
                     crate::cli_commands::models_onboard::ModelsOnboardPlanMode::Apply
@@ -1838,16 +1821,15 @@ mod tests {
     }
 
     #[test]
-    fn models_onboard_plan_live_variants_parse_as_deferred() {
+    fn models_onboard_plan_rejects_legacy_live_workflow_flags() {
         for flag in [
             "--discover",
             "--sync-plan",
             "--sync-apply",
             "--reload",
             "--reload-apply",
-            "--yes",
         ] {
-            let action = parse_action_from([
+            let error = parse_action_from([
                 "one-ai-key",
                 "models",
                 "onboard-plan",
@@ -1857,17 +1839,51 @@ mod tests {
                 "coding",
                 flag,
             ])
-            .expect("deferred live variant should parse before policy denial");
+            .expect_err("legacy live workflow flag should not parse");
 
-            assert!(matches!(
-                action,
-                CliAction::ModelsOnboardPlan(
-                    crate::cli_commands::models_onboard::ModelsOnboardPlanOptions {
-                        mode: crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DeferredToSeparatePlan,
-                        ..
-                    }
-                )
-            ));
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn models_onboard_plan_rejects_yes_without_apply() {
+        let error = parse_action_from([
+            "one-ai-key",
+            "models",
+            "onboard-plan",
+            "--channel",
+            "relay-a",
+            "--public-model",
+            "coding",
+            "--yes",
+        ])
+        .expect_err("--yes is only meaningful with --apply");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn models_onboard_plan_help_hides_legacy_live_workflow_flags() {
+        let mut command = Cli::command();
+        let models = command
+            .find_subcommand_mut("models")
+            .expect("models subcommand should exist");
+        let onboard = models
+            .find_subcommand_mut("onboard-plan")
+            .expect("models onboard-plan subcommand should exist");
+        let help = onboard.render_long_help().to_string();
+
+        for flag in [
+            "--discover",
+            "--sync-plan",
+            "--sync-apply",
+            "--reload",
+            "--reload-apply",
+        ] {
+            assert!(!help.contains(flag), "{flag} should not be public help");
         }
     }
 
