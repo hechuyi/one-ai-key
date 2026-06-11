@@ -386,7 +386,9 @@ After any replacement action, verify with `keys stats`, `route explain`,
 `one-ai-key failures tail --last <n>` and `one-ai-key failures explain
 <request-id>` read only bounded recent failure evidence from management
 projections. They are not historical storage, routing input, or a place to
-quote upstream payloads.
+quote upstream payloads. Use `--endpoint-family responses` or
+`--endpoint-family chat_completions` to narrow evidence for client-specific
+endpoint incidents.
 
 `one-ai-key response-filters events --last <n>` reads only the bounded
 response-filter event ring. It is useful when investigating relay contamination

@@ -24,6 +24,7 @@ pub struct FailureExplainOptions {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FailureFilters {
+    pub endpoint_family: Option<String>,
     pub request_id: Option<String>,
     pub public_model: Option<String>,
     pub channel_id: Option<String>,
@@ -387,7 +388,9 @@ fn request_explanation(failures: &[Value]) -> Value {
     let Some(primary) = primary_failure(failures) else {
         return serde_json::json!({
             "stage": "unknown",
+            "endpoint_family": "unknown",
             "failure_class": "unknown",
+            "route_kind": "unknown",
             "router_action": "none",
             "retry_eligibility": "not_applicable",
             "retry_blocked_reason": Value::Null,
@@ -684,6 +687,9 @@ fn primary_reason_code(failures: &[Value]) -> String {
 
 fn matches_filters(failure: &Value, filters: &FailureFilters) -> bool {
     matches_filter_field(
+        failure.get("endpoint_family").and_then(Value::as_str),
+        filters.endpoint_family.as_deref(),
+    ) && matches_filter_field(
         failure.get("request_id").and_then(Value::as_str),
         filters.request_id.as_deref(),
     ) && matches_filter_field(
@@ -710,6 +716,7 @@ fn matches_filter_field(value: Option<&str>, filter: Option<&str>) -> bool {
 
 fn filters_metadata(filters: &FailureFilters) -> Value {
     serde_json::json!({
+        "endpoint_family": filters.endpoint_family.as_deref().and_then(sanitize_local_string),
         "request_id": filters.request_id.as_deref().and_then(sanitize_local_string),
         "public_model": filters.public_model.as_deref().and_then(sanitize_local_string),
         "channel_id": filters.channel_id.as_deref().and_then(sanitize_local_string),
@@ -917,9 +924,10 @@ fn render_failure_table(report: &Value) -> String {
         .unwrap_or_default();
     for failure in failures {
         output.push_str(&format!(
-            "- request_id={} stage={} failure_class={} blocking_domain={} router_action={} retry_eligibility={} retry_blocked_reason={} client_visible_status={} upstream_status={} reason_code={} model={} channel={} directive={} admission_candidate_count={} admission_included_count={}\n",
+            "- request_id={} stage={} endpoint_family={} failure_class={} blocking_domain={} router_action={} retry_eligibility={} retry_blocked_reason={} client_visible_status={} upstream_status={} reason_code={} model={} channel={} directive={} admission_candidate_count={} admission_included_count={}\n",
             table_str(failure.get("request_id")),
             table_str(failure.get("stage")),
+            table_str(failure.get("endpoint_family")),
             table_str(failure.get("failure_class")),
             table_str(failure.get("blocking_domain")),
             table_str(failure.get("router_action")),
@@ -993,6 +1001,7 @@ mod tests {
             "event_kind": event_kind,
             "request_id": request_id,
             "stage": stage,
+            "endpoint_family": "chat_completions",
             "public_model": public_model,
             "client_token_ref": Value::Null,
             "selected_target": channel_id
@@ -1301,6 +1310,7 @@ mod tests {
             &response_filter_fixture(),
             "req_5xx",
             &FailureFilters {
+                endpoint_family: None,
                 request_id: None,
                 public_model: Some("gpt-example".to_string()),
                 channel_id: Some("relay-b".to_string()),
@@ -1516,6 +1526,7 @@ mod tests {
             &routing,
             &response_filter,
             &FailureFilters {
+                endpoint_family: None,
                 request_id: None,
                 public_model: Some("gpt-example".to_string()),
                 channel_id: Some("relay-a".to_string()),
@@ -1558,6 +1569,114 @@ mod tests {
                 "{directive} should be preserved as bounded retry evidence"
             );
         }
+    }
+
+    #[test]
+    fn failures_tail_filters_bounded_events_by_endpoint_family() {
+        let routing = serde_json::json!({
+            "buffered_events": 2,
+            "offset": 0,
+            "limit": 50,
+            "failure_events": [
+                projected_failure("routing_telemetry", "upstream_failure_observed", "req_chat", "upstream_transport", "gpt-example", Some("relay-a"), "upstream_5xx", "returned_local_error", "not_applicable", None, "upstream_5xx", "client_visible_failure", "upstream_5xx", Some("return_error"), Some(0)),
+                {
+                    "source": "routing_telemetry",
+                    "event_kind": "route_admission_denied",
+                    "request_id": "req_responses",
+                    "stage": "route_admission",
+                    "endpoint_family": "responses",
+                    "public_model": "gpt-example",
+                    "client_token_ref": null,
+                    "selected_target": null,
+                    "channel_id": null,
+                    "route_kind": "explicit_model_route",
+                    "failure_class": "route_admission_denied",
+                    "router_action": "returned_local_error",
+                    "retry_eligibility": "not_applicable",
+                    "retry_blocked_reason": null,
+                    "client_visible_status": "local_503",
+                    "upstream_status": null,
+                    "final_outcome": "client_visible_failure",
+                    "reason_code": "no_route_candidate",
+                    "blocking_domain": "route",
+                    "directive": null,
+                    "attempt": null,
+                    "admission": {
+                        "registry_generation": 9,
+                        "candidate_count": 1,
+                        "included_count": 0,
+                        "blocked_count": 1,
+                        "hard_blocked_count": 1,
+                        "soft_suppressed_count": 0,
+                        "last_resort_used": false,
+                        "hard_reason_codes": ["channel_cooling_down"],
+                        "soft_reason_codes": []
+                    },
+                    "next_action": {
+                        "summary": "Inspect route explanation.",
+                        "template_id": "route_explain",
+                        "safe_argv": ["one-ai-key", "route", "explain", "<model>"],
+                        "side_effect_class": "runtime_readonly",
+                        "requires_confirmation": false
+                    }
+                }
+            ],
+            "events": []
+        });
+        let response_filter = serde_json::json!({
+            "buffered_events": 0,
+            "offset": 0,
+            "limit": 50,
+            "failure_events": [],
+            "events": []
+        });
+
+        let rendered = render_tail_report(
+            &routing,
+            &response_filter,
+            &FailureFilters {
+                endpoint_family: Some("responses".to_string()),
+                request_id: None,
+                public_model: Some("gpt-example".to_string()),
+                channel_id: None,
+                directive: None,
+            },
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        let failures = report["data"]["failures"].as_array().unwrap();
+
+        assert_eq!(report["scope"]["endpoint_family"], "responses");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["request_id"], "req_responses");
+        assert_eq!(failures[0]["endpoint_family"], "responses");
+        assert_eq!(failures[0]["route_kind"], "explicit_model_route");
+        assert!(!rendered.contains("req_chat"));
+    }
+
+    #[test]
+    fn failures_explain_endpoint_family_filter_prevents_cross_family_request_matches() {
+        let rendered = render_explain_report(
+            &routing_fixture(),
+            &response_filter_fixture(),
+            "req_5xx",
+            &FailureFilters {
+                endpoint_family: Some("responses".to_string()),
+                request_id: None,
+                public_model: None,
+                channel_id: None,
+                directive: None,
+            },
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "not_found");
+        assert_eq!(report["reason_code"], "request_failure_not_found_in_window");
+        assert_eq!(report["scope"]["request_id"], "req_5xx");
+        assert_eq!(report["scope"]["endpoint_family"], "responses");
+        assert_eq!(report["data"]["failure_count"], 0);
+        assert_eq!(report["data"]["explanation"]["endpoint_family"], "unknown");
     }
 
     #[test]
@@ -1809,6 +1928,7 @@ mod tests {
             &routing_fixture(),
             &response_filter_fixture(),
             &FailureFilters {
+                endpoint_family: None,
                 request_id: Some("req_scope/unsafe".to_string()),
                 public_model: None,
                 channel_id: None,
@@ -1843,6 +1963,7 @@ mod tests {
         assert!(rendered.contains("window.limit: 100"));
         assert!(rendered.contains("Window: kind=bounded_recent_events"));
         assert!(rendered.contains("stage=upstream_transport"));
+        assert!(rendered.contains("endpoint_family=chat_completions"));
         assert!(rendered.contains("failure_class=upstream_5xx"));
         assert!(rendered.contains("retry_eligibility=blocked_streaming"));
         assert!(rendered.contains("client_visible_status=stream_committed_failure"));

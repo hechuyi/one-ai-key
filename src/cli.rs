@@ -513,6 +513,8 @@ struct KeysProbeApplyApplyArgs {
 struct FailuresTailArgs {
     #[arg(long, value_parser = crate::cli_commands::failures::parse_failure_last)]
     last: Option<usize>,
+    #[arg(long = "endpoint-family")]
+    endpoint_family: Option<String>,
     #[arg(long = "request-id")]
     request_id: Option<String>,
     #[arg(long = "model")]
@@ -533,6 +535,8 @@ struct FailuresExplainArgs {
     request_id: String,
     #[arg(long, value_parser = crate::cli_commands::failures::parse_failure_last)]
     last: Option<usize>,
+    #[arg(long = "endpoint-family")]
+    endpoint_family: Option<String>,
     #[arg(long = "model")]
     public_model: Option<String>,
     #[arg(long = "channel")]
@@ -881,6 +885,7 @@ where
             connection: operator_connection_options,
             last: args.last,
             filters: crate::cli_commands::failures::FailureFilters {
+                endpoint_family: args.endpoint_family,
                 request_id: args.request_id,
                 public_model: args.public_model,
                 channel_id: args.channel_id,
@@ -895,6 +900,7 @@ where
             request_id: args.request_id,
             last: args.last,
             filters: crate::cli_commands::failures::FailureFilters {
+                endpoint_family: args.endpoint_family,
                 request_id: None,
                 public_model: args.public_model,
                 channel_id: args.channel_id,
@@ -2309,6 +2315,7 @@ mod tests {
                 },
                 last: Some(20),
                 filters: crate::cli_commands::failures::FailureFilters {
+                    endpoint_family: None,
                     request_id: Some("req_123".to_string()),
                     public_model: Some("gpt-example".to_string()),
                     channel_id: Some("relay-a".to_string()),
@@ -2350,6 +2357,87 @@ mod tests {
                 request_id: "req_123".to_string(),
                 last: Some(50),
                 filters: crate::cli_commands::failures::FailureFilters::default(),
+                output: crate::cli_report::OutputFormat::Json,
+            })
+        );
+    }
+
+    #[test]
+    fn failures_tail_parse_accepts_endpoint_family_filter() {
+        let action = parse_action_from([
+            "one-ai-key",
+            "--management-url",
+            "https://router.example",
+            "--management-token-env",
+            "ONE_AI_KEY_MANAGEMENT_TOKEN",
+            "failures",
+            "tail",
+            "--endpoint-family",
+            "responses",
+            "--output",
+            "json",
+        ]);
+
+        assert_eq!(
+            action.expect("endpoint-family filter should parse"),
+            CliAction::FailuresTail(crate::cli_commands::failures::FailureTailOptions {
+                connection: OperatorConnectionOptions {
+                    management_url: Some("https://router.example".to_string()),
+                    deprecated_base_url: None,
+                    management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                    management_token_stdin: false,
+                    timeout_seconds: 10,
+                },
+                last: None,
+                filters: crate::cli_commands::failures::FailureFilters {
+                    endpoint_family: Some("responses".to_string()),
+                    request_id: None,
+                    public_model: None,
+                    channel_id: None,
+                    directive: None,
+                },
+                output: crate::cli_report::OutputFormat::Json,
+            })
+        );
+    }
+
+    #[test]
+    fn failures_explain_parse_accepts_endpoint_family_filter() {
+        let action = parse_action_from([
+            "one-ai-key",
+            "--management-url",
+            "https://router.example",
+            "--management-token-env",
+            "ONE_AI_KEY_MANAGEMENT_TOKEN",
+            "failures",
+            "explain",
+            "req_123",
+            "--endpoint-family",
+            "responses",
+            "--output",
+            "json",
+        ])
+        .expect("failures explain endpoint-family filter should parse");
+
+        assert_eq!(
+            action,
+            CliAction::FailuresExplain(crate::cli_commands::failures::FailureExplainOptions {
+                connection: OperatorConnectionOptions {
+                    management_url: Some("https://router.example".to_string()),
+                    deprecated_base_url: None,
+                    management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                    management_token_stdin: false,
+                    timeout_seconds: 10,
+                },
+                request_id: "req_123".to_string(),
+                last: None,
+                filters: crate::cli_commands::failures::FailureFilters {
+                    endpoint_family: Some("responses".to_string()),
+                    request_id: None,
+                    public_model: None,
+                    channel_id: None,
+                    directive: None,
+                },
                 output: crate::cli_report::OutputFormat::Json,
             })
         );
