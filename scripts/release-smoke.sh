@@ -1005,13 +1005,14 @@ if (( POSTS_AFTER_UPSTREAM_503 != POSTS_BEFORE_UPSTREAM_503 + 1 )); then
   exit 1
 fi
 jq -e '.error.code == "provider_unavailable"' upstream-503.json >/dev/null
-capture_management_report failures-tail-upstream-503.json failures tail --last 20 --output json
+capture_management_report failures-tail-upstream-503.json failures tail --last 20 --endpoint-family chat_completions --output json
 jq -e '
   .status == "degraded"
   and .availability_source == "bounded_evidence"
   and .current_availability == false
   and (.data.failures | any(
     .reason_code == "upstream_5xx"
+    and .endpoint_family == "chat_completions"
     and .client_visible_status == "upstream_5xx"
     and .upstream_status == 503
     and .admission == null
@@ -1022,6 +1023,7 @@ UPSTREAM_503_REQUEST_ID=$(jq -r '
   | reverse
   | map(select(
     .reason_code == "upstream_5xx"
+    and .endpoint_family == "chat_completions"
     and .client_visible_status == "upstream_5xx"
     and .upstream_status == 503
   ))
@@ -1031,17 +1033,20 @@ if [[ -z "${UPSTREAM_503_REQUEST_ID}" ]]; then
   printf 'error: upstream 503 failure evidence did not include a request id\n' >&2
   exit 1
 fi
-capture_management_report failures-explain-upstream-503.json failures explain "${UPSTREAM_503_REQUEST_ID}" --output json
+capture_management_report failures-explain-upstream-503.json failures explain "${UPSTREAM_503_REQUEST_ID}" --endpoint-family chat_completions --output json
 jq -e --arg request_id "${UPSTREAM_503_REQUEST_ID}" '
   .status == "degraded"
   and .reason_code == "upstream_5xx"
   and .scope.request_id == $request_id
+  and .scope.endpoint_family == "chat_completions"
+  and .data.explanation.endpoint_family == "chat_completions"
   and .data.explanation.client_visible_status == "upstream_5xx"
   and .data.explanation.upstream_status == 503
   and .data.explanation.admission == null
   and (.data.evidence | any(
     .request_id == $request_id
     and .reason_code == "upstream_5xx"
+    and .endpoint_family == "chat_completions"
     and .client_visible_status == "upstream_5xx"
     and .upstream_status == 503
   ))
@@ -1102,7 +1107,7 @@ if [[ "${POSTS_AFTER_LOCAL_ADMISSION}" != "${POSTS_BEFORE_LOCAL_ADMISSION}" ]]; 
   exit 1
 fi
 jq -e '.error.code == "no_route_candidate"' local-admission-503.json >/dev/null
-capture_management_report failures-tail-local-admission-503.json failures tail --last 20 --output json
+capture_management_report failures-tail-local-admission-503.json failures tail --last 20 --endpoint-family chat_completions --output json
 jq -e '
   .status == "degraded"
   and .availability_source == "bounded_evidence"
@@ -1110,6 +1115,7 @@ jq -e '
   and (.data.failures | any(
     .event_kind == "route_admission_denied"
     and .reason_code == "no_route_candidate"
+    and .endpoint_family == "chat_completions"
     and .client_visible_status == "local_503"
     and .upstream_status == null
     and .admission.included_count == 0
@@ -1121,6 +1127,7 @@ LOCAL_ADMISSION_REQUEST_ID=$(jq -r '
   | map(select(
     .event_kind == "route_admission_denied"
     and .reason_code == "no_route_candidate"
+    and .endpoint_family == "chat_completions"
     and .client_visible_status == "local_503"
     and .upstream_status == null
   ))
@@ -1130,11 +1137,13 @@ if [[ -z "${LOCAL_ADMISSION_REQUEST_ID}" ]]; then
   printf 'error: local admission failure evidence did not include a request id\n' >&2
   exit 1
 fi
-capture_management_report failures-explain-local-admission-503.json failures explain "${LOCAL_ADMISSION_REQUEST_ID}" --output json
+capture_management_report failures-explain-local-admission-503.json failures explain "${LOCAL_ADMISSION_REQUEST_ID}" --endpoint-family chat_completions --output json
 jq -e --arg request_id "${LOCAL_ADMISSION_REQUEST_ID}" '
   .status == "degraded"
   and .reason_code == "no_route_candidate"
   and .scope.request_id == $request_id
+  and .scope.endpoint_family == "chat_completions"
+  and .data.explanation.endpoint_family == "chat_completions"
   and .data.explanation.client_visible_status == "local_503"
   and .data.explanation.upstream_status == null
   and .data.explanation.admission.included_count == 0
@@ -1142,6 +1151,7 @@ jq -e --arg request_id "${LOCAL_ADMISSION_REQUEST_ID}" '
     .request_id == $request_id
     and .event_kind == "route_admission_denied"
     and .reason_code == "no_route_candidate"
+    and .endpoint_family == "chat_completions"
     and .client_visible_status == "local_503"
     and .upstream_status == null
     and .admission.included_count == 0
