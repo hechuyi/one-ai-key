@@ -79,6 +79,59 @@ fn local_ci_script_exists_is_executable_and_runs_required_cargo_commands_in_orde
 }
 
 #[test]
+fn local_ci_docker_wrapper_runs_same_amd64_nix_container_and_persistent_caches() {
+    let path = "scripts/local-ci-docker.sh";
+    assert!(Path::new(path).is_file(), "{path} must exist");
+    assert_executable(path);
+
+    let script = read_repo_file(path);
+    for required in [
+        "docker run --rm",
+        "--platform linux/amd64",
+        "nixos/nix:latest",
+        r#""${REPO_ROOT}:/work""#,
+        "NIX_STORE_VOLUME=${ONE_AI_KEY_NIX_STORE_VOLUME:-one-ai-key-nix-amd64}",
+        r#""${NIX_STORE_VOLUME}:/nix""#,
+        "NIX_CACHE_VOLUME=${ONE_AI_KEY_NIX_CACHE_VOLUME:-one-ai-key-nix-cache-amd64}",
+        r#""${NIX_CACHE_VOLUME}:/root/.cache/nix""#,
+        "CARGO_TARGET_VOLUME=${ONE_AI_KEY_CARGO_TARGET_VOLUME:-one-ai-key-cargo-target-amd64}",
+        r#""${CARGO_TARGET_VOLUME}:/cargo-target""#,
+        "CARGO_HOME_VOLUME=${ONE_AI_KEY_CARGO_HOME_VOLUME:-one-ai-key-cargo-home-amd64}",
+        r#""${CARGO_HOME_VOLUME}:/cargo-home""#,
+        "-e CARGO_TARGET_DIR=/cargo-target",
+        "-e CARGO_HOME=/cargo-home",
+        "/work/scripts/local-ci.sh",
+    ] {
+        assert!(
+            script.contains(required),
+            "{path} must include local Docker/Nix CI contract token `{required}`"
+        );
+    }
+
+    for package in [
+        "cargo",
+        "rustc",
+        "rustfmt",
+        "clippy",
+        "gcc",
+        "pkg-config",
+        "openssl",
+    ] {
+        assert!(
+            script.contains(package),
+            "{path} must make `{package}` available in the Nix shell"
+        );
+    }
+
+    for forbidden in ["ssh", "scp", "rsync", "gateway", "token", "secret"] {
+        assert!(
+            !script.to_ascii_lowercase().contains(forbidden),
+            "{path} must not contain remote operation or credential token `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn release_script_is_local_x86_64_linux_nix_command_gnu_packaging_contract() {
     let path = "scripts/build-release-x86_64-linux.sh";
     assert!(Path::new(path).is_file(), "{path} must exist");

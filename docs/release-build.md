@@ -8,6 +8,13 @@ From the repository root on the development host, run:
 scripts/build-release-x86_64-linux-docker.sh
 ```
 
+For full local verification through the same Docker/Nix x86_64 environment,
+run:
+
+```bash
+scripts/local-ci-docker.sh
+```
+
 This repository has no `Dockerfile`. The supported container path is the wrapper
 script above: it starts Docker with `--platform linux/amd64`, uses the
 `nixos/nix:latest` image, mounts this repository at `/work`, mounts the
@@ -27,6 +34,11 @@ reusable Docker volumes are `one-ai-key-nix-amd64`,
 `one-ai-key-cargo-home-amd64`; they are build caches, not release artifacts, and
 not routine cleanup targets. Repository-local `target/` is still ordinary build
 output and may be deleted when needed.
+
+`scripts/local-ci-docker.sh` uses the same four persistent volumes and then runs
+`scripts/local-ci.sh` inside the container. Use it when the host toolchain is not
+the intended x86_64 Linux Nix environment or when a developer wants CI output
+without creating repository-local build artifacts.
 
 `scripts/build-release-x86_64-linux.sh` is the container entrypoint, not the
 host entrypoint. It rejects non-Linux hosts, non-`x86_64` machines, and
