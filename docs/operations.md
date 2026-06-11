@@ -263,13 +263,16 @@ client visibility, and reload-version context. It does not stage anything, call
 upstreams, or query a live catalog.
 
 `models onboard-plan --apply --dry-run` previews the staged-registry write
-without sending the mutation. The confirmed `models onboard-plan --apply
---expected-staged-registry-version <version> --yes` requires an expected staged
-registry version from the current reload status or diff context. It writes only
-the staged registry route for an existing channel and returns the new staged
-registry version. It does not reload active runtime, change client-token scope,
-create a provider, create a channel, create a credential set, import keys, probe
-upstreams, discover models, or call upstream `/v1/models`.
+without sending the mutation. It also performs a read-only preflight against the
+management channel projection and reload-diff projection, so the report can show
+the target credential set and the staged registry version that a later confirmed
+apply must use. The confirmed `models onboard-plan --apply
+--expected-staged-registry-version <version> --yes` requires that expected
+staged registry version. It writes only the staged registry route for an
+existing channel and returns the new staged registry version. It does not reload
+active runtime, change client-token scope, create a provider, create a channel,
+create a credential set, import keys, probe upstreams, discover models, or call
+upstream `/v1/models`.
 
 Run `reload diff` after the staged route write and inspect the typed redacted
 diff before runtime mutation. Then run `reload apply

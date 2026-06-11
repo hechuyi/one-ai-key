@@ -85,7 +85,8 @@ provider pricing, context-window, tool-support, or feature metadata.
 Model publication therefore happens by staging an explicit public route and then
 reloading runtime state. `models onboard-plan --dry-run` is read-only route
 planning. `models onboard-plan --apply --dry-run` previews the staged-registry
-write. Confirmed `models onboard-plan --apply
+write and reads only management channel/reload-diff projections for preflight
+context. Confirmed `models onboard-plan --apply
 --expected-staged-registry-version <version> --yes` writes only a staged
 `model_routes` entry for an existing channel; it does not change active runtime
 until a separate `reload apply --expected-staged-registry-version <version>

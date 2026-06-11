@@ -1078,18 +1078,19 @@ if [[ "${UPSTREAM_MODELS_AFTER_PLAN}" != "${UPSTREAM_MODELS_AFTER_AUTHENTICATED_
 fi
 
 capture_management_report models-onboard-apply-dry-run.json models onboard-plan --channel relay --public-model "${PUBLISHED_PUBLIC_MODEL}" --upstream-model "${PUBLISHED_UPSTREAM_MODEL}" --apply --dry-run --output json
-jq -e --arg published_public_model "${PUBLISHED_PUBLIC_MODEL}" --arg published_upstream_model "${PUBLISHED_UPSTREAM_MODEL}" '
+jq -e --arg published_public_model "${PUBLISHED_PUBLIC_MODEL}" --arg published_upstream_model "${PUBLISHED_UPSTREAM_MODEL}" --argjson pre_onboard_staged_registry_version "${PRE_ONBOARD_STAGED_REGISTRY_VERSION}" '
   .status == "dry_run"
   and .reason_code == "models_onboard_apply_projected"
   and .public_model == $published_public_model
   and .upstream_model == $published_upstream_model
+  and .credential_set_ref == "relay-credentials"
   and .planning_only_no_visibility_change == true
   and .client_visibility_changed == false
   and .live_discovery_called == false
   and .management_mutation_sent == false
   and .mutating_reload_sent == false
-  and .staged_registry_version == null
-  and .runtime_reload_required == null
+  and .staged_registry_version == $pre_onboard_staged_registry_version
+  and .runtime_reload_required == false
   and .side_effect_class == "runtime_readonly"
 ' models-onboard-apply-dry-run.json >/dev/null
 UPSTREAM_MODELS_AFTER_APPLY_DRY_RUN=$(mock_upstream_model_catalog_requests)

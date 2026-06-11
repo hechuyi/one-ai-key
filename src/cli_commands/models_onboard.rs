@@ -39,7 +39,7 @@ pub async fn run(
         ));
     }
     if matches!(options.mode, ModelsOnboardPlanMode::ApplyDryRun) {
-        return Ok(render_apply_dry_run_report(&options));
+        return run_apply_dry_run(options).await;
     }
     if matches!(options.mode, ModelsOnboardPlanMode::Apply) {
         return run_apply(options).await;
@@ -77,6 +77,25 @@ pub async fn run(
         runtime_reload_projection.as_ref(),
         model_availability.as_ref(),
         options.output,
+    ))
+}
+
+async fn run_apply_dry_run(
+    options: ModelsOnboardPlanOptions,
+) -> Result<String, crate::operator_client::OperatorClientError> {
+    let client = crate::cli_commands::operator_client_from_connection(&options.connection)?;
+    let channel = client
+        .get_json(crate::operator_client::ReadOnlyEndpoint::Channel {
+            channel_id: options.channel_id.clone(),
+        })
+        .await?;
+    let runtime_reload_projection =
+        crate::cli_commands::runtime_reload_projection::fetch_runtime_reload_projection(&client)
+            .await?;
+    Ok(render_apply_dry_run_report(
+        &options,
+        Some(&channel),
+        runtime_reload_projection.as_ref(),
     ))
 }
 
@@ -327,23 +346,43 @@ fn onboard_report_envelope_with_effect(
     })
 }
 
-fn render_apply_dry_run_report(options: &ModelsOnboardPlanOptions) -> String {
+fn render_apply_dry_run_report(
+    options: &ModelsOnboardPlanOptions,
+    channel: Option<&Value>,
+    runtime_reload_projection: Option<&Value>,
+) -> String {
     let upstream_model = effective_upstream_model(options);
+    let credential_set_id = channel
+        .and_then(|value| value.get("credential_set_id"))
+        .and_then(Value::as_str)
+        .and_then(safe_local_string);
+    let reload_summary =
+        crate::cli_commands::runtime_reload_projection::summarize_runtime_reload_projection(
+            runtime_reload_projection,
+        );
     let report = onboard_report_envelope_with_effect(
         "dry_run",
         "models_onboard_apply_projected",
-        "Model onboarding apply payload was projected without writing staged registry state.",
+        "Model onboarding apply payload and read-only preflight were projected without writing staged registry state.",
         serde_json::json!({
             "command": "models onboard-plan",
             "channel_id": safe_local_string(&options.channel_id),
             "public_model": safe_local_string(&options.public_model),
             "upstream_model": safe_local_string(&upstream_model),
+            "credential_set_id": credential_set_id,
+            "credential_set_ref": credential_set_id,
+            "key_set_ref": credential_set_id,
+            "channel_projection": sanitize_channel(channel),
             "expected_staged_registry_version": options.expected_staged_registry_version,
             "planned_payload": sanitized_route_upsert_payload(options),
-            "runtime_reload_required": Value::Null,
-            "staged_registry_version": Value::Null,
-            "registry_version": Value::Null,
-            "active_registry_generation": Value::Null,
+            "active_registry_generation": reload_summary.active_registry_generation,
+            "active_registry_version": reload_summary.active_registry_version,
+            "staged_registry_version": reload_summary.staged_registry_version,
+            "registry_version": reload_summary.staged_registry_version,
+            "runtime_reload_required": reload_summary.runtime_reload_required,
+            "reload_diff_status": reload_summary.reload_diff_status,
+            "reload_diff_reason_code": reload_summary.reload_diff_reason_code,
+            "reload_diff_next_action": reload_summary.reload_diff_next_action,
             "planning_only_no_visibility_change": true,
             "client_visibility_changed": false,
             "live_discovery_called": false,
@@ -352,7 +391,7 @@ fn render_apply_dry_run_report(options: &ModelsOnboardPlanOptions) -> String {
             "management_mutation_sent": false,
             "mutating_reload_sent": false,
         }),
-        next_action_apply(options),
+        next_action_apply(options, reload_summary.staged_registry_version),
         options,
         crate::cli_effects::runtime_readonly_effect(),
     );
@@ -388,7 +427,7 @@ fn render_apply_blocked_report(
             "management_mutation_sent": false,
             "mutating_reload_sent": false,
         }),
-        next_action_apply(options),
+        next_action_apply(options, None),
         options,
         models_onboard_apply_management_effect(),
     );
@@ -484,8 +523,14 @@ fn effective_upstream_model(options: &ModelsOnboardPlanOptions) -> String {
         .unwrap_or_else(|| options.public_model.clone())
 }
 
-fn next_action_apply(options: &ModelsOnboardPlanOptions) -> Value {
-    let Some(expected_staged_registry_version) = options.expected_staged_registry_version else {
+fn next_action_apply(
+    options: &ModelsOnboardPlanOptions,
+    preflight_staged_registry_version: Option<u64>,
+) -> Value {
+    let Some(expected_staged_registry_version) = options
+        .expected_staged_registry_version
+        .or(preflight_staged_registry_version)
+    else {
         return serde_json::json!({
             "summary": "Rerun models onboard-plan --apply --dry-run after obtaining a staged registry version from reload diff.",
             "template_id": "models_onboard_apply_precondition_required",
@@ -1597,23 +1642,73 @@ mod tests {
     async fn models_onboard_apply_dry_run_does_not_call_mutation_endpoint() {
         let put_called = Arc::new(AtomicBool::new(false));
         let put_seen = Arc::clone(&put_called);
-        let router = Router::new().route(
-            "/management/registry/model-routes/coding",
-            put(move |Json(_body): Json<Value>| {
-                let put_seen = Arc::clone(&put_seen);
-                async move {
-                    put_seen.store(true, Ordering::SeqCst);
-                    Json(json!({"unexpected": true}))
-                }
-            }),
-        );
+        let seen_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let paths_for_channel = Arc::clone(&seen_paths);
+        let paths_for_reload = Arc::clone(&seen_paths);
+        let router = Router::new()
+            .route(
+                "/management/channels/relay-a",
+                get(move || {
+                    let paths_for_channel = Arc::clone(&paths_for_channel);
+                    async move {
+                        paths_for_channel
+                            .lock()
+                            .unwrap()
+                            .push("/management/channels/relay-a".to_string());
+                        Json(json!({
+                            "name": "relay-a",
+                            "credential_set_id": "relay-credentials",
+                            "endpoint_capabilities": {
+                                "chat_completions": "supported",
+                                "responses": "unknown",
+                                "embeddings": "unsupported"
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/management/runtime/reload-diff",
+                get(move || {
+                    let paths_for_reload = Arc::clone(&paths_for_reload);
+                    async move {
+                        paths_for_reload
+                            .lock()
+                            .unwrap()
+                            .push("/management/runtime/reload-diff".to_string());
+                        Json(json!({
+                            "status": "ok",
+                            "reason_code": "reload_diff_empty",
+                            "active_registry_generation": 7,
+                            "active_registry_version": 11,
+                            "staged_registry_version": 12,
+                            "runtime_reload_required": false
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/management/registry/model-routes/coding",
+                put(move |Json(_body): Json<Value>| {
+                    let put_seen = Arc::clone(&put_seen);
+                    async move {
+                        put_seen.store(true, Ordering::SeqCst);
+                        Json(json!({"unexpected": true}))
+                    }
+                }),
+            );
         let management_url = spawn_management_fixture(router).await;
+        let env_name = format!(
+            "ONE_AI_KEY_TEST_ONBOARD_APPLY_DRY_RUN_TOKEN_{}",
+            std::process::id()
+        );
+        std::env::set_var(&env_name, "opaque-management-fixture");
 
         let rendered = super::run(super::ModelsOnboardPlanOptions {
             connection: crate::cli::OperatorConnectionOptions {
                 management_url: Some(management_url),
                 deprecated_base_url: None,
-                management_token_env: None,
+                management_token_env: Some(env_name.clone()),
                 management_token_stdin: false,
                 timeout_seconds: 10,
             },
@@ -1623,16 +1718,24 @@ mod tests {
             client_token_ref: Some("secret-client-token-ref".to_string()),
             endpoint_family: Some("chat_completions".to_string()),
             mode: super::ModelsOnboardPlanMode::ApplyDryRun,
-            expected_staged_registry_version: Some(12),
+            expected_staged_registry_version: None,
             output: crate::cli_report::OutputFormat::Json,
         })
         .await
         .unwrap();
+        std::env::remove_var(env_name);
         let report: Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(report["status"], "dry_run");
         assert_eq!(report["reason_code"], "models_onboard_apply_projected");
         assert_eq!(report["management_mutation_sent"], false);
+        assert_eq!(report["data"]["credential_set_ref"], "relay-credentials");
+        assert_eq!(report["data"]["staged_registry_version"], 12);
+        assert_eq!(report["data"]["active_registry_generation"], 7);
+        assert_eq!(
+            report["data"]["reload_diff_reason_code"],
+            "reload_diff_empty"
+        );
         assert_eq!(
             report["data"]["planned_payload"]["targets"][0]["channel"],
             "relay-a"
@@ -1645,7 +1748,32 @@ mod tests {
             report["data"]["planned_payload"]["targets"][0]["enabled"],
             true
         );
+        assert_eq!(
+            report["next_action"]["safe_argv"],
+            json!([
+                "one-ai-key",
+                "models",
+                "onboard-plan",
+                "--channel",
+                "relay-a",
+                "--public-model",
+                "coding",
+                "--upstream-model",
+                "vendor/coding",
+                "--apply",
+                "--expected-staged-registry-version",
+                "12",
+                "--yes"
+            ])
+        );
         assert!(!put_called.load(Ordering::SeqCst));
+        assert_eq!(
+            *seen_paths.lock().unwrap(),
+            vec![
+                "/management/channels/relay-a".to_string(),
+                "/management/runtime/reload-diff".to_string(),
+            ]
+        );
         assert!(!rendered.contains("secret-client-token-ref"));
     }
 

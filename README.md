@@ -364,7 +364,9 @@ one-ai-key reload diff
 one-ai-key reload apply --expected-staged-registry-version <version> --yes
 ```
 
-The apply step writes only the staged registry. It does not reload runtime,
+The apply dry-run reads only management channel and reload-diff projections so
+you can copy the current staged registry version into the confirmed command.
+The confirmed apply writes only the staged registry. It does not reload runtime,
 change client-token scope, create providers/channels/credentials, probe
 upstreams, or call a live catalog. After reload, verify with `models explain`,
 authenticated `GET /v1/models`, and one local mock or otherwise non-sensitive
