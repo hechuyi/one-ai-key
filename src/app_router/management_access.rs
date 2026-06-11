@@ -172,11 +172,6 @@ const MANAGEMENT_ROUTE_SPECS: &[ManagementRouteSpec] = &[
     },
     ManagementRouteSpec {
         method: "POST",
-        path: "/management/credential-sets/:id/credentials/apply-latest-probe",
-        minimum_role: ManagementRole::Operator,
-    },
-    ManagementRouteSpec {
-        method: "POST",
         path: "/management/credential-sets/:id/credentials/import",
         minimum_role: ManagementRole::Operator,
     },

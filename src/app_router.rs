@@ -123,10 +123,6 @@ pub(crate) fn router_without_test_peer_default(state: AppState) -> Router {
             post(management::apply_latest_credential_probe),
         )
         .route(
-            "/management/credential-sets/:id/credentials/apply-latest-probe",
-            post(management::apply_latest_credential_probes),
-        )
-        .route(
             "/management/credential-sets/:id/credentials/import",
             post(management::import_credential_set_credentials),
         )

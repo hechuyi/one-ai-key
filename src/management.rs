@@ -32,8 +32,7 @@ use crate::{
     },
     management_credential_refs::resolve_credential_path_segment,
     management_credentials::{
-        apply_latest_credential_probe_response_for_set,
-        apply_latest_credential_probes_response_for_set, credential_import_for_existing_set,
+        apply_latest_credential_probe_response_for_set, credential_import_for_existing_set,
         credential_import_response_for_set, credential_imports_for_existing_set,
         credential_lifecycle_history_response_for_set,
         credential_operator_metadata_response_for_set,
@@ -884,45 +883,6 @@ pub async fn apply_latest_credential_probe(
         credential_id,
         payload.probe_result_ref,
         true,
-        reason,
-    )
-    .await
-    {
-        Ok(applied) => Json(applied).into_response(),
-        Err(err) => service_error(err),
-    }
-}
-
-pub async fn apply_latest_credential_probes(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(query): Query<CredentialsQuery>,
-    headers: HeaderMap,
-    Json(payload): Json<ApplyLatestProbeRequest>,
-) -> Response {
-    let principal = match authorize_management(&state, &headers) {
-        Ok(principal) => principal,
-        Err(resp) => return *resp,
-    };
-    let Some(_) = query.probe.as_ref() else {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "bulk apply latest probe requires probe filter",
-        );
-    };
-    let probe_filter = match query.probe_filter() {
-        Ok(filter) => filter,
-        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
-    };
-    let reason = payload
-        .reason
-        .unwrap_or_else(|| "bulk apply latest credential probes".to_string());
-    match apply_latest_credential_probes_response_for_set(
-        &state,
-        management_actor(&principal),
-        &id,
-        probe_filter,
-        query.limit.unwrap_or(100).clamp(1, 100),
         reason,
     )
     .await

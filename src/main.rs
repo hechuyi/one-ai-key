@@ -3175,39 +3175,26 @@ pools:
     }
 
     #[test]
-    fn bulk_probe_apply_does_not_materialize_unbounded_credential_list() {
-        let service_source = retired_management_service_source();
+    fn credential_set_batch_probe_apply_public_surface_is_absent() {
+        let app_router_source = production_source("src/app_router.rs");
+        let access_source = production_source("src/app_router/management_access.rs");
         let credential_source = production_source("src/management_credentials.rs");
         let management_source = production_source("src/management.rs");
-        let function_start = management_source
-            .find("pub async fn apply_latest_credential_probes")
-            .expect("bulk probe apply exists");
-        let function_end = management_source[function_start..]
-            .find("pub async fn import_credential_set_credentials")
-            .map(|offset| function_start + offset)
-            .expect("credential import handler follows bulk probe apply handler");
-        let body = &management_source[function_start..function_end];
 
-        assert!(!body.contains("list_credential_set_credentials"));
-        assert!(!body.contains("usize::MAX"));
-        assert!(credential_source
-            .contains("pub async fn credential_probe_apply_candidates_for_latest_outcome"));
-        assert!(credential_source
-            .contains("pub async fn credential_probe_apply_candidates_for_existing_set"));
+        for source in [&app_router_source, &access_source] {
+            assert!(
+                !source.contains("/management/credential-sets/:id/credentials/apply-latest-probe")
+            );
+        }
+        assert!(!management_source.contains("pub async fn apply_latest_credential_probes("));
+        assert!(!management_source.contains("apply_latest_credential_probes_response_for_set("));
+        assert!(!credential_source
+            .contains("pub async fn apply_latest_credential_probes_response_for_set("));
+        assert!(!credential_source.contains("pub struct CredentialProbeBatchApplyResponse"));
+        assert!(!credential_source.contains("pub struct CredentialProbeBatchApplyItem"));
+        assert!(!credential_source.contains("pub enum CredentialProbeBatchApplyItemStatus"));
+        assert!(!credential_source.contains("pub struct CredentialProbeBatchApplyError"));
         assert!(credential_source.contains("load_latest_probe_outcome_credential_ids"));
-        assert!(credential_source
-            .contains("pub async fn apply_latest_credential_probes_response_for_set"));
-        assert!(credential_source.contains("credential_probe_apply_candidates_for_existing_set("));
-        assert!(body.contains("apply_latest_credential_probes_response_for_set("));
-        assert!(body.contains("&state,"));
-        assert!(!body.contains("ManagementService::new"));
-        assert!(!body.contains(".apply_latest_credential_probes("));
-        assert!(!service_source.contains("pub async fn apply_latest_credential_probes"));
-        assert!(!service_source.contains("apply_latest_credential_probes_response_for_set"));
-        assert!(!body.contains("credential_probe_apply_candidates_for_existing_set("));
-        assert!(!body.contains("load_latest_probe_outcome_credential_ids"));
-        assert!(!body.contains("ensure_credential_set_exists"));
-        assert!(!body.contains("&state.credential_store"));
     }
 
     #[test]
@@ -3228,33 +3215,18 @@ pools:
             .find("pub fn credential_import_detail_response")
             .map(|offset| import_start + offset)
             .expect("credential import detail response helper exists");
-        let management_source = production_source("src/management.rs");
-        let bulk_start = management_source
-            .find("pub async fn apply_latest_credential_probes")
-            .expect("bulk probe apply handler exists");
-        let bulk_end = management_source[bulk_start..]
-            .find("pub async fn import_credential_set_credentials")
-            .map(|offset| bulk_start + offset)
-            .expect("credential import handler follows bulk probe apply handler");
         let imports_body = &credential_source[imports_start..imports_end];
         let import_body = &credential_source[import_start..import_end];
-        let bulk_body = &management_source[bulk_start..bulk_end];
 
         assert!(lookup_source.contains("pub fn ensure_credential_set_exists"));
         assert!(lookup_source.contains("channel_ids_for_credential_set(state, credential_set_id)"));
         assert!(imports_body.contains("ensure_credential_set_exists(state, credential_set_id)?"));
         assert!(import_body.contains("ensure_credential_set_exists(state, credential_set_id)?"));
-        assert!(bulk_body.contains("apply_latest_credential_probes_response_for_set("));
-        assert!(!bulk_body.contains("ManagementService::new"));
-        assert!(!bulk_body.contains("credential_probe_apply_candidates_for_existing_set("));
-        assert!(!bulk_body.contains("ensure_credential_set_exists(state, credential_set_id)?"));
         assert!(!imports_body
             .contains("channel_ids_for_credential_set(self.state, credential_set_id)?"));
         assert!(
             !import_body.contains("channel_ids_for_credential_set(self.state, credential_set_id)?")
         );
-        assert!(!bulk_body
-            .contains("canonical_channel_for_credential_set(self.state, credential_set_id)?"));
     }
 
     #[test]
@@ -4248,9 +4220,9 @@ pools:
             .find("pub async fn apply_latest_credential_probe")
             .expect("single probe apply handler exists");
         let apply_end = management_source[apply_start..]
-            .find("pub async fn apply_latest_credential_probes")
+            .find("pub async fn import_credential_set_credentials")
             .map(|offset| apply_start + offset)
-            .expect("bulk probe apply handler exists");
+            .expect("credential import handler follows single probe apply handler");
         let apply_body = &management_source[apply_start..apply_end];
 
         for token in [
@@ -4277,15 +4249,7 @@ pools:
             "pub struct CredentialProbeApplyPlan",
             "pub fn credential_probe_apply_response",
             "pub async fn apply_latest_credential_probe_response_for_set",
-            "pub async fn apply_latest_credential_probes_response_for_set",
             "pub async fn credential_probe_apply_plan_for_latest_result",
-            "pub struct CredentialProbeBatchApplyResponse",
-            "pub fn credential_probe_batch_apply_response",
-            "pub struct CredentialProbeBatchApplyItem",
-            "pub fn credential_probe_batch_apply_item",
-            "pub enum CredentialProbeBatchApplyItemStatus",
-            "pub struct CredentialProbeBatchApplyError",
-            "pub fn credential_probe_batch_apply_error",
             "pub enum CredentialStateFilter",
             "impl From<CredentialStateFilter> for CredentialSnapshotFilter",
             "pub async fn apply_probe_credential_cooldown",
@@ -4352,8 +4316,8 @@ pools:
         assert!(credential_source.contains("execute_credential_command_for_state("));
         assert!(credential_source.contains("credential_set_probe_apply_command("));
         assert!(credential_source.contains("apply_probe_credential_cooldown("));
-        assert!(credential_source.contains("credential_probe_batch_apply_item("));
-        assert!(credential_source.contains("credential_probe_batch_apply_response("));
+        assert!(!credential_source.contains("credential_probe_batch_apply_item("));
+        assert!(!credential_source.contains("credential_probe_batch_apply_response("));
         for token in [
             "CredentialCommandKind::Expire",
             "CredentialCommandKind::QuotaExhaust",
@@ -6397,9 +6361,9 @@ pools:
             .find("pub async fn apply_latest_credential_probe_response_for_set")
             .expect("set probe apply helper exists");
         let apply_end = credential_source[apply_start..]
-            .find("\npub async fn apply_latest_credential_probes_response_for_set")
+            .find("\nfn validate_probe_apply_precondition")
             .map(|offset| apply_start + offset)
-            .expect("bulk set probe apply helper follows single apply helper");
+            .expect("set probe apply precondition helper follows single apply helper");
         let apply_body = &credential_source[apply_start..apply_end];
         let helper_start = command_source
             .find("pub fn credential_set_probe_apply_command(")
@@ -10672,11 +10636,6 @@ pools:
             (
                 "POST",
                 "/management/credential-sets/:id/credentials/:credential_id/apply-latest-probe",
-                ManagementRole::Operator,
-            ),
-            (
-                "POST",
-                "/management/credential-sets/:id/credentials/apply-latest-probe",
                 ManagementRole::Operator,
             ),
             (
@@ -17083,297 +17042,29 @@ pools:
     }
 
     #[tokio::test]
-    async fn management_apply_latest_probes_for_filtered_credential_set_credentials() {
-        let keys_file = temp_keys_file("upstream-key-a\nupstream-key-b\nupstream-key-c\n");
-        let db_path = temp_sqlite_path("credential-set-bulk-apply-probes");
-        let repository = SqliteCredentialRepository::open(&db_path).unwrap();
-        let app = app(AppState::new(
-            AppConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
-                client_tokens: vec![ClientTokenConfig {
-                    name: "test-client".to_string(),
-                    token: fixture_client_token(),
-                    enabled: true,
-                    allowed_model_groups: Vec::new(),
-                    allowed_channels: Vec::new(),
-                }],
-                management: Some(ManagementConfig {
-                    admin_token: fixture_admin_token(),
-                    ip_allowlist: None,
-                    principals: Vec::new(),
-                    event_log_path: None,
-                    event_window_capacity: None,
-                }),
-                max_request_body_bytes: 1024 * 1024,
-                max_model_catalog_body_bytes: 512 * 1024,
-                max_error_body_bytes: 1024,
-                timeouts: TimeoutConfig::default(),
-                routing: crate::config::RoutingConfig::default(),
-                default_pool: Some("primary".to_string()),
-                providers: HashMap::new(),
-                accounts: HashMap::new(),
-                credential_sets: credential_sets_from_files([("shared-credentials", keys_file)]),
-                model_routes: HashMap::new(),
-                policy_profiles: HashMap::new(),
-                default_routing_profile: Some("default-routing".to_string()),
-                routing_profiles: std::collections::HashMap::from([(
-                    "default-routing".to_string(),
-                    crate::config::RoutingProfileConfig {
-                        key_selection:
-                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
-                        default_credential_cooldown_seconds: 20,
-                        same_request_credential_retry:
-                            crate::config::SameRequestCredentialRetryConfig {
-                                enabled: false,
-                                max_retries: 0,
-                            },
-                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
-                    },
-                )]),
-                pools: HashMap::from([(
-                    "primary".to_string(),
-                    openai_pool("https://primary.example/v1", "shared-credentials"),
-                )]),
-            }
-            .resolve_with_credential_repository_and_store_path(&repository, Some(db_path))
-            .unwrap(),
-        )
-        .unwrap());
-        let credentials = management_response_json(
-            &app,
-            "/management/credential-sets/shared-credentials/credentials?limit=3",
-        )
-        .await;
-        let first = crate::credentials::CredentialId(
-            credentials["credentials"][0]["id"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-        );
-        let second = crate::credentials::CredentialId(
-            credentials["credentials"][1]["id"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-        );
-        let credential_set_id =
-            crate::credential_repository::CredentialSetId("shared-credentials".to_string());
-        for credential_id in [first.clone(), second.clone()] {
-            repository
-                .record_probe_result(
-                    crate::credential_repository::CredentialProbeResultRecordInput {
-                        credential_set_id: credential_set_id.clone(),
-                        credential_id,
-                        channel_id: "primary".to_string(),
-                        provider_id: "openai".to_string(),
-                        account_id: "primary".to_string(),
-                        outcome: crate::credential_repository::CredentialProbeOutcome::Invalid,
-                        classifier_id: None,
-                        adaptation_rule_id: None,
-                        upstream_status: Some(401),
-                        upstream_code: Some("invalid_api_key".to_string()),
-                        upstream_limit_type: None,
-                        latency_ms: 10,
-                    },
-                )
-                .unwrap();
-        }
-
-        let response = app
-            .clone()
+    async fn management_batch_apply_latest_probe_route_is_not_registered() {
+        let response = app(test_state())
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/management/credential-sets/shared-credentials/credentials/apply-latest-probe?probe=invalid&limit=1")
+                    .uri(
+                        "/management/credential-sets/test-credentials/credentials/apply-latest-probe",
+                    )
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"reason":"bulk apply invalid probes"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 8192).await.unwrap();
-        let applied = serde_json::from_slice::<Value>(&body).unwrap();
-        assert_eq!(applied["credential_set_id"], "shared-credentials");
-        assert_eq!(applied["probe_filter"], "invalid");
-        assert_eq!(applied["matched_credentials"], 2);
-        assert_eq!(applied["applied_credentials"], 1);
-        assert_eq!(applied["failed_credentials"], 0);
-        assert_eq!(applied["results"].as_array().unwrap().len(), 1);
-        assert_eq!(applied["results"][0]["status"], "applied");
-        assert_eq!(applied["results"][0]["result"]["action"], "expire");
-        assert_eq!(
-            applied["results"][0]["result"]["probe"]["outcome"],
-            "invalid"
-        );
-        assert!(!applied.to_string().contains("upstream-key"));
-
-        let expired = management_response_json(
-            &app,
-            "/management/credential-sets/shared-credentials/credentials?state=expired",
-        )
-        .await;
-        assert_eq!(expired["filtered_credentials"], 1);
-    }
-
-    #[tokio::test]
-    async fn management_bulk_apply_latest_probe_reports_item_failures_and_continues() {
-        let keys_file = temp_keys_file("upstream-key-a\nupstream-key-b\nupstream-key-c\n");
-        let db_path = temp_sqlite_path("credential-set-bulk-apply-partial-failure");
-        let repository = SqliteCredentialRepository::open(&db_path).unwrap();
-        let app = app(AppState::new(
-            AppConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
-                client_tokens: vec![ClientTokenConfig {
-                    name: "test-client".to_string(),
-                    token: fixture_client_token(),
-                    enabled: true,
-                    allowed_model_groups: Vec::new(),
-                    allowed_channels: Vec::new(),
-                }],
-                management: Some(ManagementConfig {
-                    admin_token: fixture_admin_token(),
-                    ip_allowlist: None,
-                    principals: Vec::new(),
-                    event_log_path: None,
-                    event_window_capacity: None,
-                }),
-                max_request_body_bytes: 1024 * 1024,
-                max_model_catalog_body_bytes: 512 * 1024,
-                max_error_body_bytes: 1024,
-                timeouts: TimeoutConfig::default(),
-                routing: crate::config::RoutingConfig::default(),
-                default_pool: Some("primary".to_string()),
-                providers: HashMap::new(),
-                accounts: HashMap::new(),
-                credential_sets: credential_sets_from_files([("shared-credentials", keys_file)]),
-                model_routes: HashMap::new(),
-                policy_profiles: HashMap::new(),
-                default_routing_profile: Some("default-routing".to_string()),
-                routing_profiles: std::collections::HashMap::from([(
-                    "default-routing".to_string(),
-                    crate::config::RoutingProfileConfig {
-                        key_selection:
-                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
-                        default_credential_cooldown_seconds: 20,
-                        same_request_credential_retry:
-                            crate::config::SameRequestCredentialRetryConfig {
-                                enabled: false,
-                                max_retries: 0,
-                            },
-                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
-                    },
-                )]),
-                pools: HashMap::from([(
-                    "primary".to_string(),
-                    openai_pool("https://primary.example/v1", "shared-credentials"),
-                )]),
-            }
-            .resolve_with_credential_repository_and_store_path(&repository, Some(db_path))
-            .unwrap(),
-        )
-        .unwrap());
-        let credentials = management_response_json(
-            &app,
-            "/management/credential-sets/shared-credentials/credentials?limit=3",
-        )
-        .await;
-        let first_id = credentials["credentials"][0]["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let second_id = credentials["credentials"][1]["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let credential_set_id =
-            crate::credential_repository::CredentialSetId("shared-credentials".to_string());
-        for credential_id in [&first_id, &second_id] {
-            repository
-                .record_probe_result(
-                    crate::credential_repository::CredentialProbeResultRecordInput {
-                        credential_set_id: credential_set_id.clone(),
-                        credential_id: crate::credentials::CredentialId(credential_id.clone()),
-                        channel_id: "primary".to_string(),
-                        provider_id: "openai".to_string(),
-                        account_id: "primary".to_string(),
-                        outcome: crate::credential_repository::CredentialProbeOutcome::Invalid,
-                        classifier_id: None,
-                        adaptation_rule_id: None,
-                        upstream_status: Some(401),
-                        upstream_code: Some("invalid_api_key".to_string()),
-                        upstream_limit_type: None,
-                        latency_ms: 10,
-                    },
-                )
-                .unwrap();
-        }
-
-        let disable_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!(
-                        "/management/credential-sets/shared-credentials/credentials/{first_id}/disable"
-                    ))
-                    .header(header::AUTHORIZATION, admin_bearer())
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"reason":"manual disable before bulk apply"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(disable_response.status(), StatusCode::OK);
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/management/credential-sets/shared-credentials/credentials/apply-latest-probe?probe=invalid&limit=2")
-                    .header(header::AUTHORIZATION, admin_bearer())
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"reason":"bulk apply invalid probes"}"#))
+                    .body(Body::from(r#"{"reason":"bulk apply should not exist"}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let applied =
-            serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 8192).await.unwrap())
-                .unwrap();
-        assert_eq!(applied["matched_credentials"], 2);
-        assert_eq!(applied["applied_credentials"], 1);
-        assert_eq!(applied["failed_credentials"], 1);
-        assert_eq!(applied["results"].as_array().unwrap().len(), 2);
-        assert_eq!(applied["results"][0]["credential_id"], first_id);
-        assert_eq!(applied["results"][0]["status"], "failed");
-        assert_eq!(applied["results"][0]["error"]["kind"], "conflict");
-        assert!(applied["results"][0]["result"].is_null());
-        assert_eq!(applied["results"][1]["credential_id"], second_id);
-        assert_eq!(applied["results"][1]["status"], "applied");
-        assert_eq!(applied["results"][1]["result"]["action"], "expire");
-        assert!(applied["results"][1]["error"].is_null());
-        assert!(!applied.to_string().contains("upstream-key"));
-
-        let expired = management_response_json(
-            &app,
-            "/management/credential-sets/shared-credentials/credentials?state=expired",
-        )
-        .await;
-        assert_eq!(expired["filtered_credentials"], 1);
-        assert_eq!(expired["credentials"][0]["id"], second_id);
-
-        let disabled = management_response_json(
-            &app,
-            "/management/credential-sets/shared-credentials/credentials?state=disabled",
-        )
-        .await;
-        assert_eq!(disabled["filtered_credentials"], 1);
-        assert_eq!(disabled["credentials"][0]["id"], first_id);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("management route is not registered"),
+            "unexpected response body: {body}"
+        );
     }
 
     #[tokio::test]
@@ -20885,12 +20576,12 @@ pools:
     }
 
     #[tokio::test]
-    async fn management_bulk_apply_latest_probe_requires_probe_filter() {
+    async fn management_batch_apply_latest_probe_with_query_is_not_registered() {
         let response = app(test_state())
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/management/credential-sets/test-credentials/credentials/apply-latest-probe")
+                    .uri("/management/credential-sets/test-credentials/credentials/apply-latest-probe?probe=invalid&limit=1")
                     .header(header::AUTHORIZATION, admin_bearer())
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{}"#))
@@ -20899,7 +20590,13 @@ pools:
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("management route is not registered"),
+            "unexpected response body: {body}"
+        );
     }
 
     #[tokio::test]
