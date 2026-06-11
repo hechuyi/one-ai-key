@@ -245,6 +245,19 @@ fn release_script_is_local_x86_64_linux_nix_command_gnu_packaging_contract() {
         ),
         "{path} must generate the checksum from inside dist/ so the sidecar records only the archive basename"
     );
+    for required in [
+        "current_source_tree_hash",
+        "BUILD_INFO_PATH",
+        ".build.json",
+        "source_tree_hash",
+        "archive_sha256",
+        "jq -n",
+    ] {
+        assert!(
+            script.contains(required),
+            "{path} must write local build metadata token `{required}` for stale dist detection"
+        );
+    }
 
     for forbidden in ["ssh", "scp", "rsync", "gateway"] {
         assert!(
@@ -512,6 +525,12 @@ fn release_smoke_script_exists_is_executable_and_uses_released_binary() {
     for required in [
         "tar -xzf",
         r#"BIN="${WORK_DIR}/${PACKAGE_NAME}""#,
+        "BUILD_INFO_PATH",
+        ".build.json",
+        "current_source_tree_hash",
+        "CURRENT_SOURCE_TREE_HASH",
+        "release smoke source tree fingerprint does not match the built artifact",
+        r#".source_tree_hash == $source_tree_hash"#,
         r#""${BIN}" --help"#,
         "init local --out config/local.yaml --keys data/relay.keys --dry-run --output json",
         "init local --out config/local.yaml --keys data/relay.keys --yes --output json",

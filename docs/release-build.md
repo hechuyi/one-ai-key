@@ -49,7 +49,10 @@ The container entrypoint builds the locked Cargo package, stages only the releas
 binary, and writes a deterministic tar/gzip archive. Tar entries are sorted by
 name, owner and group are fixed to `0`, mtimes use `SOURCE_DATE_EPOCH` (default
 `0`), and gzip runs with `-n`. The `.sha256` sidecar is generated from inside
-`dist/`, so it contains only the archive basename.
+`dist/`, so it contains only the archive basename. The local build also writes a
+`*.build.json` metadata sidecar with the tracked source-tree fingerprint used by
+`scripts/release-smoke.sh` to reject stale `dist/` artifacts. This metadata file
+is a local verification guard, not a GitHub Release asset.
 
 Do not build release artifacts on deployment hosts, random Linux shells,
 Debian/Ubuntu Rust images, or ad hoc remote builders. Deployment hosts consume
@@ -75,6 +78,7 @@ The local build writes the same files under `dist/`:
 ```text
 dist/one-ai-key-<version>-<target>.tar.gz
 dist/one-ai-key-<version>-<target>.tar.gz.sha256
+dist/one-ai-key-<version>-<target>.tar.gz.build.json
 ```
 
 The SHA256 sidecar must contain only the archive basename:
@@ -88,7 +92,7 @@ It must not contain an absolute path or a `dist/`-prefixed path.
 The tarball contains the release binary as the runnable contract. It does not
 contain deployment config, client tokens, management tokens, upstream keys,
 SQLite state, JSONL event streams, local logs, Nix caches, Cargo target
-directories, private scripts, or operator notes.
+directories, private scripts, local build metadata, or operator notes.
 
 A consumer verifies the uploaded sidecar, unpacks the tarball, pins the exact
 asset URL and hash in deployment configuration, and runs the binary with local
@@ -107,12 +111,13 @@ scripts/release-smoke.sh
 git status -sb --untracked-files=all
 ```
 
-`scripts/release-smoke.sh` must run the extracted artifact in a tempdir with
-generated placeholder tokens and a local mock upstream. It must cover offline
-config generation/checking, authenticated `/v1/models`, one model-bearing
-request, redacted operator reports for `doctor`, `models`, `route`, `keys`,
-`failures`, and `reload`, and rejection of a client `/v1` URL used as a
-management URL. The smoke exercises the canonical first diagnosis command,
+`scripts/release-smoke.sh` must first verify the archive checksum and local
+`*.build.json` source-tree fingerprint, then run the extracted artifact in a
+tempdir with generated placeholder tokens and a local mock upstream. It must
+cover offline config generation/checking, authenticated `/v1/models`, one
+model-bearing request, redacted operator reports for `doctor`, `models`,
+`route`, `keys`, `failures`, and `reload`, and rejection of a client `/v1` URL
+used as a management URL. The smoke exercises the canonical first diagnosis command,
 `models explain --model <public-model-id> --client-token-ref <client-token ref>
 --endpoint-family chat_completions`, and verifies that it answers whether the
 client-token ref can use the model on that endpoint family with `can_use`,
@@ -138,9 +143,9 @@ deployment URLs, raw tokens, or a deployment host.
 4. Run `scripts/build-release-x86_64-linux-docker.sh` from the repository root.
    This is the local Docker/Nix x86_64 build path; do not use a repository
    `Dockerfile`, because the repository does not provide one.
-5. Verify that `dist/one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz` and
-   its `.sha256` sidecar exist, and that the sidecar contains only the archive
-   basename.
+5. Verify that `dist/one-ai-key-<version>-x86_64-unknown-linux-gnu.tar.gz`, its
+   `.sha256` sidecar, and the local `.build.json` sidecar exist, and that the
+   checksum sidecar contains only the archive basename.
 6. Run `scripts/release-smoke.sh`; it must exercise the extracted artifact with
    local placeholder tokens and a local mock upstream, including the explicit
    model publication path from `models onboard-plan --dry-run` through confirmed
@@ -148,7 +153,7 @@ deployment URLs, raw tokens, or a deployment host.
    `/v1/models`, and one local mock completion.
 7. Run `scripts/check-staged-denylist.sh`, then create the release commit and
    tag after checking that runtime state and generated artifacts are not staged.
-8. Upload the tarball and `.sha256` sidecar as GitHub Release assets.
+8. Upload only the tarball and `.sha256` sidecar as GitHub Release assets.
 9. Download the uploaded tarball and `.sha256` sidecar into a tempdir and verify
    the checksum from the uploaded sidecar. Confirm tag, Cargo version, asset
    filename, checksum filename, and release notes version match.

@@ -29,6 +29,7 @@ if [[ "${1:-}" != "--inside-container" ]]; then
         nixpkgs#bash \
         nixpkgs#cargo \
         nixpkgs#curl \
+        nixpkgs#git \
         nixpkgs#jq \
         nixpkgs#python3 \
         nixpkgs#gnutar \
@@ -39,7 +40,7 @@ if [[ "${1:-}" != "--inside-container" ]]; then
   fi
 fi
 
-for required in bash cargo curl jq python3 tar gzip shasum; do
+for required in bash cargo curl git jq python3 tar gzip shasum; do
   if ! command -v "${required}" >/dev/null 2>&1; then
     printf 'error: release smoke requires %s\n' "${required}" >&2
     exit 1
@@ -49,6 +50,30 @@ done
 cd "${REPO_ROOT}"
 unset KEY_POOL_ROUTER_SQLITE_CREDENTIAL_STORE
 unset KEY_POOL_ROUTER_SQLITE_REGISTRY_STORE
+
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum
+  else
+    shasum -a 256
+  fi
+}
+
+sha256_files_from_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    xargs -0 sha256sum
+  else
+    xargs -0 shasum -a 256
+  fi
+}
+
+current_source_tree_hash() {
+  git ls-files -z \
+    | LC_ALL=C sort -z \
+    | sha256_files_from_stdin \
+    | sha256_stdin \
+    | cut -d ' ' -f 1
+}
 
 PACKAGE_ID=$(cargo pkgid --locked)
 PACKAGE_SPEC=${PACKAGE_ID##*#}
@@ -68,13 +93,34 @@ TARGET=${TARGET:-x86_64-unknown-linux-gnu}
 ARCHIVE_NAME="${PACKAGE_NAME}-${VERSION}-${TARGET}.tar.gz"
 ARCHIVE_PATH="${REPO_ROOT}/dist/${ARCHIVE_NAME}"
 CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
+BUILD_INFO_PATH="${ARCHIVE_PATH}.build.json"
 
-if [[ ! -f "${ARCHIVE_PATH}" || ! -f "${CHECKSUM_PATH}" ]]; then
+if [[ ! -f "${ARCHIVE_PATH}" || ! -f "${CHECKSUM_PATH}" || ! -f "${BUILD_INFO_PATH}" ]]; then
   printf 'error: expected release artifacts are missing under dist/. Run scripts/build-release-x86_64-linux-docker.sh first.\n' >&2
   exit 1
 fi
 
 (cd "${REPO_ROOT}/dist" && shasum -a 256 -c "${ARCHIVE_NAME}.sha256")
+CURRENT_SOURCE_TREE_HASH=$(current_source_tree_hash)
+if ! jq -e \
+  --arg package_name "${PACKAGE_NAME}" \
+  --arg version "${VERSION}" \
+  --arg target "${TARGET}" \
+  --arg archive_name "${ARCHIVE_NAME}" \
+  --arg source_tree_hash "${CURRENT_SOURCE_TREE_HASH}" \
+  '
+    .schema_version == 1
+    and .package_name == $package_name
+    and .version == $version
+    and .target == $target
+    and .archive_name == $archive_name
+    and .source_tree_hash == $source_tree_hash
+    and ((.archive_sha256 | type) == "string")
+    and (.archive_sha256 | length) == 64
+  ' "${BUILD_INFO_PATH}" >/dev/null; then
+  printf 'error: release smoke source tree fingerprint does not match the built artifact. Rebuild dist/ with scripts/build-release-x86_64-linux-docker.sh.\n' >&2
+  exit 1
+fi
 
 WORK_DIR=$(mktemp -d)
 MOCK_PID=

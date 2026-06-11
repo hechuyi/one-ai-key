@@ -27,6 +27,7 @@ docker run --rm \
   nix --extra-experimental-features "nix-command flakes" shell \
     nixpkgs#cargo \
     nixpkgs#rustc \
+    nixpkgs#git \
     nixpkgs#jq \
     nixpkgs#gcc \
     nixpkgs#pkg-config \
