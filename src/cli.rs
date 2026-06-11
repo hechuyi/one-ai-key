@@ -1,4 +1,4 @@
-#[cfg(test)]
+use clap::error::ErrorKind;
 use clap::CommandFactory;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -21,6 +21,10 @@ pub enum CliAction {
     ReloadDiff(crate::cli_commands::reload::ReloadDiffOptions),
     ReloadApply(crate::cli_commands::reload::ReloadApplyOptions),
     ClientTokensList(crate::cli_commands::client_tokens::ClientTokensListOptions),
+    ClientTokensCreate(crate::cli_commands::client_tokens::ClientTokenCreateOptions),
+    ClientTokensDisable(crate::cli_commands::client_tokens::ClientTokenSetEnabledOptions),
+    ClientTokensEnable(crate::cli_commands::client_tokens::ClientTokenSetEnabledOptions),
+    ClientTokensScopeUpdate(crate::cli_commands::client_tokens::ClientTokenScopeUpdateOptions),
     Keys(crate::cli_commands::keys::KeysCommand),
     FailuresTail(crate::cli_commands::failures::FailureTailOptions),
     FailuresExplain(crate::cli_commands::failures::FailureExplainOptions),
@@ -158,6 +162,10 @@ enum ReloadCommand {
 #[derive(Debug, Subcommand)]
 enum ClientTokensCommand {
     List(ClientTokensListArgs),
+    Create(ClientTokenCreateArgs),
+    Disable(ClientTokenSetEnabledArgs),
+    Enable(ClientTokenSetEnabledArgs),
+    ScopeUpdate(ClientTokenScopeUpdateArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -337,6 +345,67 @@ struct ReloadApplyArgs {
     long_about = "List runtime client-token references without raw token material. Side-effect class: runtime_readonly. Writes local files: no. Calls upstreams: no. Mutates management state or active runtime: no."
 )]
 struct ClientTokensListArgs {
+    #[arg(long, value_enum, default_value_t = crate::cli_report::OutputFormat::Table)]
+    output: crate::cli_report::OutputFormat,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    long_about = "Create one client token through management. Side-effect class: offline_readonly with --dry-run, management_write with --yes. Reads raw client token only from --token-env when confirmed. Calls upstreams: no. Confirmed create mutates the client-token store and active runtime."
+)]
+struct ClientTokenCreateArgs {
+    #[arg(long)]
+    name: String,
+    #[arg(long = "token-env", value_name = "ENV", hide_env_values = true)]
+    token_env: String,
+    #[arg(long = "allowed-model", conflicts_with = "unrestricted_model_groups")]
+    allowed_model_groups: Vec<String>,
+    #[arg(long = "unrestricted-models", conflicts_with = "allowed_model_groups")]
+    unrestricted_model_groups: bool,
+    #[arg(long = "allowed-channel", conflicts_with = "unrestricted_channels")]
+    allowed_channels: Vec<String>,
+    #[arg(long = "unrestricted-channels", conflicts_with = "allowed_channels")]
+    unrestricted_channels: bool,
+    #[arg(long, conflicts_with = "yes")]
+    dry_run: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long, value_enum, default_value_t = crate::cli_report::OutputFormat::Table)]
+    output: crate::cli_report::OutputFormat,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    long_about = "Disable one client token through management. Side-effect class: offline_readonly with --dry-run, management_write with --yes. Calls upstreams: no. Confirmed disable mutates the client-token store and active runtime."
+)]
+struct ClientTokenSetEnabledArgs {
+    token_id: String,
+    #[arg(long, conflicts_with = "yes")]
+    dry_run: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long, value_enum, default_value_t = crate::cli_report::OutputFormat::Table)]
+    output: crate::cli_report::OutputFormat,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    long_about = "Update one client token scope through management. Side-effect class: offline_readonly with --dry-run, management_write with --yes. Omitted scope dimensions are left unchanged; --unrestricted-* explicitly clears that dimension. Calls upstreams: no."
+)]
+struct ClientTokenScopeUpdateArgs {
+    token_id: String,
+    #[arg(long = "allowed-model", conflicts_with = "unrestricted_model_groups")]
+    allowed_model_groups: Vec<String>,
+    #[arg(long = "unrestricted-models", conflicts_with = "allowed_model_groups")]
+    unrestricted_model_groups: bool,
+    #[arg(long = "allowed-channel", conflicts_with = "unrestricted_channels")]
+    allowed_channels: Vec<String>,
+    #[arg(long = "unrestricted-channels", conflicts_with = "allowed_channels")]
+    unrestricted_channels: bool,
+    #[arg(long, conflicts_with = "yes")]
+    dry_run: bool,
+    #[arg(long)]
+    yes: bool,
     #[arg(long, value_enum, default_value_t = crate::cli_report::OutputFormat::Table)]
     output: crate::cli_report::OutputFormat,
 }
@@ -735,6 +804,69 @@ where
                 output: args.output,
             },
         ),
+        Some(CliCommand::ClientTokens {
+            command: ClientTokensCommand::Create(args),
+        }) => CliAction::ClientTokensCreate(
+            crate::cli_commands::client_tokens::ClientTokenCreateOptions {
+                connection: operator_connection_options,
+                name: args.name,
+                token_source: crate::cli_commands::client_tokens::ClientTokenSecretSource::Env(
+                    args.token_env,
+                ),
+                allowed_model_groups: args.allowed_model_groups,
+                unrestricted_model_groups: args.unrestricted_model_groups,
+                allowed_channels: args.allowed_channels,
+                unrestricted_channels: args.unrestricted_channels,
+                mode: client_token_mutation_mode(args.dry_run, args.yes),
+                output: args.output,
+            },
+        ),
+        Some(CliCommand::ClientTokens {
+            command: ClientTokensCommand::Disable(args),
+        }) => CliAction::ClientTokensDisable(
+            crate::cli_commands::client_tokens::ClientTokenSetEnabledOptions {
+                connection: operator_connection_options,
+                token_id: args.token_id,
+                mode: client_token_mutation_mode(args.dry_run, args.yes),
+                output: args.output,
+            },
+        ),
+        Some(CliCommand::ClientTokens {
+            command: ClientTokensCommand::Enable(args),
+        }) => CliAction::ClientTokensEnable(
+            crate::cli_commands::client_tokens::ClientTokenSetEnabledOptions {
+                connection: operator_connection_options,
+                token_id: args.token_id,
+                mode: client_token_mutation_mode(args.dry_run, args.yes),
+                output: args.output,
+            },
+        ),
+        Some(CliCommand::ClientTokens {
+            command: ClientTokensCommand::ScopeUpdate(args),
+        }) => {
+            if args.allowed_model_groups.is_empty()
+                && !args.unrestricted_model_groups
+                && args.allowed_channels.is_empty()
+                && !args.unrestricted_channels
+            {
+                return Err(Cli::command().error(
+                    ErrorKind::MissingRequiredArgument,
+                    "client-tokens scope-update requires at least one of --allowed-model, --unrestricted-models, --allowed-channel, or --unrestricted-channels",
+                ));
+            }
+            CliAction::ClientTokensScopeUpdate(
+                crate::cli_commands::client_tokens::ClientTokenScopeUpdateOptions {
+                    connection: operator_connection_options,
+                    token_id: args.token_id,
+                    allowed_model_groups: args.allowed_model_groups,
+                    unrestricted_model_groups: args.unrestricted_model_groups,
+                    allowed_channels: args.allowed_channels,
+                    unrestricted_channels: args.unrestricted_channels,
+                    mode: client_token_mutation_mode(args.dry_run, args.yes),
+                    output: args.output,
+                },
+            )
+        }
         Some(CliCommand::Keys {
             command: KeysCommandArgs::List(args),
         }) => CliAction::Keys(crate::cli_commands::keys::KeysCommand::List(
@@ -934,6 +1066,19 @@ where
     })
 }
 
+fn client_token_mutation_mode(
+    dry_run: bool,
+    yes: bool,
+) -> crate::cli_commands::client_tokens::ClientTokenMutationMode {
+    if dry_run {
+        crate::cli_commands::client_tokens::ClientTokenMutationMode::DryRun
+    } else if yes {
+        crate::cli_commands::client_tokens::ClientTokenMutationMode::Apply
+    } else {
+        crate::cli_commands::client_tokens::ClientTokenMutationMode::NeedsConfirmation
+    }
+}
+
 #[cfg(test)]
 pub fn parse_operator_connection_options_from<I, T>(
     args: I,
@@ -1068,6 +1213,149 @@ mod tests {
             Some("ONE_AI_KEY_MANAGEMENT_TOKEN")
         );
         assert!(!options.management_token_stdin);
+    }
+
+    #[test]
+    fn client_tokens_create_parse_supports_token_env_scope_and_dry_run() {
+        let action = parse_action_from([
+            "one-ai-key",
+            "--management-url",
+            "https://router.example",
+            "--management-token-env",
+            "ONE_AI_KEY_MANAGEMENT_TOKEN",
+            "client-tokens",
+            "create",
+            "--name",
+            "local-codex",
+            "--token-env",
+            "ONE_AI_KEY_NEW_CLIENT_TOKEN",
+            "--allowed-model",
+            "coding",
+            "--allowed-channel",
+            "primary",
+            "--dry-run",
+            "--output",
+            "json",
+        ])
+        .expect("client token create dry-run should parse");
+
+        assert_eq!(
+            action,
+            CliAction::ClientTokensCreate(
+                crate::cli_commands::client_tokens::ClientTokenCreateOptions {
+                    connection: crate::cli::OperatorConnectionOptions {
+                        management_url: Some("https://router.example".to_string()),
+                        deprecated_base_url: None,
+                        management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                        management_token_stdin: false,
+                        timeout_seconds: 10,
+                    },
+                    name: "local-codex".to_string(),
+                    token_source: crate::cli_commands::client_tokens::ClientTokenSecretSource::Env(
+                        "ONE_AI_KEY_NEW_CLIENT_TOKEN".to_string()
+                    ),
+                    allowed_model_groups: vec!["coding".to_string()],
+                    unrestricted_model_groups: false,
+                    allowed_channels: vec!["primary".to_string()],
+                    unrestricted_channels: false,
+                    mode: crate::cli_commands::client_tokens::ClientTokenMutationMode::DryRun,
+                    output: crate::cli_report::OutputFormat::Json,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn client_tokens_disable_enable_and_scope_update_parse_confirmation_modes() {
+        let disable = parse_action_from([
+            "one-ai-key",
+            "client-tokens",
+            "disable",
+            "local-client",
+            "--dry-run",
+        ])
+        .expect("client token disable dry-run should parse");
+        let enable = parse_action_from([
+            "one-ai-key",
+            "client-tokens",
+            "enable",
+            "local-client",
+            "--yes",
+        ])
+        .expect("client token enable apply should parse");
+        let scope_update = parse_action_from([
+            "one-ai-key",
+            "client-tokens",
+            "scope-update",
+            "local-client",
+            "--allowed-model",
+            "coding",
+            "--unrestricted-channels",
+            "--dry-run",
+        ])
+        .expect("client token scope update dry-run should parse");
+
+        assert!(matches!(
+            disable,
+            CliAction::ClientTokensDisable(
+                crate::cli_commands::client_tokens::ClientTokenSetEnabledOptions {
+                    mode: crate::cli_commands::client_tokens::ClientTokenMutationMode::DryRun,
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            enable,
+            CliAction::ClientTokensEnable(
+                crate::cli_commands::client_tokens::ClientTokenSetEnabledOptions {
+                    mode: crate::cli_commands::client_tokens::ClientTokenMutationMode::Apply,
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            scope_update,
+            CliAction::ClientTokensScopeUpdate(
+                crate::cli_commands::client_tokens::ClientTokenScopeUpdateOptions {
+                    mode: crate::cli_commands::client_tokens::ClientTokenMutationMode::DryRun,
+                    unrestricted_channels: true,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn client_tokens_create_rejects_raw_token_arguments_and_requires_token_env() {
+        let missing_token_env =
+            parse_action_from(["one-ai-key", "client-tokens", "create", "--name", "local"]);
+        let raw_token_flag = parse_action_from([
+            "one-ai-key",
+            "client-tokens",
+            "create",
+            "--name",
+            "local",
+            "--token",
+            "raw-secret-value",
+            "--dry-run",
+        ]);
+
+        assert!(missing_token_env.is_err());
+        assert!(raw_token_flag.is_err());
+    }
+
+    #[test]
+    fn client_tokens_scope_update_rejects_empty_scope_change() {
+        let parsed = parse_action_from([
+            "one-ai-key",
+            "client-tokens",
+            "scope-update",
+            "local-client",
+            "--dry-run",
+        ]);
+
+        let error = parsed.expect_err("empty scope update should be rejected");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     #[test]

@@ -81,6 +81,15 @@ pub fn classify_action(action: &CliAction) -> CommandEffect {
                 ..EffectVector::default()
             },
         },
+        CliAction::ClientTokensCreate(options) => {
+            crate::cli_commands::client_tokens::client_token_effect_for_mode(options.mode)
+        }
+        CliAction::ClientTokensDisable(options) | CliAction::ClientTokensEnable(options) => {
+            crate::cli_commands::client_tokens::client_token_effect_for_mode(options.mode)
+        }
+        CliAction::ClientTokensScopeUpdate(options) => {
+            crate::cli_commands::client_tokens::client_token_effect_for_mode(options.mode)
+        }
         CliAction::ModelsOnboardPlan(options) => match options.mode {
             crate::cli_commands::models_onboard::ModelsOnboardPlanMode::DryRun
             | crate::cli_commands::models_onboard::ModelsOnboardPlanMode::ApplyDryRun
@@ -373,6 +382,38 @@ pub fn confirmation_outcome(action: &CliAction, stdin_is_tty: bool) -> Confirmat
                 }
             }
         }
+        CliAction::ClientTokensCreate(options)
+            if matches!(
+                options.mode,
+                crate::cli_commands::client_tokens::ClientTokenMutationMode::NeedsConfirmation
+            ) =>
+        {
+            confirmation_required_outcome(stdin_is_tty)
+        }
+        CliAction::ClientTokensDisable(options)
+            if matches!(
+                options.mode,
+                crate::cli_commands::client_tokens::ClientTokenMutationMode::NeedsConfirmation
+            ) =>
+        {
+            confirmation_required_outcome(stdin_is_tty)
+        }
+        CliAction::ClientTokensEnable(options)
+            if matches!(
+                options.mode,
+                crate::cli_commands::client_tokens::ClientTokenMutationMode::NeedsConfirmation
+            ) =>
+        {
+            confirmation_required_outcome(stdin_is_tty)
+        }
+        CliAction::ClientTokensScopeUpdate(options)
+            if matches!(
+                options.mode,
+                crate::cli_commands::client_tokens::ClientTokenMutationMode::NeedsConfirmation
+            ) =>
+        {
+            confirmation_required_outcome(stdin_is_tty)
+        }
         CliAction::ModelsOnboardPlan(options)
             if matches!(
                 options.mode,
@@ -403,6 +444,19 @@ pub fn confirmation_outcome(action: &CliAction, stdin_is_tty: bool) -> Confirmat
             }
         }
         _ => ConfirmationOutcome::Allowed,
+    }
+}
+
+fn confirmation_required_outcome(stdin_is_tty: bool) -> ConfirmationOutcome {
+    if stdin_is_tty {
+        ConfirmationOutcome::PromptRequired {
+            reason_code: "confirmation_required",
+        }
+    } else {
+        ConfirmationOutcome::Denied {
+            exit_code: 3,
+            reason_code: "confirmation_required",
+        }
     }
 }
 
@@ -643,6 +697,165 @@ mod tests {
                     writes_management_store: false,
                     calls_upstream: false,
                     mutates_runtime: false,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_client_token_mutation_dry_runs_as_offline_readonly() {
+        let actions = [
+            parse_action_from([
+                "one-ai-key",
+                "client-tokens",
+                "create",
+                "--name",
+                "local-codex",
+                "--token-env",
+                "ONE_AI_KEY_NEW_CLIENT_TOKEN",
+                "--dry-run",
+            ])
+            .unwrap(),
+            parse_action_from([
+                "one-ai-key",
+                "client-tokens",
+                "disable",
+                "client_local",
+                "--dry-run",
+            ])
+            .unwrap(),
+            parse_action_from([
+                "one-ai-key",
+                "client-tokens",
+                "enable",
+                "client_local",
+                "--dry-run",
+            ])
+            .unwrap(),
+            parse_action_from([
+                "one-ai-key",
+                "client-tokens",
+                "scope-update",
+                "client_local",
+                "--unrestricted-models",
+                "--dry-run",
+            ])
+            .unwrap(),
+        ];
+
+        for action in actions {
+            let effect = super::classify_action(&action);
+
+            assert_eq!(
+                effect.side_effect_class,
+                super::SideEffectClass::OfflineReadonly
+            );
+            assert_eq!(effect.effect_vector, super::EffectVector::default());
+        }
+    }
+
+    #[test]
+    fn classifies_client_token_confirmed_mutations_as_management_write() {
+        let actions = [
+            parse_action_from([
+                "one-ai-key",
+                "client-tokens",
+                "create",
+                "--name",
+                "local-codex",
+                "--token-env",
+                "ONE_AI_KEY_NEW_CLIENT_TOKEN",
+                "--yes",
+            ])
+            .unwrap(),
+            parse_action_from([
+                "one-ai-key",
+                "client-tokens",
+                "disable",
+                "client_local",
+                "--yes",
+            ])
+            .unwrap(),
+            parse_action_from([
+                "one-ai-key",
+                "client-tokens",
+                "enable",
+                "client_local",
+                "--yes",
+            ])
+            .unwrap(),
+            parse_action_from([
+                "one-ai-key",
+                "client-tokens",
+                "scope-update",
+                "client_local",
+                "--allowed-channel",
+                "primary",
+                "--yes",
+            ])
+            .unwrap(),
+        ];
+
+        for action in actions {
+            let effect = super::classify_action(&action);
+
+            assert_eq!(
+                effect.side_effect_class,
+                super::SideEffectClass::ManagementWrite
+            );
+            assert_eq!(
+                effect.effect_vector,
+                super::EffectVector {
+                    reads_local_files: false,
+                    reads_management_runtime: false,
+                    reads_management_store: false,
+                    writes_local_files: false,
+                    writes_management_store: true,
+                    calls_upstream: false,
+                    mutates_runtime: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn client_token_mutations_require_confirmation_without_explicit_mode() {
+        let actions = [
+            parse_action_from([
+                "one-ai-key",
+                "client-tokens",
+                "create",
+                "--name",
+                "local-codex",
+                "--token-env",
+                "ONE_AI_KEY_NEW_CLIENT_TOKEN",
+            ])
+            .unwrap(),
+            parse_action_from(["one-ai-key", "client-tokens", "disable", "client_local"]).unwrap(),
+            parse_action_from(["one-ai-key", "client-tokens", "enable", "client_local"]).unwrap(),
+            parse_action_from([
+                "one-ai-key",
+                "client-tokens",
+                "scope-update",
+                "client_local",
+                "--allowed-model",
+                "coding",
+            ])
+            .unwrap(),
+        ];
+
+        for action in actions {
+            assert_eq!(
+                super::confirmation_outcome(&action, false),
+                super::ConfirmationOutcome::Denied {
+                    exit_code: 3,
+                    reason_code: "confirmation_required"
+                }
+            );
+            assert_eq!(
+                super::confirmation_outcome(&action, true),
+                super::ConfirmationOutcome::PromptRequired {
+                    reason_code: "confirmation_required"
                 }
             );
         }

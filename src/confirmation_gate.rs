@@ -96,6 +96,38 @@ pub(crate) fn apply_confirmed_transition(action: &mut cli::CliAction) {
         {
             options.mode = cli_commands::reload::ReloadApplyMode::Apply;
         }
+        cli::CliAction::ClientTokensCreate(options)
+            if matches!(
+                options.mode,
+                cli_commands::client_tokens::ClientTokenMutationMode::NeedsConfirmation
+            ) =>
+        {
+            options.mode = cli_commands::client_tokens::ClientTokenMutationMode::Apply;
+        }
+        cli::CliAction::ClientTokensDisable(options)
+            if matches!(
+                options.mode,
+                cli_commands::client_tokens::ClientTokenMutationMode::NeedsConfirmation
+            ) =>
+        {
+            options.mode = cli_commands::client_tokens::ClientTokenMutationMode::Apply;
+        }
+        cli::CliAction::ClientTokensEnable(options)
+            if matches!(
+                options.mode,
+                cli_commands::client_tokens::ClientTokenMutationMode::NeedsConfirmation
+            ) =>
+        {
+            options.mode = cli_commands::client_tokens::ClientTokenMutationMode::Apply;
+        }
+        cli::CliAction::ClientTokensScopeUpdate(options)
+            if matches!(
+                options.mode,
+                cli_commands::client_tokens::ClientTokenMutationMode::NeedsConfirmation
+            ) =>
+        {
+            options.mode = cli_commands::client_tokens::ClientTokenMutationMode::Apply;
+        }
         _ => {}
     }
 }
@@ -111,4 +143,58 @@ fn prompt_for_confirmation(reason_code: &str) -> anyhow::Result<bool> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmed_transition_applies_client_token_mutations() {
+        let mut actions = [
+            cli::parse_action_from([
+                "one-ai-key",
+                "client-tokens",
+                "create",
+                "--name",
+                "local-codex",
+                "--token-env",
+                "ONE_AI_KEY_NEW_CLIENT_TOKEN",
+            ])
+            .unwrap(),
+            cli::parse_action_from(["one-ai-key", "client-tokens", "disable", "client_local"])
+                .unwrap(),
+            cli::parse_action_from(["one-ai-key", "client-tokens", "enable", "client_local"])
+                .unwrap(),
+            cli::parse_action_from([
+                "one-ai-key",
+                "client-tokens",
+                "scope-update",
+                "client_local",
+                "--allowed-model",
+                "coding",
+            ])
+            .unwrap(),
+        ];
+
+        for action in &mut actions {
+            apply_confirmed_transition(action);
+            match action {
+                cli::CliAction::ClientTokensCreate(options) => assert!(matches!(
+                    options.mode,
+                    cli_commands::client_tokens::ClientTokenMutationMode::Apply
+                )),
+                cli::CliAction::ClientTokensDisable(options)
+                | cli::CliAction::ClientTokensEnable(options) => assert!(matches!(
+                    options.mode,
+                    cli_commands::client_tokens::ClientTokenMutationMode::Apply
+                )),
+                cli::CliAction::ClientTokensScopeUpdate(options) => assert!(matches!(
+                    options.mode,
+                    cli_commands::client_tokens::ClientTokenMutationMode::Apply
+                )),
+                other => panic!("unexpected action after parse: {other:?}"),
+            }
+        }
+    }
 }

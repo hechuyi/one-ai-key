@@ -152,6 +152,26 @@ async fn main() -> anyhow::Result<()> {
             println!("{report}");
             Ok(())
         }
+        cli::CliAction::ClientTokensCreate(options) => {
+            let report = cli_commands::client_tokens::run_create(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::ClientTokensDisable(options) => {
+            let report = cli_commands::client_tokens::run_disable(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::ClientTokensEnable(options) => {
+            let report = cli_commands::client_tokens::run_enable(options).await?;
+            println!("{report}");
+            Ok(())
+        }
+        cli::CliAction::ClientTokensScopeUpdate(options) => {
+            let report = cli_commands::client_tokens::run_scope_update(options).await?;
+            println!("{report}");
+            Ok(())
+        }
         cli::CliAction::Keys(command) => {
             let report = cli_commands::keys::run(command).await?;
             println!("{report}");

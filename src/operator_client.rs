@@ -14,6 +14,7 @@ pub enum Method {
     Get,
     Post,
     Put,
+    Patch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,60 +180,7 @@ impl OperatorClient {
         endpoint: ManagementMutationEndpoint,
         body: &T,
     ) -> Result<Value, OperatorClientError> {
-        let request = endpoint.request()?;
-        let path = request.path.as_str();
-        if !is_management_mutation_path(Method::Post, path) {
-            return Err(OperatorClientError::new(
-                "management_mutation_path_rejected",
-                "management path is not in the mutation allowlist",
-            ));
-        }
-        let mut url = self.config.base_url.clone();
-        url.set_path(path);
-        {
-            let mut pairs = url.query_pairs_mut();
-            for (key, value) in &request.query {
-                pairs.append_pair(key, value);
-            }
-        }
-        let response = self
-            .http
-            .post(url.clone())
-            .bearer_auth(self.config.bearer_token.as_str())
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| {
-                if error.is_timeout() {
-                    OperatorClientError::timeout(url.as_str())
-                } else {
-                    OperatorClientError::new(
-                        "management_transport_error",
-                        "management API request failed",
-                    )
-                }
-            })?;
-        let status = response.status();
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let bytes = response.bytes().await.map_err(|_| {
-            OperatorClientError::new(
-                "management_body_error",
-                "failed to read management API body",
-            )
-        })?;
-        if !request.accepts_status(status) {
-            return Err(classify_http_error(status, content_type.as_deref(), &bytes));
-        }
-        serde_json::from_slice(&bytes).map_err(|_| {
-            OperatorClientError::new(
-                "management_non_json_error",
-                "management API returned a non-json response",
-            )
-        })
+        self.send_mutation_json(Method::Post, endpoint, body).await
     }
 
     pub async fn put_json<T: Serialize>(
@@ -240,9 +188,26 @@ impl OperatorClient {
         endpoint: ManagementMutationEndpoint,
         body: &T,
     ) -> Result<Value, OperatorClientError> {
+        self.send_mutation_json(Method::Put, endpoint, body).await
+    }
+
+    pub async fn patch_json<T: Serialize>(
+        &self,
+        endpoint: ManagementMutationEndpoint,
+        body: &T,
+    ) -> Result<Value, OperatorClientError> {
+        self.send_mutation_json(Method::Patch, endpoint, body).await
+    }
+
+    async fn send_mutation_json<T: Serialize>(
+        &self,
+        method: Method,
+        endpoint: ManagementMutationEndpoint,
+        body: &T,
+    ) -> Result<Value, OperatorClientError> {
         let request = endpoint.request()?;
         let path = request.path.as_str();
-        if !is_management_mutation_path(Method::Put, path) {
+        if !is_management_mutation_path(method, path) {
             return Err(OperatorClientError::new(
                 "management_mutation_path_rejected",
                 "management path is not in the mutation allowlist",
@@ -256,9 +221,18 @@ impl OperatorClient {
                 pairs.append_pair(key, value);
             }
         }
-        let response = self
-            .http
-            .put(url.clone())
+        let request_builder = match method {
+            Method::Post => self.http.post(url.clone()),
+            Method::Put => self.http.put(url.clone()),
+            Method::Patch => self.http.patch(url.clone()),
+            Method::Get => {
+                return Err(OperatorClientError::new(
+                    "management_mutation_method_invalid",
+                    "read-only method cannot send management mutation",
+                ));
+            }
+        };
+        let response = request_builder
             .bearer_auth(self.config.bearer_token.as_str())
             .json(body)
             .send()
@@ -407,6 +381,16 @@ pub enum ReadOnlyEndpoint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
 pub enum ManagementMutationEndpoint {
+    ClientTokenCreate,
+    ClientTokenScopeUpdate {
+        token_id: String,
+    },
+    ClientTokenDisable {
+        token_id: String,
+    },
+    ClientTokenEnable {
+        token_id: String,
+    },
     RuntimeReload {
         expected_staged_registry_version: u64,
     },
@@ -565,6 +549,30 @@ impl ManagementMutationEndpoint {
 
     fn request(&self) -> Result<EndpointRequest, OperatorClientError> {
         let request = match self {
+            Self::ClientTokenCreate => {
+                EndpointRequest::new("/management/client-tokens", Vec::new())
+            }
+            Self::ClientTokenScopeUpdate { token_id } => EndpointRequest::new(
+                format!(
+                    "/management/client-tokens/{}",
+                    safe_path_segment(token_id, "client_token_id")?
+                ),
+                Vec::new(),
+            ),
+            Self::ClientTokenDisable { token_id } => EndpointRequest::new(
+                format!(
+                    "/management/client-tokens/{}/disable",
+                    safe_path_segment(token_id, "client_token_id")?
+                ),
+                Vec::new(),
+            ),
+            Self::ClientTokenEnable { token_id } => EndpointRequest::new(
+                format!(
+                    "/management/client-tokens/{}/enable",
+                    safe_path_segment(token_id, "client_token_id")?
+                ),
+                Vec::new(),
+            ),
             Self::RuntimeReload {
                 expected_staged_registry_version,
             } => EndpointRequest::new(
@@ -963,13 +971,33 @@ pub fn is_management_mutation_path(method: Method, path: &str) -> bool {
             && parts[3] == "model-routes"
             && safe_encoded_model_route_path_component(parts[4]);
     }
+    if method == Method::Patch {
+        let parts = path.split('/').collect::<Vec<_>>();
+        return parts.len() == 4
+            && parts[0].is_empty()
+            && parts[1] == "management"
+            && parts[2] == "client-tokens"
+            && safe_path_segment(parts[3], "client_token_id").is_ok();
+    }
     if method != Method::Post {
         return false;
     }
     if path == "/management/runtime/reload" {
         return true;
     }
+    if path == "/management/client-tokens" {
+        return true;
+    }
     let parts = path.split('/').collect::<Vec<_>>();
+    if parts.len() == 5
+        && parts[0].is_empty()
+        && parts[1] == "management"
+        && parts[2] == "client-tokens"
+        && safe_path_segment(parts[3], "client_token_id").is_ok()
+        && matches!(parts[4], "disable" | "enable")
+    {
+        return true;
+    }
     let credential_set_prefix = parts.len() >= 6
         && parts[0].is_empty()
         && parts[1] == "management"
@@ -1335,6 +1363,97 @@ mod tests {
             Method::Post,
             "/management/credential-sets/relay_keys/credentials/import"
         ));
+    }
+
+    #[test]
+    fn typed_mutation_endpoint_builds_client_token_paths_without_broadening_readonly_allowlist() {
+        let create = ManagementMutationEndpoint::ClientTokenCreate
+            .test_request_parts()
+            .expect("client token create endpoint should build");
+        assert_eq!(
+            create,
+            ("/management/client-tokens".to_string(), Vec::new())
+        );
+        assert!(is_management_mutation_path(
+            Method::Post,
+            "/management/client-tokens"
+        ));
+        assert!(!is_management_mutation_path(
+            Method::Get,
+            "/management/client-tokens"
+        ));
+        assert!(is_readonly_management_path(
+            Method::Get,
+            "/management/client-tokens"
+        ));
+
+        let scope_update = ManagementMutationEndpoint::ClientTokenScopeUpdate {
+            token_id: "client_local-codex".to_string(),
+        }
+        .test_request_parts()
+        .expect("client token scope update endpoint should build");
+        assert_eq!(
+            scope_update,
+            (
+                "/management/client-tokens/client_local-codex".to_string(),
+                Vec::new()
+            )
+        );
+        assert!(is_management_mutation_path(
+            Method::Patch,
+            "/management/client-tokens/client_local-codex"
+        ));
+        assert!(!is_readonly_management_path(
+            Method::Patch,
+            "/management/client-tokens/client_local-codex"
+        ));
+
+        let disable = ManagementMutationEndpoint::ClientTokenDisable {
+            token_id: "client_local-codex".to_string(),
+        }
+        .test_request_parts()
+        .expect("client token disable endpoint should build");
+        assert_eq!(
+            disable,
+            (
+                "/management/client-tokens/client_local-codex/disable".to_string(),
+                Vec::new()
+            )
+        );
+        assert!(is_management_mutation_path(
+            Method::Post,
+            "/management/client-tokens/client_local-codex/disable"
+        ));
+
+        let enable = ManagementMutationEndpoint::ClientTokenEnable {
+            token_id: "client_local-codex".to_string(),
+        }
+        .test_request_parts()
+        .expect("client token enable endpoint should build");
+        assert_eq!(
+            enable,
+            (
+                "/management/client-tokens/client_local-codex/enable".to_string(),
+                Vec::new()
+            )
+        );
+        assert!(is_management_mutation_path(
+            Method::Post,
+            "/management/client-tokens/client_local-codex/enable"
+        ));
+
+        for path in [
+            "/management/client-tokens/../runtime/reload",
+            "/management/client-tokens/client/local/disable",
+            "/management/client-tokens/client%2Flocal/enable",
+            "/management/client-tokens/client_local-codex/delete",
+        ] {
+            assert!(
+                !is_management_mutation_path(Method::Post, path)
+                    && !is_management_mutation_path(Method::Patch, path),
+                "{path} should not be allowlisted"
+            );
+        }
     }
 
     #[test]
