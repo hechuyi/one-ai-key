@@ -4,7 +4,9 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
 NIX_STORE_VOLUME=${ONE_AI_KEY_NIX_STORE_VOLUME:-one-ai-key-nix-amd64}
+NIX_CACHE_VOLUME=${ONE_AI_KEY_NIX_CACHE_VOLUME:-one-ai-key-nix-cache-amd64}
 CARGO_TARGET_VOLUME=${ONE_AI_KEY_CARGO_TARGET_VOLUME:-one-ai-key-cargo-target-amd64}
+CARGO_HOME_VOLUME=${ONE_AI_KEY_CARGO_HOME_VOLUME:-one-ai-key-cargo-home-amd64}
 
 if [[ "${1:-}" != "--inside-container" ]]; then
   if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
@@ -16,8 +18,11 @@ if [[ "${1:-}" != "--inside-container" ]]; then
       --platform linux/amd64 \
       -v "${REPO_ROOT}:/work" \
       -v "${NIX_STORE_VOLUME}:/nix" \
+      -v "${NIX_CACHE_VOLUME}:/root/.cache/nix" \
       -v "${CARGO_TARGET_VOLUME}:/cargo-target" \
+      -v "${CARGO_HOME_VOLUME}:/cargo-home" \
       -e CARGO_TARGET_DIR=/cargo-target \
+      -e CARGO_HOME=/cargo-home \
       -w /work \
       nixos/nix:latest \
       nix --extra-experimental-features "nix-command flakes" shell \

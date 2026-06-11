@@ -15,9 +15,18 @@ configured persistent Nix store volume at `/nix`, and then runs
 `scripts/build-release-x86_64-linux.sh` inside that x86_64 Linux Nix
 environment. The default volume is `one-ai-key-nix-amd64`; set
 `ONE_AI_KEY_NIX_STORE_VOLUME` when a development host needs a different local
-volume name. The wrapper also mounts a separate Cargo target volume at
-`/cargo-target` and exports `CARGO_TARGET_DIR=/cargo-target`, so release builds
-do not create repository-local `target/` directories.
+volume name. It also mounts a Nix user cache volume at `/root/.cache/nix`, so
+Nix tarball and eval caches survive repeated Docker/Nix runs. The wrapper
+mounts a separate Cargo target volume at `/cargo-target` and exports
+`CARGO_TARGET_DIR=/cargo-target`, so release builds do not create
+repository-local `target/` directories. It also mounts a Cargo home cache volume
+at `/cargo-home` and exports `CARGO_HOME=/cargo-home`, so Cargo registry and Git
+dependency caches survive repeated Docker/Nix runs. The four fixed default
+reusable Docker volumes are `one-ai-key-nix-amd64`,
+`one-ai-key-nix-cache-amd64`, `one-ai-key-cargo-target-amd64`, and
+`one-ai-key-cargo-home-amd64`; they are build caches, not release artifacts, and
+not routine cleanup targets. Repository-local `target/` is still ordinary build
+output and may be deleted when needed.
 
 `scripts/build-release-x86_64-linux.sh` is the container entrypoint, not the
 host entrypoint. It rejects non-Linux hosts, non-`x86_64` machines, and

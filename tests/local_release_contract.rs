@@ -219,10 +219,23 @@ fn docker_release_wrapper_runs_local_amd64_nix_container_with_cached_nix_store()
     );
     assert!(
         script.contains(
+            "NIX_CACHE_VOLUME=${ONE_AI_KEY_NIX_CACHE_VOLUME:-one-ai-key-nix-cache-amd64}"
+        ) && script.contains(r#""${NIX_CACHE_VOLUME}:/root/.cache/nix""#),
+        "{path} must persist the Nix user Git/eval cache in a configurable named Docker volume"
+    );
+    assert!(
+        script.contains(
             "CARGO_TARGET_VOLUME=${ONE_AI_KEY_CARGO_TARGET_VOLUME:-one-ai-key-cargo-target-amd64}"
         ) && script.contains(r#""${CARGO_TARGET_VOLUME}:/cargo-target""#)
             && script.contains("-e CARGO_TARGET_DIR=/cargo-target"),
         "{path} must keep release Cargo build output outside the repository"
+    );
+    assert!(
+        script.contains(
+            "CARGO_HOME_VOLUME=${ONE_AI_KEY_CARGO_HOME_VOLUME:-one-ai-key-cargo-home-amd64}"
+        ) && script.contains(r#""${CARGO_HOME_VOLUME}:/cargo-home""#)
+            && script.contains("-e CARGO_HOME=/cargo-home"),
+        "{path} must persist Cargo home cache in a configurable named Docker volume"
     );
     assert!(
         script.contains("nix-command flakes"),
@@ -858,6 +871,11 @@ fn release_smoke_script_is_local_redacted_and_cleans_processes() {
         "docker run --rm",
         "--platform linux/amd64",
         "nixos/nix:latest",
+        "NIX_CACHE_VOLUME=${ONE_AI_KEY_NIX_CACHE_VOLUME:-one-ai-key-nix-cache-amd64}",
+        r#""${NIX_CACHE_VOLUME}:/root/.cache/nix""#,
+        "CARGO_HOME_VOLUME=${ONE_AI_KEY_CARGO_HOME_VOLUME:-one-ai-key-cargo-home-amd64}",
+        r#""${CARGO_HOME_VOLUME}:/cargo-home""#,
+        "-e CARGO_HOME=/cargo-home",
         "mktemp -d",
         "trap cleanup EXIT",
         "kill \"${SERVICE_PID}\"",
@@ -875,6 +893,29 @@ fn release_smoke_script_is_local_redacted_and_cleans_processes() {
         assert!(
             !script.to_ascii_lowercase().contains(forbidden),
             "{path} must not contain remote operation or secret-like token `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn release_build_docs_protect_persistent_docker_build_caches() {
+    let path = "docs/release-build.md";
+    let docs = read_repo_file(path);
+
+    for required in [
+        "one-ai-key-nix-amd64",
+        "one-ai-key-nix-cache-amd64",
+        "one-ai-key-cargo-target-amd64",
+        "one-ai-key-cargo-home-amd64",
+        "build caches, not release artifacts",
+        "not routine cleanup targets",
+        "Repository-local `target/`",
+        "ordinary build",
+        "output and may be deleted",
+    ] {
+        assert!(
+            docs.contains(required),
+            "{path} must document persistent build-cache discipline token `{required}`"
         );
     }
 }
