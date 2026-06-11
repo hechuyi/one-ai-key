@@ -498,7 +498,7 @@ fn route_plan_for_openai_request(
             record_route_admission_denied(
                 state,
                 &preview,
-                no_route_candidate_denial(endpoint, Some(client_token_ref), "explicit_model"),
+                no_route_candidate_denial(endpoint, Some(client_token_ref), "explicit_model_route"),
             );
             return Err(Box::new(no_route_candidate_response(&[
                 "channel_cooling_down",
@@ -509,7 +509,7 @@ fn route_plan_for_openai_request(
             record_route_admission_denied(
                 state,
                 &preview,
-                no_route_candidate_denial(endpoint, Some(client_token_ref), "explicit_model"),
+                no_route_candidate_denial(endpoint, Some(client_token_ref), "explicit_model_route"),
             );
             return Err(Box::new(no_route_candidate_response(&reason_codes)));
         }

@@ -29981,6 +29981,169 @@ model_routes:
     }
 
     #[tokio::test]
+    async fn responses_explicit_route_all_channel_cooldown_returns_no_route_candidate_with_responses_telemetry(
+    ) {
+        let upstream_hits = Arc::new(Mutex::new(0usize));
+        let upstream_hits_for_handler = upstream_hits.clone();
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let upstream_hits = upstream_hits_for_handler.clone();
+                async move {
+                    *upstream_hits.lock().await += 1;
+                    Json(serde_json::json!({
+                        "id": "resp-fixture",
+                        "object": "response",
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [
+                                    {"type": "output_text", "text": "should-not-route"}
+                                ]
+                            }
+                        ]
+                    }))
+                }
+            }),
+        );
+        let upstream_base = spawn_upstream(upstream).await;
+        let state = AppState::new(
+            AppConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                client_tokens: vec![ClientTokenConfig {
+                    name: "test-client".to_string(),
+                    token: fixture_client_token(),
+                    enabled: true,
+                    allowed_model_groups: Vec::new(),
+                    allowed_channels: Vec::new(),
+                }],
+                management: Some(ManagementConfig {
+                    admin_token: fixture_admin_token(),
+                    ip_allowlist: None,
+                    principals: Vec::new(),
+                    event_log_path: None,
+                    event_window_capacity: None,
+                }),
+                max_request_body_bytes: 1024 * 1024,
+                max_model_catalog_body_bytes: 512 * 1024,
+                max_error_body_bytes: 1024,
+                timeouts: TimeoutConfig::default(),
+                routing: crate::config::RoutingConfig::default(),
+                default_pool: Some("responses-cooling".to_string()),
+                providers: HashMap::new(),
+                accounts: HashMap::new(),
+                credential_sets: credential_sets_from_files([(
+                    "responses-cooling-credentials",
+                    temp_keys_file("responses-cooling-key\n"),
+                )]),
+                model_routes: HashMap::from([priority_route(
+                    "gpt-responses",
+                    ["responses-cooling"],
+                )]),
+                policy_profiles: HashMap::new(),
+                default_routing_profile: Some("default-routing".to_string()),
+                routing_profiles: std::collections::HashMap::from([(
+                    "default-routing".to_string(),
+                    crate::config::RoutingProfileConfig {
+                        key_selection:
+                            crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                        default_credential_cooldown_seconds: 20,
+                        same_request_credential_retry:
+                            crate::config::SameRequestCredentialRetryConfig {
+                                enabled: false,
+                                max_retries: 0,
+                            },
+                        route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                    },
+                )]),
+                pools: HashMap::from([(
+                    "responses-cooling".to_string(),
+                    openai_pool(upstream_base, "responses-cooling-credentials"),
+                )]),
+            }
+            .resolve()
+            .unwrap(),
+        )
+        .unwrap();
+        *state
+            .channels
+            .get("responses-cooling")
+            .unwrap()
+            .health
+            .lock()
+            .unwrap() = ChannelHealth::CoolingDown {
+            until: Instant::now() + Duration::from_secs(30),
+            reason: "relay balance unavailable".to_string(),
+        };
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"gpt-responses","input":"ok"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(*upstream_hits.lock().await, 0);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "no_route_candidate");
+        assert_eq!(value["error"]["reasons"][0], "channel_cooling_down");
+        assert!(!value.to_string().contains("responses-cooling-key"));
+
+        let telemetry = state
+            .routing_telemetry
+            .lock()
+            .expect("routing telemetry mutex poisoned")
+            .snapshot();
+        let admission_denial = telemetry
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    RoutingTelemetry::RouteAdmissionDenied {
+                        endpoint_family,
+                        public_model,
+                        route_kind,
+                        reason_code,
+                        client_visible_status,
+                        upstream_status,
+                        ..
+                    } if endpoint_family == "responses"
+                        && public_model.as_deref() == Some("gpt-responses")
+                        && route_kind == "explicit_model_route"
+                        && reason_code == "no_route_candidate"
+                        && *client_visible_status == 503
+                        && upstream_status.is_none()
+                )
+            })
+            .expect("responses no_route_candidate should record route admission denial");
+        if let RoutingTelemetry::RouteAdmissionDenied {
+            hard_reason_codes,
+            candidate_count,
+            included_count,
+            hard_blocked_count,
+            soft_suppressed_count,
+            last_resort_used,
+            ..
+        } = admission_denial
+        {
+            assert_eq!(*candidate_count, 1);
+            assert_eq!(*included_count, 0);
+            assert_eq!(*hard_blocked_count, 1);
+            assert_eq!(*soft_suppressed_count, 0);
+            assert!(!last_resort_used);
+            assert_eq!(hard_reason_codes, &vec!["channel_cooling_down".to_string()]);
+        }
+    }
+
+    #[tokio::test]
     async fn provider_cooling_down_selected_target_is_not_rejected_when_fallback_exists() {
         let primary_hits = Arc::new(AtomicU64::new(0));
         let primary_hits_for_handler = primary_hits.clone();
@@ -34627,6 +34790,26 @@ model_routes:
         assert_eq!(
             state.channels.channel_route_state("responses"),
             ChannelRouteState::ProviderCoolingDown
+        );
+
+        let preview = management_response_json(
+            &app(state.clone()),
+            "/management/routing/preview?model=gpt-responses&client_token=test-client",
+        )
+        .await;
+        assert_eq!(preview["admission_summary"]["status"], "last_resort");
+        assert_eq!(
+            preview["admission_summary"]["reason_code"],
+            "provider_cooling_down_last_resort"
+        );
+        assert_eq!(preview["admission_summary"]["last_resort_used"], true);
+        assert_eq!(
+            preview["admission_summary"]["last_resort_reason"],
+            "provider_cooling_down_last_resort"
+        );
+        assert_eq!(
+            preview["admission_summary"]["selected_target"]["channel_id"],
+            "responses"
         );
 
         let second = app(state)

@@ -399,9 +399,11 @@ fn request_explanation(failures: &[Value]) -> Value {
     };
     serde_json::json!({
         "stage": taxonomy_string(primary, "stage", "unknown"),
+        "endpoint_family": taxonomy_string(primary, "endpoint_family", "unknown"),
         "public_model": taxonomy_string(primary, "public_model", "unknown"),
         "client_token_ref": primary.get("client_token_ref").cloned().unwrap_or(Value::Null),
         "selected_target": primary.get("selected_target").cloned().unwrap_or(Value::Null),
+        "route_kind": taxonomy_string(primary, "route_kind", "unknown"),
         "failure_class": taxonomy_string(primary, "failure_class", "unknown"),
         "router_action": taxonomy_string(primary, "router_action", "none"),
         "retry_eligibility": taxonomy_string(primary, "retry_eligibility", "not_applicable"),
@@ -515,10 +517,12 @@ fn projected_failure_event(event: &Value) -> Option<Value> {
         "event_kind": projected_string(event, "event_kind", "unknown"),
         "request_id": projected_nullable_string(event, "request_id"),
         "stage": projected_string(event, "stage", "unknown"),
+        "endpoint_family": projected_nullable_string(event, "endpoint_family"),
         "public_model": projected_string(event, "public_model", "unknown"),
         "client_token_ref": projected_nullable_string(event, "client_token_ref"),
         "selected_target": projected_selected_target(event.get("selected_target")),
         "channel_id": projected_nullable_string(event, "channel_id"),
+        "route_kind": projected_nullable_string(event, "route_kind"),
         "failure_class": projected_string(event, "failure_class", "unknown"),
         "router_action": projected_string(event, "router_action", "none"),
         "retry_eligibility": projected_string(event, "retry_eligibility", "not_applicable"),
@@ -1336,10 +1340,10 @@ mod tests {
                     "event_kind": "route_admission_denied",
                     "request_id": "req_local_503",
                     "stage": "route_admission",
-                    "endpoint_family": "chat_completions",
+                    "endpoint_family": "responses",
                     "public_model": "gpt-route",
                     "client_token_ref": "local-client",
-                    "route_kind": "explicit_model",
+                    "route_kind": "explicit_model_route",
                     "failure_class": "route_admission_denied",
                     "router_action": "returned_local_error",
                     "retry_eligibility": "not_applicable",
@@ -1418,8 +1422,18 @@ mod tests {
         let local_failure = &local_report["data"]["evidence"][0];
 
         assert_eq!(local_report["reason_code"], "no_route_candidate");
+        assert_eq!(
+            local_report["data"]["explanation"]["endpoint_family"],
+            "responses"
+        );
+        assert_eq!(
+            local_report["data"]["explanation"]["route_kind"],
+            "explicit_model_route"
+        );
         assert_eq!(local_failure["event_kind"], "route_admission_denied");
         assert_eq!(local_failure["stage"], "route_admission");
+        assert_eq!(local_failure["endpoint_family"], "responses");
+        assert_eq!(local_failure["route_kind"], "explicit_model_route");
         assert_eq!(local_failure["client_visible_status"], "local_503");
         assert!(local_failure["upstream_status"].is_null());
         assert_eq!(local_failure["admission"]["candidate_count"], 3);
