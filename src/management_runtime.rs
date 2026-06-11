@@ -107,6 +107,7 @@ pub struct RoutingTelemetryResponse {
 pub struct FailureTransitionSummary {
     pub request_id: Option<String>,
     pub channel_id: Option<String>,
+    pub endpoint_family: String,
     pub public_model: Option<String>,
     pub client_token_ref: Option<String>,
     pub selected_credential_id_hash: Option<String>,
@@ -260,6 +261,7 @@ fn failure_transition_summary_from_failure(
     FailureTransitionSummary {
         request_id: safe_management_id(request_id),
         channel_id: safe_management_id(channel_id),
+        endpoint_family: safe_management_code(&failure.endpoint_family),
         public_model: failure.public_model.as_deref().and_then(safe_management_id),
         client_token_ref: None,
         selected_credential_id_hash: safe_management_id(&failure.credential_id_hash),
@@ -378,6 +380,7 @@ fn project_routing_failure_event(summary: FailureTransitionSummary) -> Value {
         "event_kind": "upstream_failure_observed",
         "request_id": summary.request_id,
         "stage": upstream_stage(&summary.failure_source),
+        "endpoint_family": summary.endpoint_family,
         "public_model": summary.public_model.unwrap_or_else(|| "unknown".to_string()),
         "client_token_ref": summary.client_token_ref,
         "selected_target": selected_target(summary.channel_id.as_deref()),
@@ -814,6 +817,7 @@ fn sanitize_routing_telemetry(event: RoutingTelemetry) -> Value {
 
 fn sanitize_upstream_failure(failure: UpstreamFailureTelemetry) -> Value {
     json!({
+        "endpoint_family": safe_management_code(&failure.endpoint_family),
         "public_model": failure.public_model.as_deref().and_then(safe_management_id),
         "credential_id_hash": safe_management_id(&failure.credential_id_hash),
         "attempt": failure.attempt,
@@ -2162,6 +2166,7 @@ mod tests {
             .expect("upstream failure should be projected");
         assert_eq!(upstream["event_kind"], "upstream_failure_observed");
         assert_eq!(upstream["stage"], "upstream_transport");
+        assert_eq!(upstream["endpoint_family"], "chat_completions");
         assert_eq!(upstream["client_visible_status"], "upstream_5xx");
         assert_eq!(upstream["upstream_status"], 503);
         assert_eq!(upstream["reason_code"], "upstream_5xx");
@@ -2305,6 +2310,7 @@ mod tests {
         failure_source: &str,
     ) -> UpstreamFailureTelemetry {
         UpstreamFailureTelemetry {
+            endpoint_family: "chat_completions".to_string(),
             public_model: Some("gpt-test".to_string()),
             credential_id_hash: "safe-credential-hash".to_string(),
             attempt: 0,

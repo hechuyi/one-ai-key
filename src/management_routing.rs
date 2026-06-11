@@ -2439,6 +2439,7 @@ mod tests {
                 request_id: "req-secret".to_string(),
                 channel_id: "https://relay.example/private?secret=sk-SHOULD_NOT_RENDER".to_string(),
                 failure: Box::new(UpstreamFailureTelemetry {
+                    endpoint_family: "chat_completions".to_string(),
                     public_model: Some("gpt-public".to_string()),
                     credential_id_hash: "credential-hash-should-not-render".to_string(),
                     attempt: 0,

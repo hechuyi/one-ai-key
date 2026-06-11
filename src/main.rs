@@ -21777,6 +21777,7 @@ pools:
         credential_id_hash: &str,
     ) -> UpstreamFailureTelemetry {
         UpstreamFailureTelemetry {
+            endpoint_family: "chat_completions".to_string(),
             public_model: Some("gpt-test".to_string()),
             credential_id_hash: credential_id_hash.to_string(),
             attempt: 0,
@@ -24274,6 +24275,7 @@ pools:
                 request_id: "req_retry_decision".to_string(),
                 channel_id: "test".to_string(),
                 failure: Box::new(UpstreamFailureTelemetry {
+                    endpoint_family: "chat_completions".to_string(),
                     public_model: Some("gpt-test".to_string()),
                     credential_id_hash: "fingerprint-a".to_string(),
                     attempt: 2,
@@ -24342,6 +24344,7 @@ pools:
                 request_id: "req_diagnosis_summary".to_string(),
                 channel_id: "test".to_string(),
                 failure: Box::new(UpstreamFailureTelemetry {
+                    endpoint_family: "chat_completions".to_string(),
                     public_model: Some("gpt-test".to_string()),
                     credential_id_hash: "safe-credential-hash".to_string(),
                     attempt: 1,
@@ -24836,6 +24839,7 @@ pools:
                 request_id: "req_rule".to_string(),
                 channel_id: "test".to_string(),
                 failure: Box::new(UpstreamFailureTelemetry {
+                    endpoint_family: "chat_completions".to_string(),
                     public_model: Some("gpt-test".to_string()),
                     credential_id_hash: "safe-hash".to_string(),
                     attempt: 0,

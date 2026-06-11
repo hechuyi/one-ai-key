@@ -356,6 +356,7 @@ EXPECTED_MANAGEMENT_REPORTS=(
   "keys-restore-apply.json"
   "keys-stats-after-restore.json"
   "failures-tail.json"
+  "response-filter-events.json"
   "reload-status.json"
   "reload-diff.json"
   "reload-apply-dry-run.json"

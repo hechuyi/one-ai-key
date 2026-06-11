@@ -596,7 +596,7 @@ fn record_route_admission_denied(
         RoutingTelemetry::RouteAdmissionDenied {
             request_id: preview.request_id.clone(),
             registry_generation: preview.registry_generation,
-            endpoint_family: endpoint_family_code(denial.endpoint).to_string(),
+            endpoint_family: denial.endpoint.family_code().to_string(),
             public_model: preview.public_model.clone(),
             client_token_ref: denial.client_token_ref.map(ToOwned::to_owned),
             route_kind: denial.route_kind.to_string(),
@@ -647,7 +647,7 @@ fn record_single_route_admission_denied(
         RoutingTelemetry::RouteAdmissionDenied {
             request_id: request_id.to_string(),
             registry_generation,
-            endpoint_family: endpoint_family_code(denial.endpoint).to_string(),
+            endpoint_family: denial.endpoint.family_code().to_string(),
             public_model: public_model.map(ToOwned::to_owned),
             client_token_ref: denial.client_token_ref.map(ToOwned::to_owned),
             route_kind: denial.route_kind.to_string(),
@@ -716,16 +716,6 @@ fn soft_suppressed_candidate_count(preview: &RoutePreview) -> usize {
                     .all(route_preview_reason_is_soft_suppression)
         })
         .count()
-}
-
-fn endpoint_family_code(endpoint: EndpointKind) -> &'static str {
-    match endpoint {
-        EndpointKind::Models => "models",
-        EndpointKind::ChatCompletions => "chat_completions",
-        EndpointKind::Responses => "responses",
-        EndpointKind::Embeddings => "embeddings",
-        EndpointKind::Generic => "generic",
-    }
 }
 
 fn route_preview_reason_excludes_candidate_from_cooling_denominator(

@@ -199,6 +199,7 @@ pub enum RoutingTelemetry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpstreamFailureTelemetry {
+    pub endpoint_family: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_model: Option<String>,
     pub credential_id_hash: String,
@@ -1688,6 +1689,7 @@ mod tests {
         let value = serde_json::to_value(event).unwrap();
 
         assert_eq!(value["kind"], "upstream_failure_observed");
+        assert_eq!(value["failure"]["endpoint_family"], "chat_completions");
         assert_eq!(value["failure"]["failure_kind"], "rate_limited");
         assert_eq!(value["failure"]["failure_scope"], "credential");
         assert_eq!(value["failure"]["retryable"], true);
@@ -1954,6 +1956,7 @@ mod tests {
 
     fn test_failure_telemetry() -> UpstreamFailureTelemetry {
         UpstreamFailureTelemetry {
+            endpoint_family: "chat_completions".to_string(),
             public_model: Some("gpt-test".to_string()),
             credential_id_hash: "hash-a".to_string(),
             attempt: 2,

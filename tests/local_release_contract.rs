@@ -606,6 +606,36 @@ fn release_smoke_script_covers_local_mock_data_plane_and_operator_commands() {
 }
 
 #[test]
+fn release_smoke_expected_management_reports_cover_every_captured_report() {
+    let path = "scripts/release-smoke.sh";
+    let script = read_repo_file(path);
+    let expected_reports = script
+        .split("EXPECTED_MANAGEMENT_REPORTS=(")
+        .nth(1)
+        .and_then(|tail| tail.split("\n)").next())
+        .unwrap_or_else(|| panic!("{path} must declare EXPECTED_MANAGEMENT_REPORTS"));
+    let captured_reports = script
+        .lines()
+        .filter_map(|line| {
+            line.trim_start()
+                .strip_prefix("capture_management_report ")
+                .and_then(|tail| tail.split_whitespace().next())
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        !captured_reports.is_empty(),
+        "{path} must capture management reports for release-smoke verification"
+    );
+    for report in captured_reports {
+        assert!(
+            expected_reports.contains(&format!(r#""{report}""#)),
+            "{path} EXPECTED_MANAGEMENT_REPORTS must include captured report {report}"
+        );
+    }
+}
+
+#[test]
 fn release_smoke_script_covers_local_admission_and_upstream_503_failure_evidence() {
     let path = "scripts/release-smoke.sh";
     let script = read_repo_file(path);
@@ -1140,6 +1170,57 @@ fn production_smoke_refuses_repository_tmpdir_before_creating_output() {
         child_count, 0,
         "production smoke must refuse repository-local TMPDIR before creating output"
     );
+}
+
+#[test]
+fn operator_confidence_local_release_ready_record_is_public_and_bounded() {
+    let path = "docs/release-records/v0.2-local-release-ready.md";
+    assert!(Path::new(path).is_file(), "{path} must exist");
+
+    let record = read_repo_file(path);
+    for required in [
+        "Stop node: `v0.2_local_release_ready`",
+        &format!("Cargo package version: `{}`", env!("CARGO_PKG_VERSION")),
+        "M1-M4 operator confidence baseline",
+        "local CI: `pass`",
+        "release artifact build: `pass`",
+        "artifact shape check: `pass`",
+        "release smoke: `pass`",
+        "staged denylist: `pass`",
+        "public docs: `pass`",
+        "GitHub release publication: `not_run_by_design`",
+        "deployment pin smoke: `not_run_by_design`",
+        "Production smoke remains operator-run",
+        "No request-path retry, routing, endpoint conversion, model exposure, or credential lifecycle behavior changed for this stop node.",
+    ] {
+        assert!(
+            record.contains(required),
+            "{path} must contain bounded release-ready record token `{required}`"
+        );
+    }
+
+    for forbidden in [
+        "sk-",
+        "github_pat_",
+        "ghp_",
+        "http://",
+        "https://",
+        "/Users/",
+        "rtoc-gateway",
+        "hhhl",
+        "dc.",
+        "chat/room",
+        "Telegram",
+        "Discord",
+        "raw command log",
+        "artifact_sha",
+        "deployment transcript",
+    ] {
+        assert!(
+            !record.contains(forbidden),
+            "{path} must not contain private or over-specific release evidence `{forbidden}`"
+        );
+    }
 }
 
 #[test]

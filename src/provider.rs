@@ -44,6 +44,18 @@ pub enum EndpointKind {
     Generic,
 }
 
+impl EndpointKind {
+    pub fn family_code(self) -> &'static str {
+        match self {
+            Self::Models => "models",
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+            Self::Embeddings => "embeddings",
+            Self::Generic => "generic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestContext {
     pub endpoint: EndpointKind,

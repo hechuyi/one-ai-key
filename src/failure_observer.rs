@@ -150,6 +150,7 @@ fn upstream_failure_telemetry(
     let (directive, retry_decision, retry_decision_reason) =
         retry_decision_telemetry(&result.retry);
     crate::events::UpstreamFailureTelemetry {
+        endpoint_family: snapshot.endpoint.family_code().to_string(),
         public_model: snapshot.requested_model.clone(),
         credential_id_hash: short_hash(&snapshot.credential_id.0),
         attempt: snapshot.attempt,
@@ -395,6 +396,31 @@ mod tests {
 
         assert_eq!(telemetry.failure_source, "guarded_success_envelope");
         assert_eq!(telemetry.duplicate_charge_risk, "unknown");
+    }
+
+    #[test]
+    fn upstream_failure_telemetry_carries_endpoint_family_from_selection_snapshot() {
+        let result = TransitionResult {
+            mutation: StateMutation::Noop {
+                reason: crate::routing::FailureReason::Unknown,
+            },
+            retry: RetryDirective::ReturnCurrentError {
+                reason: RetryDecisionReason::FailureNotRetryable,
+            },
+            duplicate_charge_risk: DuplicateChargeRisk::None,
+            effective_deadline_remaining_ms: None,
+        };
+        let mut snapshot = snapshot();
+        snapshot.endpoint = EndpointKind::Responses;
+
+        let telemetry = upstream_failure_telemetry(
+            &snapshot,
+            &failure(),
+            FailureSource::UpstreamTransaction,
+            &result,
+        );
+
+        assert_eq!(telemetry.endpoint_family, "responses");
     }
 
     #[test]
