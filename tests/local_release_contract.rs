@@ -1172,6 +1172,71 @@ fn production_smoke_refuses_repository_tmpdir_before_creating_output() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn production_smoke_reports_json_when_check_artifact_write_fails() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|error| panic!("system time must be after epoch: {error}"))
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "one-ai-key-production-smoke-unwritable-{}-{unique}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&path);
+    fs::create_dir_all(&path)
+        .unwrap_or_else(|error| panic!("failed to create {}: {error}", path.display()));
+    let conflicting_artifact = path.join("public_liveness.json");
+    fs::create_dir_all(&conflicting_artifact).unwrap_or_else(|error| {
+        panic!(
+            "failed to create conflicting artifact dir {}: {error}",
+            conflicting_artifact.display()
+        )
+    });
+
+    let output = Command::new("scripts/production-smoke.sh")
+        .arg("--allow-production")
+        .env("ONE_AI_KEY_PUBLIC_BASE_URL", "http://127.0.0.1:1/v1")
+        .env("ONE_AI_KEY_MANAGEMENT_URL", "http://127.0.0.1:1")
+        .env(
+            "ONE_AI_KEY_CLIENT_TOKEN_ENV",
+            "ONE_AI_KEY_TEST_CLIENT_TOKEN",
+        )
+        .env(
+            "ONE_AI_KEY_MANAGEMENT_TOKEN_ENV",
+            "ONE_AI_KEY_TEST_MANAGEMENT_TOKEN",
+        )
+        .env("ONE_AI_KEY_TEST_CLIENT_TOKEN", "client-token-placeholder")
+        .env(
+            "ONE_AI_KEY_TEST_MANAGEMENT_TOKEN",
+            "management-token-placeholder",
+        )
+        .env("ONE_AI_KEY_PUBLIC_MODEL", "contract-test-model")
+        .env("ONE_AI_KEY_OUTPUT_DIR", &path)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run production smoke contract: {error}"));
+
+    let _ = fs::remove_dir_all(&path);
+
+    assert!(
+        !output.status.success(),
+        "production smoke must fail when an artifact cannot be written"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "production smoke artifact write failures must not print non-JSON stderr"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("stdout must be JSON, got {stdout:?}: {error}"));
+    assert_eq!(
+        value["reason_code"], "output_file_write_failed",
+        "production smoke must return a redacted structured refusal"
+    );
+}
+
 #[test]
 fn operator_confidence_local_release_ready_record_is_public_and_bounded() {
     let path = "docs/release-records/v0.2-local-release-ready.md";

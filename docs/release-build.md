@@ -152,7 +152,7 @@ deployment URLs, raw tokens, or a deployment host.
 9. Download the uploaded tarball and `.sha256` sidecar into a tempdir and verify
    the checksum from the uploaded sidecar. Confirm tag, Cargo version, asset
    filename, checksum filename, and release notes version match.
-10. Record the local release-ready stop node and the published asset
+10. Record the local release verification result and the published asset
     verification result. If a deployment host has not been intentionally updated
     by the operator, record `deployment_pin_smoke: not_run_by_design`.
 11. When an operator separately updates a gateway or NixOS deployment, pin the
@@ -181,8 +181,8 @@ The staged-path denylist is executable evidence. Human inspection of
 build output, runtime state, local config, database/log/key/token material,
 private scripts, `key-pool-router/`, and `AGENTS.md`. It also scans newly
 staged text for internal execution traces, long-form secret material, and
-promotional/injection residue. Product roadmaps, RFCs, ADRs, public stop cards,
-architecture notes, and operator documentation may be committed when they are
+promotional/injection residue. Product roadmaps, RFCs, ADRs, release
+verification records, architecture notes, and operator documentation may be committed when they are
 written as durable user or contributor documentation. Private coordination
 notes, one-off support records, deployment-local facts, raw traces, and
 assistant/process transcripts stay local and must be reduced into a public

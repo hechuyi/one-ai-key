@@ -51,6 +51,15 @@ resolve_existing_dir() {
   printf '%s' "${resolved}"
 }
 
+require_output_dir_writable() {
+  local path="$1"
+  local probe="${path}/.one-ai-key-production-smoke-write-test.$$"
+  if ! ( : > "${probe}" ) 2>/dev/null; then
+    fail_json "output_dir_not_writable" "ONE_AI_KEY_OUTPUT_DIR must be writable"
+  fi
+  rm -f "${probe}" 2>/dev/null || true
+}
+
 curl_config_escape() {
   local value="$1"
   value="${value//\\/\\\\}"
@@ -147,6 +156,7 @@ esac
 if ! mkdir -p "${OUTPUT_DIR}" 2>/dev/null; then
   fail_json "output_dir_create_failed" "failed to create production smoke output directory"
 fi
+require_output_dir_writable "${OUTPUT_DIR}"
 
 for required_command in curl jq; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
@@ -236,7 +246,7 @@ write_check() {
     FAILED=1
   fi
   local output="${OUTPUT_DIR}/${name}.json"
-  jq -n \
+  if ! ( jq -n \
     --arg check "${name}" \
     --arg status "${status_text}" \
     --arg reason_code "${reason_code}" \
@@ -248,7 +258,9 @@ write_check() {
       ok: $ok,
       http_status: $http_status,
       reason_code: $reason_code
-    }' > "${output}"
+    }' > "${output}" ) 2>/dev/null; then
+    fail_json "output_file_write_failed" "failed to write production smoke check artifact"
+  fi
   CHECK_FILES+=("${output}")
 }
 
@@ -318,7 +330,7 @@ if [[ "${FAILED}" -ne 0 ]]; then
 fi
 
 SUMMARY_PATH="${OUTPUT_DIR}/summary.json"
-jq -s \
+if ! ( jq -s \
   --arg status "${OVERALL_STATUS}" \
   --arg reason_code "${OVERALL_REASON}" \
   --arg model "${PUBLIC_MODEL}" \
@@ -342,7 +354,9 @@ jq -s \
         "complete URLs not recorded"
       ]
     }
-  }' "${CHECK_FILES[@]}" > "${SUMMARY_PATH}"
+  }' "${CHECK_FILES[@]}" > "${SUMMARY_PATH}" ) 2>/dev/null; then
+  fail_json "summary_write_failed" "failed to write production smoke summary"
+fi
 
 cat "${SUMMARY_PATH}"
 printf '\n'

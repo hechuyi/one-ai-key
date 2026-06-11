@@ -4,7 +4,7 @@
 
 one-ai-key is a personal AI account and API key management gateway. It exposes OpenAI-compatible and named-pool HTTP forwarding endpoints while managing upstream providers, credential pools, credential lifecycle state, routing policy, and upstream-specific failure semantics.
 
-The project deliberately keeps the first implementation backend-only. A future UI should call management APIs; it should not share routing internals or read credential storage directly.
+The project deliberately stays backend-only. Any UI should call management APIs; it should not share routing internals or read credential storage directly.
 
 ## Layers
 
@@ -90,20 +90,21 @@ The classifier has three internal stages:
 
 Provider-specific behavior should enter through typed adaptation rules, not by parsing free-form upstream messages on the hot path. Rule config distinguishes omitted fields from explicit empty lists: omitted fields inherit defaults, while empty lists disable that rule set. Reusable top-level `policy_profiles` hold structured error rules that pools can reference and locally override; resolution still compiles one effective classifier per channel before runtime forwarding starts. Adaptation rule ids must be unique inside each profile, inside each pool override list, and after profile and pool rules are merged. Matchers must be non-empty. Config resolution rejects unsupported adaptation action combinations, not just unsupported scopes: any rule that changes `kind` or `primary_scope` must provide both fields and the resulting `(FailureKind, FailureScope)` pair must be implemented by the runtime state machine. Reserved or non-state-backed scopes such as `account`, `deployment`, `provider_adapter`, and `client_token` must fail config resolution until corresponding runtime state, management projection, and transitions exist. Management APIs expose the active rule set and rule provenance read-only through a management projection; proxy, routing, and pool code do not inspect policy profile storage or source metadata. Changing rules at runtime belongs in a later configuration persistence layer.
 
-Phase 1 relay semantics are limited to typed classifier inputs. `relay_profile` has three values: `official_openai` keeps the default OpenAI-compatible assumption that bare `401`/`403` means selected-credential authentication failure; `generic_relay` treats bare `401`/`403` as request-only client errors unless structured invalid-key evidence is present; `untrusted_relay` uses the same conservative bare-auth handling as `generic_relay` and keeps same-request retry opt-in for rate-limit cases. Across all three profiles, structured invalid-key evidence remains credential-scoped auth failure, bare `429` remains credential-scoped rate limiting, code-less top-level error envelopes remain request-only client errors, and structured quota evidence is durable credential quota exhaustion only when `balance_scope` is `credential`.
+Relay semantics are limited to typed classifier inputs. `relay_profile` has three values: `official_openai` keeps the default OpenAI-compatible assumption that bare `401`/`403` means selected-credential authentication failure; `generic_relay` treats bare `401`/`403` as request-only client errors unless structured invalid-key evidence is present; `untrusted_relay` uses the same conservative bare-auth handling as `generic_relay` and keeps same-request retry opt-in for rate-limit cases. Across all three profiles, structured invalid-key evidence remains credential-scoped auth failure, bare `429` remains credential-scoped rate limiting, code-less top-level error envelopes remain request-only client errors, and structured quota evidence is durable credential quota exhaustion only when `balance_scope` is `credential`.
 
-`balance_scope` defaults to `credential`. `balance_scope: channel` means selected-channel transient suppression: structured relay balance evidence marks only the channel selected for the failed attempt as cooling down or suppressed, using runtime channel health state and bounded cooldown metadata. It never writes durable credential quota exhaustion, never suppresses all channels that share the same account, provider, or credential set, and never promotes account/provider/credential-set failure domains into balance suppression. `account`, `provider`, `credential_set`, and `client_token` balance scopes are rejected because their runtime state machines and management projections are outside Phase 1B. Error adaptation matchers are restricted to structured status/code/limit-type evidence. Free-form upstream message contains/regex matchers are not supported and must fail config resolution instead of being ignored or evaluated on the request path.
+`balance_scope` defaults to `credential`. `balance_scope: channel` means selected-channel transient suppression: structured relay balance evidence marks only the channel selected for the failed attempt as cooling down or suppressed, using runtime channel health state and bounded cooldown metadata. It never writes durable credential quota exhaustion, never suppresses all channels that share the same account, provider, or credential set, and never promotes account/provider/credential-set failure domains into balance suppression. `account`, `provider`, `credential_set`, and `client_token` balance scopes are rejected because their runtime state machines and management projections are not part of the current product surface. Error adaptation matchers are restricted to structured status/code/limit-type evidence. Free-form upstream message contains/regex matchers are not supported and must fail config resolution instead of being ignored or evaluated on the request path.
 
 When every scoped route target has been excluded by active selected-channel cooldown after client-token scope, configured enablement, and route candidate limits are applied, route planning fails closed with an OpenAI-compatible local error using `code: no_route_candidate`. Provider/account soft cooling is different: it is skipped while normal or degraded candidates remain, but it can serve as the final route state when no better candidate exists. Temporary credential cooldown follows the same last-resort admission pattern, while expired, quota-exhausted, disabled, or absent credentials remain hard `no_available_credentials` blockers. The error exposes only redacted reason classes such as `channel_cooling_down`, `provider_cooling_down`, or `credential_cooling_down`; it must not include upstream bodies, credentials, token material, or absolute source paths. Configured-disabled providers, accounts, and channels remain excluded, and runtime `Disabled` channel health remains authoritative: automatic relay-balance transitions, cooldown expiry, and success recovery do not re-enable disabled/configured-disabled resources.
 
-Phase 1B stops at selected-channel transient suppression. Phase 2 retry
-telemetry/retry-pressure counters and Phase 3 guarded-success 2xx
-classification are separate layers on the proxy path. Phase 4 response-filter
-lifecycle handling is inside the boundary only for explicit pre-commit rejecting
-actions; response-filter events and alerts remain observability-only.
+Selected-channel transient suppression is deliberately narrower than
+account/provider/credential-set balance suppression. Retry telemetry,
+guarded-success 2xx classification, and response-filter lifecycle handling are
+separate proxy-path responsibilities. Response-filter lifecycle handling is
+inside the boundary only for explicit pre-commit rejecting actions;
+response-filter events and alerts remain observability-only.
 
-Phase 2 adds observability and hard bounds to the existing retry boundary
-without broadening which responses are classified as failures. Every
+Retry observability adds hard bounds to the existing retry boundary without
+broadening which responses are classified as failures. Every
 same-request credential retry and route-target retry uses the same attempt-state
 path and emits a management `retry_decision` event containing `request_id`,
 `public_model`, `channel_id`, `credential_id_hash`, `attempt`,
@@ -122,7 +123,7 @@ means no completed upstream transaction is suspected or no retry is attempted,
 and `unknown` means the gateway cannot prove whether the upstream charged before
 failure. The current runtime does not emit a separate `known_no_charge` state.
 Retry pressure is exposed through bounded recent counters and a configured
-capacity in management runtime state. Phase 3 reuses this retry boundary for
+capacity in management runtime state. The guarded-success path reuses this retry boundary for
 guarded body-bearing HTTP 2xx responses: the proxy performs a bounded
 pre-output peek, classifies only top-level structured JSON/SSE error envelopes,
 emits `failure_source=guarded_success_envelope` for classified attempts, and
@@ -145,7 +146,7 @@ Current states:
 - `Expired { reason }`
 - `Disabled { reason }`; manual management state that removes a credential from selection until an explicit enable command.
 
-Future states should be added here, not embedded in proxy code. Likely additions:
+New lifecycle states should be added here, not embedded in proxy code. Candidate extensions must first define their routing effect, management projection, and redaction boundary:
 
 - `BudgetExhausted { reset_at }`
 
@@ -193,14 +194,13 @@ Channel ids are normalized and validated during config resolution. `default_pool
 
 Every resolved channel carries a stable `config_generation` derived from the effective channel configuration after provider/account inheritance. Request selection snapshots and management channel responses expose this generation. It is separate from selector generation: config generation changes when channel configuration changes; selector generation changes when explicit credential selector mutations change the selector-visible state kind. Time-derived cooldown expiry is evaluated from monotonic deadlines and materialized lazily by the pool selector; it does not append a management event or advance selector generation by itself.
 
-Planned storage migration:
+Storage authority stays split by resource kind:
 
-1. Keep YAML for service settings and provider definitions.
-2. Use SQLite-backed credential bootstrap and management credential import for local deployment.
-3. Persist management-driven credential lifecycle snapshots behind the same credential store boundary. In writable-store mode, those snapshots become startup authority for durable credential state; JSONL remains audit/display for credential lifecycle. When snapshot authority is unavailable, startup can still replay persisted management events as the compatibility source for credential lifecycle and channel enable/disable state.
-4. Add a registry store boundary for provider, account, channel, model-route, policy-profile, and routing-profile configuration writes. Registry writes should apply typed commands in a transaction, produce a full `RegistryDocument`, and resolve that document successfully before the write is accepted. The first local adapter should be SQLite; the boundary should not be named around SQLite.
-5. Promote upstream credentials from secret rows plus selector snapshots into explicit credential resources with import batches, redacted source lineage, structured transition evidence, and optional validation probe summaries. This resource model still belongs behind `CredentialStore`; registry storage should only reference credential-set ids.
-6. Add PostgreSQL behind the same repository boundary only if multi-process deployment, concurrent writers, or remote database operation needs it.
+1. YAML owns service settings and bootstrap provider definitions.
+2. SQLite-backed credential stores own local credential bootstrap, imports, lifecycle snapshots, import batches, redacted source lineage, and optional validation probe summaries.
+3. Registry stores own provider, account, channel, model-route, policy-profile, and routing-profile configuration writes. Registry writes apply typed commands in a transaction, produce a full `RegistryDocument`, and resolve that document successfully before the write is accepted.
+4. JSONL management events are audit/display data and compatibility replay where explicitly documented; they are not the request-path lifecycle authority when a writable credential store is present.
+5. PostgreSQL or other remote stores belong behind the same repository boundaries only if multi-process deployment, concurrent writers, or remote database operation needs them.
 
 ### Management API Layer
 
@@ -308,7 +308,7 @@ Health endpoints intentionally answer different questions:
 
 `PUT /management/registry/policy-profiles/{id}` persists a complete desired policy profile through the registry store. The payload uses the same typed `PolicyProfileConfig` schema as bootstrap configuration, including ordered, named, enableable error adaptation rules and probe-result actions. The resolver compiles those rules before commit acceptance, so unsupported lifecycle action combinations such as account-scoped rate limits are rejected transactionally. Probe-result actions are resolved once per channel alongside the error classifier: by default `invalid` maps to `expire`, `success` maps to `restore`, and transient or ambiguous outcomes remain `noop`; a profile may opt selected outcomes into runtime `cooldown` with a bounded `cooldown_seconds`, or map credential-scoped stable quota evidence to durable `quota_exhaust`. Provider-level and unsupported-model probe outcomes cannot be configured to expire or quota-exhaust individual credentials. A successful response includes the committed registry version and reports `runtime_reload_required: true`; `/management/policy-profiles` continues to show the active in-memory policy catalog until reload or restart.
 
-Policy inspection uses the existing management surfaces. `/management/policy-profiles` and `/management/policy-profiles/{id}` show the resolved policy profile catalog, while `/management/channels/{id}/error-rules` shows the effective per-channel classifier after profile inheritance and channel-local overrides, including the resolved `relay_profile`, `balance_scope`, structured matchers, actions, and provenance. There is no separate Phase 1A management endpoint for relay profiles.
+Policy inspection uses the existing management surfaces. `/management/policy-profiles` and `/management/policy-profiles/{id}` show the resolved policy profile catalog, while `/management/channels/{id}/error-rules` shows the effective per-channel classifier after profile inheritance and channel-local overrides, including the resolved `relay_profile`, `balance_scope`, structured matchers, actions, and provenance. There is no separate management endpoint just for relay profiles.
 
 `PUT /management/registry/routing-profiles/{id}` persists a complete desired routing profile through the registry store. The payload uses the same typed `RoutingProfileConfig` schema as bootstrap configuration: key selection strategy, default credential cooldown, same-request credential retry budget, and route-target retry. The resolver validates policy coherence before commit acceptance, for example rejecting disabled same-request retry with a nonzero retry budget. A successful response includes the committed registry version and reports `runtime_reload_required: true`; `/management/routing-profiles` continues to show the active in-memory routing policy catalog until reload or restart.
 
@@ -328,18 +328,18 @@ Set-scoped lifecycle command endpoints include `expire`, `quota-exhaust`, `resto
 
 Channel-scoped credential mutation endpoints expose the same lifecycle command vocabulary for compatibility with older management clients. They delegate to the same command executor and durable credential-store path as set-scoped mutations, so `quota-exhaust` has identical state, event, redaction, and restore semantics regardless of which management path is used.
 
-Future endpoints should stay resource-oriented, for example:
+New endpoints should stay resource-oriented. For example, credential import and credential lifecycle operations should remain set-scoped or resource-scoped rather than being hidden behind route-specific shortcuts:
 
 - `POST /management/pools/{pool}/credentials/import`
 - `PATCH /management/credentials/{id}`
 
-Future registry-write endpoints must distinguish configured enablement from transient runtime health. A configured channel disable is a persistent registry property that survives restart and should be validated with the full registry document. A runtime health disable is an operational state transition used to remove a currently running channel from selection. These must not share an ambiguous command path once persistent channel CRUD exists.
+Registry-write endpoints must distinguish configured enablement from transient runtime health. A configured channel disable is a persistent registry property that survives restart and should be validated with the full registry document. A runtime health disable is an operational state transition used to remove a currently running channel from selection. These must not share an ambiguous command path.
 
 ## Frontend Boundary
 
 The frontend should be a separate app or separate crate/package. It should use only management APIs and never call routing internals. The backend remains usable headlessly from CLI, curl, or other clients.
 
-## Current Verification
+## Verification Surface
 
 The current backend has unit tests for:
 
@@ -364,7 +364,7 @@ The current backend has unit tests for:
 - explicit production and management credential state mutations advancing selector generation when they change selector-visible state kind.
 - manual cooldown reset clearing only `CoolingDown` credentials while rejecting `Expired` credentials.
 - manual disable/enable state, including set-scoped management APIs, disabled-state filtering, selector generation movement, and replay of persisted disabled/enabled events.
-- Phase 1A relay profile parsing and classifier semantics for `official_openai`, `generic_relay`, and `untrusted_relay`.
+- relay profile parsing and classifier semantics for `official_openai`, `generic_relay`, and `untrusted_relay`.
 - `balance_scope` defaulting to `credential`, `channel` applying selected-channel transient suppression without durable credential quota exhaustion, and account/provider/credential-set/client-token balance scopes being rejected.
 - all-target selected-channel cooldown failing closed as `no_route_candidate`, with routing preview and alerts exposing only redacted reason classes.
 - unsupported free-form error message matcher fields being rejected, with request-path lifecycle decisions limited to structured status/code/limit-type evidence.

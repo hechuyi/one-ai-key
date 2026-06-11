@@ -6,6 +6,7 @@ INTERNAL_TRACE_REGEX='(For agentic workers|[Aa]gentic workers?|[Ss]ubagents?|[Ss
 SECRET_MATERIAL_REGEX='(sk-[A-Za-z0-9_-]{20,}|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9_]{20,}|-----BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)'
 PROMO_INJECTION_REGEX='(邀请码|拉群|备用网址|欢迎加入|购买套餐|低价[[:space:]]*API|公益.*换[[:space:]]*key)'
 CONTENT_DENY_REGEX="(${INTERNAL_TRACE_REGEX}|${SECRET_MATERIAL_REGEX}|${PROMO_INJECTION_REGEX})"
+PUBLIC_DOC_ADDED_DENY_REGEX="(${CONTENT_DENY_REGEX}|[Ss]top[ -][Cc]ard|checkpoint evidence|artifact_sha|deployment_pin_evidence|operator_contract_evidence|raw command log|deployment transcript)"
 PUBLIC_PLAN_DENY_REGEX="(${CONTENT_DENY_REGEX}|[Ss]top[ -][Cc]ard|Task [0-9]+ checkpoint|checkpoint evidence|Implementation Progress|Propagation audit|Cold scan result|Current status|artifact_sha|published_asset_verification|operator_contract_evidence|test_evidence|non_empty_filtered_test_evidence|local_ci_result|release_artifact_result|release_smoke_result|deployment_boundary_result|deployment_pin_evidence|production_smoke_result:[[:space:]]*\`pass|https://ai\.|hhhl|rtoc-gateway|dc\.hhhl|chat/room|Telegram|Discord|加入|购买|套餐|站长|充值|推广|广告|备用网址)"
 
 is_denied_path() {
@@ -21,6 +22,16 @@ is_denied_added_line() {
 is_denied_public_plan_line() {
   local line=$1
   [[ "${line}" =~ ${PUBLIC_PLAN_DENY_REGEX} ]]
+}
+
+is_public_doc_path() {
+  local path=$1
+  [[ "${path}" == "README.md" || "${path}" =~ ^docs/.*\.md$ ]]
+}
+
+is_denied_public_doc_added_line() {
+  local line=$1
+  [[ "${line}" =~ ${PUBLIC_DOC_ADDED_DENY_REGEX} ]]
 }
 
 check_public_plans() {
@@ -59,6 +70,9 @@ run_self_test() {
   is_denied_added_line "token = sk-abcdefghijklmnopqrstuvwxyz123456" || failed=1
   is_denied_added_line "欢迎加入测试群" || failed=1
   is_denied_added_line "This roadmap defines a public operator contract." && failed=1
+  is_denied_public_doc_added_line "Stop Card: internal checkpoint" || failed=1
+  is_denied_public_doc_added_line "artifact_sha: abc123" || failed=1
+  is_denied_public_doc_added_line "This release verification record is public." && failed=1
   is_denied_public_plan_line "Task 7 checkpoint evidence:" || failed=1
   is_denied_public_plan_line "deployment_boundary_result: pass" || failed=1
   is_denied_public_plan_line "https://example.invalid/chat/room/test" || failed=1
@@ -89,8 +103,17 @@ while IFS= read -r path; do
   fi
 done < <(git diff --cached --name-only)
 
+current_diff_path=""
 while IFS= read -r line; do
   case "${line}" in
+    '+++ b/'*)
+      current_diff_path="${line#+++ b/}"
+      continue
+      ;;
+    '+++ /dev/null')
+      current_diff_path=""
+      continue
+      ;;
     '+++'* | '---'* | '@@'* | 'diff --git'* | 'index '* | 'new file mode '* | 'deleted file mode '*)
       continue
       ;;
@@ -98,6 +121,9 @@ while IFS= read -r line; do
       added=${line:1}
       if is_denied_added_line "${added}"; then
         violations+=("content:${added:0:160}")
+      fi
+      if is_public_doc_path "${current_diff_path}" && is_denied_public_doc_added_line "${added}"; then
+        violations+=("public-doc:${current_diff_path}:${added:0:160}")
       fi
       ;;
   esac
