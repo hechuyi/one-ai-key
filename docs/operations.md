@@ -481,9 +481,11 @@ cooldown, empty credential pools, runtime-unavailable state, unknown channels,
 and route candidate-limit exclusion. Provider/account `Retry-After` cooldown is
 a soft suppression: normal and degraded targets are preferred first, but a
 provider-cooling target can still be attempted as the last-resort route state.
-Credential cooldown, credential expiration, and credential quota exhaustion are
-credential lifecycle states; request-only schema, endpoint-family, model-scope,
-or client-error failures should not mutate route availability.
+Temporary credential cooldown is also a soft last-resort state when every
+otherwise valid target lacks a non-cooling credential. Credential expiration,
+credential quota exhaustion, disabled credentials, and absent credentials remain
+hard lifecycle blockers; request-only schema, endpoint-family, model-scope, or
+client-error failures should not mutate route availability.
 
 If a model was recently discovered or staged, confirm that the relevant
 publication path completed. For management model-discovery/sync workflows,

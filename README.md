@@ -240,6 +240,10 @@ Default routing behavior is conservative:
   normal and degraded candidates win first, but a provider-cooling target may
   still serve as the last available candidate instead of producing an immediate
   local `no_route_candidate`;
+- credential cooldown is also admitted only as a last resort: normal,
+  degraded, and provider-cooling route targets win first, but a route whose
+  credentials are only temporarily cooling down may still be tried when every
+  otherwise valid target is in that state;
 - streaming, non-replayable, partial-output, embeddings, named-pool, unknown
   endpoint, and `/v1/models` paths do not transparently fallback;
 - duplicate-charge risk is recorded as telemetry when retrying after an upstream
@@ -247,11 +251,12 @@ Default routing behavior is conservative:
 
 `no_route_candidate` is a local admission failure, not an upstream response. It
 means the compiled runtime found no usable candidate after model scope, channel
-scope, configured enablement, hard channel cooldown, credential availability,
-and candidate-limit checks. Provider/account soft cooldown is intentionally
-different: it is skipped while better candidates remain, but it may be selected
-as a last-resort first upstream attempt when it is the only otherwise valid
-route state.
+scope, configured enablement, hard channel cooldown, hard credential
+availability, and candidate-limit checks. Provider/account soft cooldown and
+temporary credential cooldown are intentionally different: they are skipped
+while better candidates remain, but one of those soft states may be selected as
+a last-resort first upstream attempt when it is the only otherwise valid route
+state.
 
 Relay behavior is configured through structured evidence. The built-in
 `relay_profile` values are `official_openai`, `generic_relay`, and

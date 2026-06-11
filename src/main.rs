@@ -33715,6 +33715,232 @@ model_routes:
     }
 
     #[tokio::test]
+    async fn credential_cooling_down_single_route_target_is_used_as_last_resort() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_for_handler = hits.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let hits = hits_for_handler.clone();
+                async move {
+                    let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if hit == 1 {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [(header::RETRY_AFTER, "30")],
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "rate_limit_exceeded",
+                                    "message": "slow down"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "last-resort-ok"}}
+                        ]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let mut config = test_config_with_api_base(&api_base);
+        config.model_routes = HashMap::from([priority_route("gpt-cooling-last-resort", ["test"])]);
+        let state = AppState::new(config.resolve().unwrap()).unwrap();
+
+        let first = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-cooling-last-resort","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        {
+            let channel = state.channels.get("test").unwrap();
+            let pool = channel.pool.lock().await;
+            let snapshot = pool.snapshot();
+            assert_eq!(snapshot.available_credentials, 0);
+            assert_eq!(snapshot.cooling_down_credentials, 1);
+        }
+
+        let second = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-cooling-last-resort","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.status(), StatusCode::OK);
+        let body = to_bytes(second.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"].as_str(),
+            Some("last-resort-ok")
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn credential_cooling_down_route_target_is_skipped_when_available_fallback_exists() {
+        let primary_hits = Arc::new(AtomicU64::new(0));
+        let primary_hits_for_handler = primary_hits.clone();
+        let primary = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let primary_hits = primary_hits_for_handler.clone();
+                async move {
+                    primary_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "primary",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "primary"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let fallback_hits = Arc::new(AtomicU64::new(0));
+        let fallback_hits_for_handler = fallback_hits.clone();
+        let fallback = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fallback",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "fallback-ok"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let primary_base = spawn_upstream(primary).await;
+        let fallback_base = spawn_upstream(fallback).await;
+        let config = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "test-client".to_string(),
+                token: fixture_client_token(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: fixture_admin_token(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path: None,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: TimeoutConfig::default(),
+            routing: crate::config::RoutingConfig::default(),
+            default_pool: Some("primary".to_string()),
+            providers: HashMap::new(),
+            accounts: HashMap::new(),
+            credential_sets: credential_sets_from_files([
+                ("primary-credentials", temp_keys_file("primary-key\n")),
+                ("fallback-credentials", temp_keys_file("fallback-key\n")),
+            ]),
+            model_routes: HashMap::from([priority_route(
+                "gpt-cooling-fallback",
+                ["primary", "fallback"],
+            )]),
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: std::collections::HashMap::from([(
+                "default-routing".to_string(),
+                crate::config::RoutingProfileConfig {
+                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry:
+                        crate::config::SameRequestCredentialRetryConfig {
+                            enabled: false,
+                            max_retries: 0,
+                        },
+                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            pools: HashMap::from([
+                (
+                    "primary".to_string(),
+                    openai_pool(primary_base, "primary-credentials"),
+                ),
+                (
+                    "fallback".to_string(),
+                    openai_pool(fallback_base, "fallback-credentials"),
+                ),
+            ]),
+        };
+        let state = AppState::new(config.resolve().unwrap()).unwrap();
+        {
+            let channel = state.channels.get("primary").unwrap();
+            let credential_id = {
+                let pool = channel.pool.lock().await;
+                pool.credential_snapshots()[0].id.clone()
+            };
+            channel.pool.lock().await.apply_credential_cooldown_until(
+                &CredentialId(credential_id),
+                Instant::now() + Duration::from_secs(30),
+                "test cooldown",
+            );
+        }
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-cooling-fallback","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"].as_str(),
+            Some("fallback-ok")
+        );
+    }
+
+    #[tokio::test]
     async fn openai_compatible_retries_only_one_opted_in_credential_in_same_request() {
         let upstream_hits = Arc::new(AtomicU64::new(0));
         let upstream_hits_for_handler = upstream_hits.clone();

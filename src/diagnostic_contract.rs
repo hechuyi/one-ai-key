@@ -147,12 +147,22 @@ const CONTRACTS: &[ContractEntry] = &[
         action: SafeAction::FailuresTail,
     },
     ContractEntry {
+        reason_code: "credential_cooling_down",
+        blocking_domain: "target",
+        action: SafeAction::FailuresTail,
+    },
+    ContractEntry {
         reason_code: "degraded_last_resort",
         blocking_domain: "target",
         action: SafeAction::FailuresTail,
     },
     ContractEntry {
         reason_code: "provider_cooling_down_last_resort",
+        blocking_domain: "target",
+        action: SafeAction::FailuresTail,
+    },
+    ContractEntry {
+        reason_code: "credential_cooling_down_last_resort",
         blocking_domain: "target",
         action: SafeAction::FailuresTail,
     },
@@ -239,8 +249,10 @@ pub const STAGE2_REASON_CODES: &[&str] = &[
     "unknown_channel",
     "runtime_unavailable",
     "provider_cooling_down",
+    "credential_cooling_down",
     "degraded_last_resort",
     "provider_cooling_down_last_resort",
+    "credential_cooling_down_last_resort",
     "unsupported_endpoint_family",
     "endpoint_family_unsupported",
     "endpoint_family_mismatch",

@@ -86,11 +86,13 @@ pub enum RoutePreviewReason {
     ChannelDisabled,
     ChannelCoolingDown,
     ProviderCoolingDown,
+    CredentialCoolingDown,
     NoAvailableCredentials,
     RuntimeUnavailable,
     ChannelDegraded,
     DegradedLastResort,
     ProviderCoolingDownLastResort,
+    CredentialCoolingDownLastResort,
     UnknownChannel,
     CandidateLimit,
 }
@@ -103,12 +105,16 @@ impl RoutePreviewReason {
             RoutePreviewReason::ChannelDisabled => "channel_disabled",
             RoutePreviewReason::ChannelCoolingDown => "channel_cooling_down",
             RoutePreviewReason::ProviderCoolingDown => "provider_cooling_down",
+            RoutePreviewReason::CredentialCoolingDown => "credential_cooling_down",
             RoutePreviewReason::NoAvailableCredentials => "no_available_credentials",
             RoutePreviewReason::RuntimeUnavailable => "runtime_unavailable",
             RoutePreviewReason::ChannelDegraded => "channel_degraded",
             RoutePreviewReason::DegradedLastResort => "degraded_last_resort",
             RoutePreviewReason::ProviderCoolingDownLastResort => {
                 "provider_cooling_down_last_resort"
+            }
+            RoutePreviewReason::CredentialCoolingDownLastResort => {
+                "credential_cooling_down_last_resort"
             }
             RoutePreviewReason::UnknownChannel => "unknown_channel",
             RoutePreviewReason::CandidateLimit => "candidate_limit",
@@ -159,6 +165,7 @@ pub enum ChannelRouteState {
     /// Provider/account failure-domain soft cooldowns are normalized to this
     /// state before route planning.
     ProviderCoolingDown,
+    CredentialCoolingDown,
     CoolingDown,
     Degraded,
     Disabled,
@@ -182,11 +189,12 @@ fn route_state_severity(state: ChannelRouteState) -> u8 {
         ChannelRouteState::Available => 0,
         ChannelRouteState::Degraded => 1,
         ChannelRouteState::ProviderCoolingDown => 2,
-        ChannelRouteState::RuntimeUnavailable => 3,
-        ChannelRouteState::CoolingDown => 4,
-        ChannelRouteState::NoAvailableCredentials => 5,
-        ChannelRouteState::Disabled => 6,
-        ChannelRouteState::UnknownChannel => 7,
+        ChannelRouteState::CredentialCoolingDown => 3,
+        ChannelRouteState::RuntimeUnavailable => 4,
+        ChannelRouteState::CoolingDown => 5,
+        ChannelRouteState::NoAvailableCredentials => 6,
+        ChannelRouteState::Disabled => 7,
+        ChannelRouteState::UnknownChannel => 8,
     }
 }
 
@@ -370,14 +378,18 @@ pub fn route_preview_reason_is_hard_blocker(reason: RoutePreviewReason) -> bool 
 pub fn route_preview_reason_is_soft_suppression(reason: RoutePreviewReason) -> bool {
     matches!(
         reason,
-        RoutePreviewReason::ChannelDegraded | RoutePreviewReason::ProviderCoolingDown
+        RoutePreviewReason::ChannelDegraded
+            | RoutePreviewReason::ProviderCoolingDown
+            | RoutePreviewReason::CredentialCoolingDown
     )
 }
 
 pub fn route_preview_reason_is_last_resort(reason: RoutePreviewReason) -> bool {
     matches!(
         reason,
-        RoutePreviewReason::DegradedLastResort | RoutePreviewReason::ProviderCoolingDownLastResort
+        RoutePreviewReason::DegradedLastResort
+            | RoutePreviewReason::ProviderCoolingDownLastResort
+            | RoutePreviewReason::CredentialCoolingDownLastResort
     )
 }
 
@@ -492,6 +504,11 @@ pub fn preview_route(input: RoutePreviewInput<'_>) -> RoutePreview {
                             .reasons
                             .push(RoutePreviewReason::ProviderCoolingDown);
                     }
+                    Some(ChannelRouteState::CredentialCoolingDown) => {
+                        candidates[index]
+                            .reasons
+                            .push(RoutePreviewReason::CredentialCoolingDown);
+                    }
                     _ => {}
                 }
                 continue;
@@ -506,6 +523,11 @@ pub fn preview_route(input: RoutePreviewInput<'_>) -> RoutePreview {
                     candidates[index]
                         .reasons
                         .push(RoutePreviewReason::ProviderCoolingDownLastResort);
+                }
+                Some(ChannelRouteState::CredentialCoolingDown) => {
+                    candidates[index]
+                        .reasons
+                        .push(RoutePreviewReason::CredentialCoolingDownLastResort);
                 }
                 _ => {}
             }
@@ -556,12 +578,14 @@ enum RouteAdmissionTier {
     Available,
     Degraded,
     ProviderAccountCooling,
+    CredentialCooling,
 }
 
 fn route_state_admission_tier(state: Option<&ChannelRouteState>) -> RouteAdmissionTier {
     match state {
         Some(ChannelRouteState::Degraded) => RouteAdmissionTier::Degraded,
         Some(ChannelRouteState::ProviderCoolingDown) => RouteAdmissionTier::ProviderAccountCooling,
+        Some(ChannelRouteState::CredentialCoolingDown) => RouteAdmissionTier::CredentialCooling,
         _ => RouteAdmissionTier::Available,
     }
 }
@@ -675,6 +699,10 @@ mod tests {
             RoutePreviewReason::ProviderCoolingDownLastResort.as_str(),
             "provider_cooling_down_last_resort"
         );
+        assert_eq!(
+            RoutePreviewReason::CredentialCoolingDownLastResort.as_str(),
+            "credential_cooling_down_last_resort"
+        );
     }
 
     #[test]
@@ -697,6 +725,7 @@ mod tests {
         for reason in [
             RoutePreviewReason::ChannelDegraded,
             RoutePreviewReason::ProviderCoolingDown,
+            RoutePreviewReason::CredentialCoolingDown,
         ] {
             assert!(!route_preview_reason_is_hard_blocker(reason));
             assert!(route_preview_reason_is_soft_suppression(reason));
@@ -706,6 +735,7 @@ mod tests {
         for reason in [
             RoutePreviewReason::DegradedLastResort,
             RoutePreviewReason::ProviderCoolingDownLastResort,
+            RoutePreviewReason::CredentialCoolingDownLastResort,
         ] {
             assert!(!route_preview_reason_is_hard_blocker(reason));
             assert!(!route_preview_reason_is_soft_suppression(reason));
@@ -1272,6 +1302,79 @@ mod tests {
             preview.candidates[0].reasons,
             vec![RoutePreviewReason::ProviderCoolingDownLastResort]
         );
+    }
+
+    #[test]
+    fn credential_cooling_down_target_remains_last_resort_when_no_available_target_exists() {
+        let route = route_with_targets(vec![("credential-cooling", 0, 1)]);
+        let states = HashMap::from([(
+            ChannelId("credential-cooling".to_string()),
+            ChannelRouteState::CredentialCoolingDown,
+        )]);
+
+        let preview = preview_route(RoutePreviewInput {
+            request_id: "req-credential-cooling".to_string(),
+            registry_generation: 1,
+            public_model: Some("gpt-x".to_string()),
+            route: Some(&route),
+            channel_states: &states,
+            allowed_channels: &[],
+            candidate_limit: 16,
+        });
+
+        assert_eq!(preview.selected_target_index, Some(0));
+        assert!(preview.candidates[0].included);
+        assert_eq!(
+            preview.candidates[0].reasons,
+            vec![RoutePreviewReason::CredentialCoolingDownLastResort]
+        );
+        let summary = route_admission_summary(&preview);
+        assert_eq!(summary.status, RouteAdmissionStatus::LastResort);
+        assert_eq!(summary.reason_code, "credential_cooling_down_last_resort");
+        assert_eq!(
+            summary.last_resort_reason,
+            Some("credential_cooling_down_last_resort")
+        );
+    }
+
+    #[test]
+    fn route_plan_prefers_provider_cooling_targets_over_credential_cooling_targets() {
+        let route = route_with_targets(vec![
+            ("credential-cooling", 0, 1),
+            ("provider-cooling", 1, 1),
+        ]);
+        let channel_states = HashMap::from([
+            (
+                ChannelId("credential-cooling".to_string()),
+                ChannelRouteState::CredentialCoolingDown,
+            ),
+            (
+                ChannelId("provider-cooling".to_string()),
+                ChannelRouteState::ProviderCoolingDown,
+            ),
+        ]);
+
+        let preview = preview_route(RoutePreviewInput {
+            request_id: "req-credential-cooling-suppressed".to_string(),
+            registry_generation: 7,
+            public_model: Some("gpt-x".to_string()),
+            route: Some(&route),
+            channel_states: &channel_states,
+            allowed_channels: &[],
+            candidate_limit: 16,
+        });
+
+        assert!(!preview.candidates[0].included);
+        assert_eq!(
+            preview.candidates[0].reasons,
+            vec![RoutePreviewReason::CredentialCoolingDown]
+        );
+        assert!(preview.candidates[1].included);
+        assert_eq!(
+            preview.candidates[1].reasons,
+            vec![RoutePreviewReason::ProviderCoolingDownLastResort]
+        );
+        assert_eq!(preview.selected_target_index, Some(1));
     }
 
     #[test]

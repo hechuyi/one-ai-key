@@ -624,6 +624,7 @@ fn record_route_admission_denied(
                             reason,
                             RoutePreviewReason::DegradedLastResort
                                 | RoutePreviewReason::ProviderCoolingDownLastResort
+                                | RoutePreviewReason::CredentialCoolingDownLastResort
                         )
                     })
             }),
@@ -910,7 +911,8 @@ fn route_state_unavailable_response(
     let (status, code, message) = match state {
         ChannelRouteState::Available
         | ChannelRouteState::Degraded
-        | ChannelRouteState::ProviderCoolingDown => return None,
+        | ChannelRouteState::ProviderCoolingDown
+        | ChannelRouteState::CredentialCoolingDown => return None,
         ChannelRouteState::CoolingDown => unreachable!("cooling down handled above"),
         ChannelRouteState::Disabled => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -947,6 +949,12 @@ fn route_state_unavailable_response_for_attempt(
         && route_target_available
     {
         return Some(no_route_candidate_response(&["provider_cooling_down"]));
+    }
+    if matches!(state, ChannelRouteState::CredentialCoolingDown)
+        && !matches!(frozen_state, ChannelRouteState::CredentialCoolingDown)
+        && route_target_available
+    {
+        return Some(no_route_candidate_response(&["credential_cooling_down"]));
     }
     route_state_unavailable_response(channel_id, state)
 }
@@ -1162,16 +1170,19 @@ async fn forward_streaming_named_pool(req: StreamingForwardRequest) -> Response 
     let send_guard = pool_state.send_gate.read().await;
     let (selected, auth_header, auth_prefix, snapshot) = {
         let _mutation_guard = pool_state.mutation_gate.lock().await;
-        if let Some(response) = route_state_unavailable_response(
-            &pool_name,
-            target
-                .route_state
-                .most_restrictive(pool_state.route_state()),
-        ) {
+        let route_state = target
+            .route_state
+            .most_restrictive(pool_state.route_state());
+        if let Some(response) = route_state_unavailable_response(&pool_name, route_state) {
             return response;
         }
         let mut pool = pool_state.pool.lock().await;
-        let selected = match pool.select() {
+        let selected = if matches!(route_state, ChannelRouteState::CredentialCoolingDown) {
+            pool.select_cooling_down_last_resort()
+        } else {
+            pool.select()
+        };
+        let selected = match selected {
             Ok(selected) => selected,
             Err(err) => {
                 return credential_pool_exhausted_response(err.to_string());
@@ -1520,8 +1531,11 @@ async fn forward_with_pool(
                 return PoolForwardResult::RouteFallback(response);
             }
             let mut pool = pool_state.pool.lock().await;
+            let select_cooling_last_resort =
+                matches!(route_state, ChannelRouteState::CredentialCoolingDown);
             let selected = match retry_credential_id.take() {
                 Some(credential_id) => pool.select_credential_by_id(&credential_id),
+                None if select_cooling_last_resort => pool.select_cooling_down_last_resort(),
                 None => pool.select(),
             };
             let selected = match selected {

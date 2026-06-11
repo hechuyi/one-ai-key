@@ -277,20 +277,40 @@ targets remain, so a shared-account failure does not immediately retry a sibling
 channel before external fallback. Single-target default and named-pool
 forwarding can still use the provider-cooling target as a last resort.
 
+Credential cooldown is also transient runtime state, but it belongs to the
+credential selector rather than the provider/account failure-domain layer. If a
+route target has no currently available credential and at least one credential
+is only temporarily cooling down, route admission may keep that target as the
+lowest-priority last resort. Normal, degraded, and provider/account-cooling
+route targets are preferred before credential-cooling targets. Expired,
+quota-exhausted, disabled, or absent credentials remain hard blockers and do
+not enter this last-resort path.
+
 Manual or configured disablement remains authoritative. Automatic cooldown
 expiry or success recovery must not re-enable disabled providers, accounts,
 channels, or credentials.
 
-Route admission uses four state categories. Hard route states fail closed before
+Hard channel cooldown remains a channel-health gate. It is evaluated before
+credential last-resort admission, so an active selected-channel cooldown or
+relay balance suppression cannot be bypassed merely because the selected
+credential is also temporarily cooling down. The exception is the
+provider/account failure-domain path: provider unavailable with structured
+cooldown may keep a channel-health cooldown marker for health reporting while
+route admission projects the opened provider/account domain as
+`provider_cooling_down`.
+
+Route admission uses ordered state categories. Hard route states fail closed before
 touching an upstream: configured disablement, hard channel cooldown, no
-available credentials, runtime-unavailable state, unknown channels, scope
+usable credentials because the pool is empty or every credential is expired,
+quota-exhausted, or disabled, runtime-unavailable state, unknown channels, scope
 denial, missing routes, and candidate-limit exclusion. Soft route states are
-admission suppressions rather than hard blockers: degraded health and
-provider/account soft cooldown can be selected only as last resort after better
-candidates are removed. Credential states affect only credential lifecycle
-selection unless configuration explicitly scopes the evidence wider. Request
-scoped failures such as schema errors, endpoint-family mismatch, model/scope
-errors, or generic client errors do not mutate route availability.
+admission suppressions rather than hard blockers: degraded health,
+provider/account soft cooldown, and temporary credential cooldown can be
+selected only as last resort after better candidates are removed. Credential
+states affect only credential lifecycle selection unless configuration
+explicitly scopes the evidence wider. Request scoped failures such as schema
+errors, endpoint-family mismatch, model/scope errors, or generic client errors
+do not mutate route availability.
 
 The route-admission resilience work does not add public YAML fields and does
 not broaden retry, streaming behavior, endpoint-family fallback,

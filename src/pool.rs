@@ -160,6 +160,14 @@ impl KeyPool {
             .is_some_and(|(deadline, _)| *deadline <= Instant::now())
     }
 
+    pub fn has_cooling_down_credentials_read_only(&self) -> bool {
+        let now = Instant::now();
+        self.cooldown_deadlines
+            .keys()
+            .next_back()
+            .is_some_and(|deadline| *deadline > now)
+    }
+
     pub fn add_credentials(
         &mut self,
         credential_inputs: Vec<PoolCredentialInput>,
@@ -196,6 +204,33 @@ impl KeyPool {
             self.available_indices.insert(index);
         }
         Ok(snapshots)
+    }
+
+    pub fn select_cooling_down_last_resort(&mut self) -> anyhow::Result<SelectedKey> {
+        self.refresh_available_indices(Instant::now());
+        if let Some(index) = self.next_available_from(self.current) {
+            self.current = index;
+            return Ok(self.selected_key_at(index));
+        }
+
+        let now = Instant::now();
+        let start = self.current;
+        let indices = (start..self.credentials.len()).chain(0..start);
+        for index in indices {
+            if self
+                .cooldown_deadline_by_index
+                .get(&index)
+                .is_some_and(|deadline| *deadline > now)
+            {
+                self.current = index;
+                return Ok(self.selected_key_at(index));
+            }
+        }
+
+        anyhow::bail!(
+            "pool {} has no cooling-down credentials for last-resort selection",
+            self.config.name
+        )
     }
 
     pub fn contains_secret(&self, secret: &str) -> bool {

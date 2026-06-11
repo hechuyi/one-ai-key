@@ -1359,11 +1359,24 @@ fn route_state_for_pool(pool: &PoolState) -> ChannelRouteState {
     let failure_domain_state = pool
         .failure_domains
         .route_state(&pool.provider_id, &pool.account_id);
+    if let ChannelHealth::CoolingDown { until, .. } = &health {
+        if Instant::now() < *until
+            && !channel_cooldown_is_provider_failure_domain_soft_state(
+                &health,
+                failure_domain_state,
+            )
+        {
+            return ChannelRouteState::CoolingDown;
+        }
+    }
     let Ok(pool_guard) = pool.pool.try_lock() else {
         return failure_domain_state.unwrap_or(ChannelRouteState::RuntimeUnavailable);
     };
     let has_available_credentials = pool_guard.has_available_credentials_read_only();
     if !has_available_credentials {
+        if pool_guard.has_cooling_down_credentials_read_only() {
+            return ChannelRouteState::CredentialCoolingDown;
+        }
         return ChannelRouteState::NoAvailableCredentials;
     }
     if let Some(state) = failure_domain_state {
@@ -1371,13 +1384,24 @@ fn route_state_for_pool(pool: &PoolState) -> ChannelRouteState {
     }
     match health {
         ChannelHealth::Available => ChannelRouteState::Available,
-        ChannelHealth::CoolingDown { until, .. } if Instant::now() < until => {
-            ChannelRouteState::CoolingDown
-        }
         ChannelHealth::CoolingDown { .. } => ChannelRouteState::Available,
         ChannelHealth::Degraded { .. } => ChannelRouteState::Degraded,
         ChannelHealth::Disabled { .. } => ChannelRouteState::Disabled,
     }
+}
+
+fn channel_cooldown_is_provider_failure_domain_soft_state(
+    health: &ChannelHealth,
+    failure_domain_state: Option<ChannelRouteState>,
+) -> bool {
+    matches!(
+        failure_domain_state,
+        Some(ChannelRouteState::ProviderCoolingDown)
+    ) && matches!(
+        health,
+        ChannelHealth::CoolingDown { reason, .. }
+            if reason == "upstream provider unavailable"
+    )
 }
 
 fn route_channel_states_from_snapshot(
@@ -3596,6 +3620,45 @@ mod tests {
         assert_eq!(
             state.channels.channel_route_state("test"),
             ChannelRouteState::NoAvailableCredentials
+        );
+    }
+
+    #[test]
+    fn active_channel_cooldown_remains_hard_blocker_over_credential_cooldown() {
+        let keys_file = temp_path("key-pool-router-channel-cooldown-over-credential-cooldown-keys");
+        fs::write(&keys_file, "k1\n").unwrap();
+        let config = single_pool_config(keys_file, None).resolve().unwrap();
+        let state = AppState::new(config).unwrap();
+        let pool_state = state.channels.get("test").unwrap();
+        let credential_id = {
+            let pool = pool_state.pool.blocking_lock();
+            CredentialId(pool.credential_snapshots()[0].id.clone())
+        };
+        {
+            let mut pool = pool_state.pool.blocking_lock();
+            pool.apply_credential_cooldown_until(
+                &credential_id,
+                Instant::now() + Duration::from_secs(60),
+                "temporary credential cooldown",
+            );
+        }
+
+        assert_eq!(
+            state.channels.channel_route_state("test"),
+            ChannelRouteState::CredentialCoolingDown
+        );
+
+        *pool_state
+            .health
+            .lock()
+            .expect("channel health mutex poisoned") = ChannelHealth::CoolingDown {
+            until: Instant::now() + Duration::from_secs(60),
+            reason: "hard channel cooldown".to_string(),
+        };
+
+        assert_eq!(
+            state.channels.channel_route_state("test"),
+            ChannelRouteState::CoolingDown
         );
     }
 
