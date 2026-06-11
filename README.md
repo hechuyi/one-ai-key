@@ -34,7 +34,7 @@ support bundle.
 - Serves `/v1/models` from the compiled local public catalog. It does not call
   upstream `/v1/models` or aggregate live provider catalogs on the request path.
 - Provides redacted operator commands for `doctor`, `models`, `route`, `keys`,
-  `failures`, and `reload`.
+  `failures`, `response-filters`, and `reload`.
 
 ## Fit
 
@@ -387,6 +387,12 @@ After any replacement action, verify with `keys stats`, `route explain`,
 <request-id>` read only bounded recent failure evidence from management
 projections. They are not historical storage, routing input, or a place to
 quote upstream payloads.
+
+`one-ai-key response-filters events --last <n>` reads only the bounded
+response-filter event ring. It is useful when investigating relay contamination
+or structured upstream error bodies that matched configured rules. The command
+does not change rules, call upstreams, retry requests, or mutate channel or
+credential state.
 
 `one-ai-key reload status` is a read-only operator CLI view over
 `/management/runtime` and `/management/explain/runtime`. It reports the active

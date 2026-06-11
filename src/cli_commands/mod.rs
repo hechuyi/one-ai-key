@@ -6,6 +6,7 @@ pub(crate) mod model_availability_projection;
 pub mod models;
 pub mod models_onboard;
 pub mod reload;
+pub mod response_filter_events;
 pub mod route;
 pub(crate) mod runtime_reload_projection;
 

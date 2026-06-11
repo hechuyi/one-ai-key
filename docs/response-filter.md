@@ -124,6 +124,12 @@ When response-filter event capture is enabled, the proxy writes only bounded met
 
 The event stream never stores matched text, raw chunks, request bodies, response bodies, upstream keys, client tokens, credential ids, or absolute key paths. Ring capacity defaults to 1024 events, rejects public configuration outside 1 to 4096, and is updated by runtime reload. `dropped_events` includes capacity eviction, runtime-reload shrink, and lock-contended best-effort append drops.
 
+Operators can inspect the same bounded ring with `one-ai-key response-filters
+events --last <n>`. The command is read-only, reads only management projections,
+does not call upstreams, and does not mutate rules, routing, channels, or
+credentials. It projects only the event metadata whitelist above; it does not
+print matched text or raw upstream bodies.
+
 `GET /management/alerts` derives a management-only `response_filter_contamination` alert when at least three filter events for the same `(channel_id, rule_id)` occur inside `response_filter.alert_window_seconds`, which defaults to 900 seconds. The alert includes channel id, rule id, redact/reject counts, reason codes, and the window size. Alerts decay when matching events age out of the window. Alerts summarize operator-visible contamination signals only; they are not routing telemetry and are not lifecycle evidence.
 
 ## Boundaries

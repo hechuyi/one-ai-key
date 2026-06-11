@@ -544,6 +544,19 @@ fn is_allowed_safe_action(template_id: &str, argv: &[&str]) -> bool {
                 "<env>"
             ]
         ) | (
+            "response_filter_events_review",
+            [
+                "one-ai-key",
+                "response-filters",
+                "events",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "--last",
+                "50"
+            ]
+        ) | (
             "reload_status",
             [
                 "one-ai-key",
@@ -648,6 +661,16 @@ fn is_allowed_safe_argv(argv: &[&str]) -> bool {
             "<url>",
             "--management-token-env",
             "<env>"
+        ] | [
+            "one-ai-key",
+            "response-filters",
+            "events",
+            "--management-url",
+            "<url>",
+            "--management-token-env",
+            "<env>",
+            "--last",
+            "50"
         ] | [
             "one-ai-key",
             "reload",

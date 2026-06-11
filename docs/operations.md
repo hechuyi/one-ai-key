@@ -337,7 +337,7 @@ any route-target detail is inspected.
 Read-only commands do not write local files, call upstreams, or mutate
 management state: `doctor`, `models list`, `models explain`, `route explain`,
 `client-tokens list`, `keys list`, `keys stats`, `failures tail`, `failures
-explain`, `reload status`, and `reload diff`.
+explain`, `response-filters events`, `reload status`, and `reload diff`.
 
 `models onboard-plan --channel <channel-id> --public-model <public-model>
 --upstream-model <upstream-model> --dry-run` is a read-only publication plan

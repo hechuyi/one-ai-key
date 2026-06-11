@@ -196,9 +196,9 @@ pub fn classify_action(action: &CliAction) -> CommandEffect {
                 runtime_readonly_store_reads_effect()
             }
         },
-        CliAction::FailuresTail(_) | CliAction::FailuresExplain(_) => {
-            runtime_readonly_store_reads_effect()
-        }
+        CliAction::FailuresTail(_)
+        | CliAction::FailuresExplain(_)
+        | CliAction::ResponseFilterEvents(_) => runtime_readonly_store_reads_effect(),
         CliAction::Doctor(options) => {
             let mut effect = runtime_readonly_effect();
             if options.include_alerts || options.include_events {
@@ -1214,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_failures_commands_as_runtime_readonly_store_reads() {
+    fn classifies_failures_and_response_filter_event_commands_as_runtime_readonly_store_reads() {
         let connection = crate::cli::OperatorConnectionOptions {
             management_url: Some("https://router.example".to_string()),
             deprecated_base_url: None,
@@ -1229,6 +1229,17 @@ mod tests {
                 filters: crate::cli_commands::failures::FailureFilters::default(),
                 output: crate::cli_report::OutputFormat::Table,
             }),
+            CliAction::ResponseFilterEvents(
+                crate::cli_commands::response_filter_events::ResponseFilterEventsOptions {
+                    connection: connection.clone(),
+                    last: Some(50),
+                    request_id: None,
+                    public_model: None,
+                    channel_id: None,
+                    action: None,
+                    output: crate::cli_report::OutputFormat::Table,
+                },
+            ),
             CliAction::FailuresExplain(crate::cli_commands::failures::FailureExplainOptions {
                 connection,
                 request_id: "req_123".to_string(),

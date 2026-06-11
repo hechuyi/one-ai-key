@@ -825,6 +825,20 @@ jq -e '
   and .data.failure_count == 0
   and (.data.failures | length == 0)
 ' failures-tail.json >/dev/null
+capture_management_report response-filter-events.json response-filters events --last 20 --output json
+jq -e '
+  .status == "ok"
+  and .reason_code == "no_response_filter_events_found"
+  and .side_effect_class == "runtime_readonly"
+  and .effect_vector.calls_upstream == false
+  and .effect_vector.writes_management_store == false
+  and .window.kind == "bounded_recent_response_filter_events"
+  and (.window.limit | type == "number")
+  and (.window.returned | type == "number")
+  and (.window.truncated | type == "boolean")
+  and .data.event_count == 0
+  and (.data.events | length == 0)
+' response-filter-events.json >/dev/null
 capture_management_report reload-status.json reload status --output json
 jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' reload-status.json >/dev/null
 capture_management_report reload-diff.json reload diff --output json

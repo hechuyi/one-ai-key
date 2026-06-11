@@ -167,6 +167,11 @@ async fn main() -> anyhow::Result<()> {
             println!("{report}");
             Ok(())
         }
+        cli::CliAction::ResponseFilterEvents(options) => {
+            let report = cli_commands::response_filter_events::run_events(options).await?;
+            println!("{report}");
+            Ok(())
+        }
         cli::CliAction::Doctor(options) => {
             let report = cli_commands::doctor::run(options).await?;
             println!("{report}");

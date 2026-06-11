@@ -24,6 +24,7 @@ pub enum CliAction {
     Keys(crate::cli_commands::keys::KeysCommand),
     FailuresTail(crate::cli_commands::failures::FailureTailOptions),
     FailuresExplain(crate::cli_commands::failures::FailureExplainOptions),
+    ResponseFilterEvents(crate::cli_commands::response_filter_events::ResponseFilterEventsOptions),
     Doctor(crate::cli_commands::doctor::DoctorOptions),
 }
 
@@ -124,6 +125,10 @@ enum CliCommand {
         #[command(subcommand)]
         command: FailuresCommand,
     },
+    ResponseFilters {
+        #[command(subcommand)]
+        command: ResponseFiltersCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -180,6 +185,11 @@ enum KeysProbeApplyCommandArgs {
 enum FailuresCommand {
     Tail(FailuresTailArgs),
     Explain(FailuresExplainArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ResponseFiltersCommand {
+    Events(ResponseFilterEventsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -535,6 +545,25 @@ struct FailuresExplainArgs {
 
 #[derive(Debug, Args)]
 #[command(
+    long_about = "Tail bounded recent response-filter events. Side-effect class: runtime_readonly. Writes local files: no. Calls upstreams: no. Mutates management state or active runtime: no."
+)]
+struct ResponseFilterEventsArgs {
+    #[arg(long, value_parser = crate::cli_commands::response_filter_events::parse_response_filter_events_last)]
+    last: Option<usize>,
+    #[arg(long = "request-id")]
+    request_id: Option<String>,
+    #[arg(long = "model")]
+    public_model: Option<String>,
+    #[arg(long = "channel")]
+    channel_id: Option<String>,
+    #[arg(long)]
+    action: Option<String>,
+    #[arg(long, value_enum, default_value_t = crate::cli_report::OutputFormat::Table)]
+    output: crate::cli_report::OutputFormat,
+}
+
+#[derive(Debug, Args)]
+#[command(
     about = "Read-only runtime doctor",
     long_about = "Read-only runtime doctor. Side-effect class: runtime_readonly. Writes local files: no. Calls upstreams: no. Mutates management state or active runtime: no."
 )]
@@ -873,6 +902,19 @@ where
             },
             output: args.output,
         }),
+        Some(CliCommand::ResponseFilters {
+            command: ResponseFiltersCommand::Events(args),
+        }) => CliAction::ResponseFilterEvents(
+            crate::cli_commands::response_filter_events::ResponseFilterEventsOptions {
+                connection: operator_connection_options,
+                last: args.last,
+                request_id: args.request_id,
+                public_model: args.public_model,
+                channel_id: args.channel_id,
+                action: args.action,
+                output: args.output,
+            },
+        ),
         Some(CliCommand::Doctor(args)) => {
             CliAction::Doctor(crate::cli_commands::doctor::DoctorOptions {
                 connection: operator_connection_options,
@@ -2310,6 +2352,53 @@ mod tests {
                 filters: crate::cli_commands::failures::FailureFilters::default(),
                 output: crate::cli_report::OutputFormat::Json,
             })
+        );
+    }
+
+    #[test]
+    fn response_filters_events_parse_uses_management_options_and_bounded_filters() {
+        let action = parse_action_from([
+            "one-ai-key",
+            "--management-url",
+            "https://router.example",
+            "--management-token-env",
+            "ONE_AI_KEY_MANAGEMENT_TOKEN",
+            "response-filters",
+            "events",
+            "--last",
+            "25",
+            "--request-id",
+            "req-filter",
+            "--model",
+            "gpt-example",
+            "--channel",
+            "relay-a",
+            "--action",
+            "reject",
+            "--output",
+            "json",
+        ])
+        .expect("response filter events should parse");
+
+        assert_eq!(
+            action,
+            CliAction::ResponseFilterEvents(
+                crate::cli_commands::response_filter_events::ResponseFilterEventsOptions {
+                    connection: OperatorConnectionOptions {
+                        management_url: Some("https://router.example".to_string()),
+                        deprecated_base_url: None,
+                        management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                        management_token_stdin: false,
+                        timeout_seconds: 10,
+                    },
+                    last: Some(25),
+                    request_id: Some("req-filter".to_string()),
+                    public_model: Some("gpt-example".to_string()),
+                    channel_id: Some("relay-a".to_string()),
+                    action: Some("reject".to_string()),
+                    output: crate::cli_report::OutputFormat::Json,
+                }
+            )
         );
     }
 
