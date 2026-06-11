@@ -533,3 +533,23 @@ client token and a harmless prompt. Store only redacted status, reason codes,
 route names, model ids, release version, and checksum in the smoke record.
 Production smoke is not part of local CI, and scripts must not bake in private
 server paths, remote base URLs, raw tokens, or upstream keys as defaults.
+
+The repository-provided production smoke harness is opt-in and parameterized:
+
+```bash
+export ONE_AI_KEY_CLIENT_TOKEN=<client-token>
+export ONE_AI_KEY_MANAGEMENT_TOKEN=<management-token>
+
+ONE_AI_KEY_PUBLIC_BASE_URL=<public-gateway-base-url>/v1 \
+ONE_AI_KEY_MANAGEMENT_URL=<management-origin> \
+ONE_AI_KEY_CLIENT_TOKEN_ENV=ONE_AI_KEY_CLIENT_TOKEN \
+ONE_AI_KEY_MANAGEMENT_TOKEN_ENV=ONE_AI_KEY_MANAGEMENT_TOKEN \
+ONE_AI_KEY_PUBLIC_MODEL=<public-model-id> \
+scripts/production-smoke.sh --allow-production
+```
+
+The script refuses to run without `--allow-production`, reads token values only
+through the named environment variables, writes redacted JSON to a temporary
+directory unless `ONE_AI_KEY_OUTPUT_DIR` points outside the repository, and does
+not store raw request bodies, raw response bodies, complete URLs, or token
+values.

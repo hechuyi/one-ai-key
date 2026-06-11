@@ -62,6 +62,18 @@ fn local_ci_script_exists_is_executable_and_runs_required_cargo_commands_in_orde
     assert_executable(path);
 
     let script = read_repo_file(path);
+    for required in [
+        "CARGO_TARGET_DIR_ABS",
+        r#"export CARGO_TARGET_DIR="${CARGO_TARGET_DIR_ABS}""#,
+        "ensure_no_repository_target_dir",
+        "repository-local target/",
+    ] {
+        assert!(
+            script.contains(required),
+            "{path} must enforce repository-local target discipline token `{required}`"
+        );
+    }
+
     let required_commands = [
         "cargo fmt -- --check",
         "cargo check --locked",
@@ -959,6 +971,175 @@ fn release_smoke_script_is_local_redacted_and_cleans_processes() {
             "{path} must not contain remote operation or secret-like token `{forbidden}`"
         );
     }
+}
+
+#[test]
+fn production_smoke_script_is_guarded_parameterized_and_redacted() {
+    let path = "scripts/production-smoke.sh";
+    assert!(Path::new(path).is_file(), "{path} must exist");
+    assert_executable(path);
+
+    let script = read_repo_file(path);
+
+    for required in [
+        "--allow-production",
+        "refusing production smoke without --allow-production",
+        "ONE_AI_KEY_PUBLIC_BASE_URL",
+        "ONE_AI_KEY_MANAGEMENT_URL",
+        "ONE_AI_KEY_CLIENT_TOKEN_ENV",
+        "ONE_AI_KEY_MANAGEMENT_TOKEN_ENV",
+        "ONE_AI_KEY_PUBLIC_MODEL",
+        "ONE_AI_KEY_OUTPUT_DIR",
+        "mktemp -d",
+        "curl",
+        "jq",
+        "--config",
+        "curl_config_escape",
+        "safe_reason_code",
+        "/health",
+        "/management/health/serving",
+        "/management/health/resilience",
+        "/models",
+        "/chat/completions",
+        "Authorization: Bearer",
+        "client_token_env",
+        "management_token_env",
+        "public_liveness",
+        "management_serving",
+        "management_resilience",
+        "client_models",
+        "client_completion",
+        "summary.json",
+        "raw request bodies",
+        "raw response bodies",
+    ] {
+        assert!(
+            script.contains(required),
+            "{path} must include guarded production smoke contract token `{required}`"
+        );
+    }
+
+    let lower = script.to_ascii_lowercase();
+    for forbidden in [
+        "ssh",
+        "scp",
+        "rsync",
+        "systemctl",
+        "nixos-rebuild",
+        "cargo ",
+        "git ",
+        "raw_dir",
+        "completion-request.json",
+        "public-liveness.body",
+        r#"args+=(--header "authorization: bearer ${token}")"#,
+        r#"--header "authorization: bearer ${token}""#,
+        "default_public_base_url",
+        "default_management_url",
+        "default_model",
+    ] {
+        assert!(
+            !lower.contains(forbidden),
+            "{path} must not contain production mutation or private-default token `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn production_smoke_refuses_repository_output_dir_before_creating_it() {
+    let path = ".tmp-production-smoke-contract-output";
+    let _ = fs::remove_dir_all(path);
+
+    let output = Command::new("scripts/production-smoke.sh")
+        .arg("--allow-production")
+        .env("ONE_AI_KEY_PUBLIC_BASE_URL", "http://127.0.0.1:1/v1")
+        .env("ONE_AI_KEY_MANAGEMENT_URL", "http://127.0.0.1:1")
+        .env(
+            "ONE_AI_KEY_CLIENT_TOKEN_ENV",
+            "ONE_AI_KEY_TEST_CLIENT_TOKEN",
+        )
+        .env(
+            "ONE_AI_KEY_MANAGEMENT_TOKEN_ENV",
+            "ONE_AI_KEY_TEST_MANAGEMENT_TOKEN",
+        )
+        .env("ONE_AI_KEY_TEST_CLIENT_TOKEN", "client-token-placeholder")
+        .env(
+            "ONE_AI_KEY_TEST_MANAGEMENT_TOKEN",
+            "management-token-placeholder",
+        )
+        .env("ONE_AI_KEY_PUBLIC_MODEL", "contract-test-model")
+        .env("ONE_AI_KEY_OUTPUT_DIR", path)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run production smoke contract: {error}"));
+
+    assert!(
+        !output.status.success(),
+        "production smoke must refuse repository-local output dirs"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("output_dir_inside_repository"),
+        "production smoke must emit a redacted repository-output refusal"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "production smoke refusal must not print non-JSON stderr"
+    );
+    assert!(
+        !Path::new(path).exists(),
+        "production smoke must refuse before creating repository-local output dirs"
+    );
+}
+
+#[test]
+fn production_smoke_refuses_repository_tmpdir_before_creating_output() {
+    let tmp_parent = ".tmp-production-smoke-contract-tmp";
+    let _ = fs::remove_dir_all(tmp_parent);
+    fs::create_dir_all(tmp_parent)
+        .unwrap_or_else(|error| panic!("failed to create {tmp_parent}: {error}"));
+
+    let output = Command::new("scripts/production-smoke.sh")
+        .arg("--allow-production")
+        .env("ONE_AI_KEY_PUBLIC_BASE_URL", "http://127.0.0.1:1/v1")
+        .env("ONE_AI_KEY_MANAGEMENT_URL", "http://127.0.0.1:1")
+        .env(
+            "ONE_AI_KEY_CLIENT_TOKEN_ENV",
+            "ONE_AI_KEY_TEST_CLIENT_TOKEN",
+        )
+        .env(
+            "ONE_AI_KEY_MANAGEMENT_TOKEN_ENV",
+            "ONE_AI_KEY_TEST_MANAGEMENT_TOKEN",
+        )
+        .env("ONE_AI_KEY_TEST_CLIENT_TOKEN", "client-token-placeholder")
+        .env(
+            "ONE_AI_KEY_TEST_MANAGEMENT_TOKEN",
+            "management-token-placeholder",
+        )
+        .env("ONE_AI_KEY_PUBLIC_MODEL", "contract-test-model")
+        .env("TMPDIR", tmp_parent)
+        .env_remove("ONE_AI_KEY_OUTPUT_DIR")
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run production smoke contract: {error}"));
+
+    assert!(
+        !output.status.success(),
+        "production smoke must refuse repository-local TMPDIR"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("tmpdir_inside_repository"),
+        "production smoke must emit a redacted repository-TMPDIR refusal"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "production smoke TMPDIR refusal must not print non-JSON stderr"
+    );
+
+    let child_count = fs::read_dir(tmp_parent)
+        .unwrap_or_else(|error| panic!("failed to read {tmp_parent}: {error}"))
+        .count();
+    let _ = fs::remove_dir_all(tmp_parent);
+    assert_eq!(
+        child_count, 0,
+        "production smoke must refuse repository-local TMPDIR before creating output"
+    );
 }
 
 #[test]

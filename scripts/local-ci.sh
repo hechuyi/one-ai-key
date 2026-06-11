@@ -18,10 +18,20 @@ case "${CARGO_TARGET_DIR_ABS}" in
     exit 1
     ;;
 esac
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR_ABS}"
 
+ensure_no_repository_target_dir() {
+  if [[ -d "${REPO_ROOT}/target" ]]; then
+    echo "repository-local target/ exists; remove it before running local CI" >&2
+    exit 1
+  fi
+}
+
+ensure_no_repository_target_dir
 scripts/check-staged-denylist.sh --self-test
 scripts/check-staged-denylist.sh --check-public-plans
 cargo fmt -- --check
 cargo check --locked
 cargo clippy --locked -- -D warnings
 cargo test --locked
+ensure_no_repository_target_dir

@@ -161,7 +161,12 @@ deployment URLs, raw tokens, or a deployment host.
     not to `scripts/local-ci.sh`: process liveness, authenticated management
     health, `/v1/models`, and one harmless client completion through the public
     base URL. Do not store private server URLs, raw tokens, upstream keys, or
-    default remote targets in local CI or release scripts.
+    default remote targets in local CI or release scripts. When using the
+    repository harness, provide `ONE_AI_KEY_PUBLIC_BASE_URL`,
+    `ONE_AI_KEY_MANAGEMENT_URL`, `ONE_AI_KEY_CLIENT_TOKEN_ENV`,
+    `ONE_AI_KEY_MANAGEMENT_TOKEN_ENV`, and `ONE_AI_KEY_PUBLIC_MODEL`, then run
+    `scripts/production-smoke.sh --allow-production`; the script writes only
+    redacted JSON and is not a release or CI gate.
 13. Deployment records must contain only redacted status, reason codes, route
     names, model ids, release version, asset URL, and checksum. Do not record
     raw tokens, upstream keys, request bodies, or response bodies.
