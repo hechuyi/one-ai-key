@@ -112,6 +112,7 @@ MANAGEMENT_TOKEN="release-smoke-management-token"
 UPSTREAM_TOKEN="release-smoke-upstream-token"
 REPLACEMENT_TOKEN="release-smoke-replacement-token"
 INVALID_CLIENT_TOKEN="release-smoke-invalid-client-token"
+NEW_CLIENT_TOKEN="release-smoke-new-client-token"
 SERVICE_PORT=$(python3 - <<'PY'
 import socket
 with socket.socket() as sock:
@@ -329,12 +330,21 @@ if [[ "${CHECK_MODELS}" != "${CLIENT_MODELS}" ]]; then
 fi
 
 export ONE_AI_KEY_MANAGEMENT_TOKEN="${MANAGEMENT_TOKEN}"
+export ONE_AI_KEY_NEW_CLIENT_TOKEN="${NEW_CLIENT_TOKEN}"
 MANAGEMENT_URL="http://127.0.0.1:${SERVICE_PORT}"
 COMMON=(--management-url "${MANAGEMENT_URL}" --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN)
 MANAGEMENT_REPORTS=()
 EXPECTED_MANAGEMENT_REPORTS=(
   "doctor.json"
   "client-tokens-list.json"
+  "client-tokens-create-dry-run.json"
+  "client-tokens-create-apply.json"
+  "client-tokens-scope-update-dry-run.json"
+  "client-tokens-scope-update-apply.json"
+  "client-tokens-disable-dry-run.json"
+  "client-tokens-disable-apply.json"
+  "client-tokens-enable-dry-run.json"
+  "client-tokens-enable-apply.json"
   "models-list.json"
   "models-explain.json"
   "route-explain.json"
@@ -520,6 +530,7 @@ assert_no_management_report_leaks() {
     "${UPSTREAM_TOKEN}"
     "${REPLACEMENT_TOKEN}"
     "${INVALID_CLIENT_TOKEN}"
+    "${NEW_CLIENT_TOKEN}"
     "${WORK_DIR}"
     "data/relay.keys"
     "${MOCK_UPSTREAM_URL}"
@@ -555,6 +566,137 @@ capture_management_report doctor.json doctor --output json
 jq -e '.status and .reason_code and .side_effect_class and (.next_action.safe_argv | type == "array")' doctor.json >/dev/null
 capture_management_report client-tokens-list.json client-tokens list --output json
 jq -e '.status == "ok" and .reason_code == "client_tokens_available" and .side_effect_class and (.next_action.safe_argv | type == "array")' client-tokens-list.json >/dev/null
+capture_management_report client-tokens-create-dry-run.json client-tokens create --name release-smoke-client-extra --token-env ONE_AI_KEY_NEW_CLIENT_TOKEN --allowed-model gpt-example --unrestricted-channels --dry-run --output json
+jq -e '
+  .status == "dry_run"
+  and .reason_code == "client_token_create_plan"
+  and .side_effect_class == "offline_readonly"
+  and .effect_vector.writes_management_store == false
+  and .effect_vector.mutates_runtime == false
+  and .raw_token_read == false
+  and .mutating_create_sent == false
+  and .allowed_model_groups == ["gpt-example"]
+  and .unrestricted_channels == true
+  and .next_action.requires_confirmation == true
+' client-tokens-create-dry-run.json >/dev/null
+capture_management_report client-tokens-create-apply.json client-tokens create --name release-smoke-client-extra --token-env ONE_AI_KEY_NEW_CLIENT_TOKEN --allowed-model gpt-example --unrestricted-channels --yes --output json
+jq -e '
+  .status == "ok"
+  and .reason_code == "client_token_create_applied"
+  and .side_effect_class == "management_write"
+  and .effect_vector.writes_management_store == true
+  and .effect_vector.mutates_runtime == true
+  and .raw_token_read == true
+  and .mutating_create_sent == true
+  and (.token.id | type == "string")
+  and .token.enabled == true
+  and .token.scope_summary.allowed_model_group_count == 1
+  and .token.scope_summary.unrestricted_channels == true
+  and .next_action.requires_confirmation == false
+' client-tokens-create-apply.json >/dev/null
+NEW_CLIENT_TOKEN_ID=$(jq -r '.token.id' client-tokens-create-apply.json)
+if [[ -z "${NEW_CLIENT_TOKEN_ID}" || "${NEW_CLIENT_TOKEN_ID}" == "null" ]]; then
+  printf 'error: client token create smoke did not return a token id\n' >&2
+  exit 1
+fi
+NEW_CLIENT_MODELS=$(curl -fsS "http://127.0.0.1:${SERVICE_PORT}/v1/models" \
+  -H "Authorization: Bearer ${NEW_CLIENT_TOKEN}")
+printf '%s\n' "${NEW_CLIENT_MODELS}" \
+  | jq -e '.data | map(.id) == ["gpt-example"]' >/dev/null
+capture_management_report client-tokens-scope-update-dry-run.json client-tokens scope-update "${NEW_CLIENT_TOKEN_ID}" --unrestricted-models --unrestricted-channels --dry-run --output json
+jq -e --arg token_id "${NEW_CLIENT_TOKEN_ID}" '
+  .status == "dry_run"
+  and .reason_code == "client_token_scope_update_plan"
+  and .side_effect_class == "offline_readonly"
+  and .effect_vector.writes_management_store == false
+  and .effect_vector.mutates_runtime == false
+  and .token_id == $token_id
+  and .allowed_model_groups == []
+  and .allowed_channels == []
+  and .unrestricted_model_groups == true
+  and .unrestricted_channels == true
+  and .mutating_scope_update_sent == false
+  and .next_action.requires_confirmation == true
+' client-tokens-scope-update-dry-run.json >/dev/null
+capture_management_report client-tokens-scope-update-apply.json client-tokens scope-update "${NEW_CLIENT_TOKEN_ID}" --unrestricted-models --unrestricted-channels --yes --output json
+jq -e --arg token_id "${NEW_CLIENT_TOKEN_ID}" '
+  .status == "ok"
+  and .reason_code == "client_token_scope_update_applied"
+  and .side_effect_class == "management_write"
+  and .effect_vector.writes_management_store == true
+  and .effect_vector.mutates_runtime == true
+  and .token_id == $token_id
+  and .mutating_scope_update_sent == true
+  and .token.enabled == true
+  and .token.scope_summary.unrestricted_model_groups == true
+  and .token.scope_summary.unrestricted_channels == true
+  and .next_action.requires_confirmation == false
+' client-tokens-scope-update-apply.json >/dev/null
+NEW_CLIENT_MODELS_AFTER_SCOPE_UPDATE=$(curl -fsS "http://127.0.0.1:${SERVICE_PORT}/v1/models" \
+  -H "Authorization: Bearer ${NEW_CLIENT_TOKEN}")
+printf '%s\n' "${NEW_CLIENT_MODELS_AFTER_SCOPE_UPDATE}" \
+  | jq -e '.data | map(.id) | index("gpt-example") != null' >/dev/null
+capture_management_report client-tokens-disable-dry-run.json client-tokens disable "${NEW_CLIENT_TOKEN_ID}" --dry-run --output json
+jq -e --arg token_id "${NEW_CLIENT_TOKEN_ID}" '
+  .status == "dry_run"
+  and .reason_code == "client_token_disable_plan"
+  and .side_effect_class == "offline_readonly"
+  and .effect_vector.writes_management_store == false
+  and .effect_vector.mutates_runtime == false
+  and .token_id == $token_id
+  and .mutating_disable_sent == false
+  and .next_action.requires_confirmation == true
+' client-tokens-disable-dry-run.json >/dev/null
+capture_management_report client-tokens-disable-apply.json client-tokens disable "${NEW_CLIENT_TOKEN_ID}" --yes --output json
+jq -e --arg token_id "${NEW_CLIENT_TOKEN_ID}" '
+  .status == "ok"
+  and .reason_code == "client_token_disable_applied"
+  and .side_effect_class == "management_write"
+  and .effect_vector.writes_management_store == true
+  and .effect_vector.mutates_runtime == true
+  and .token_id == $token_id
+  and .mutating_disable_sent == true
+  and .token.enabled == false
+  and .next_action.requires_confirmation == false
+' client-tokens-disable-apply.json >/dev/null
+NEW_CLIENT_DISABLED_STATUS=$(curl -sS -o new-client-disabled-models.json -w "%{http_code}" \
+  "http://127.0.0.1:${SERVICE_PORT}/v1/models" \
+  -H "Authorization: Bearer ${NEW_CLIENT_TOKEN}")
+if [[ "${NEW_CLIENT_DISABLED_STATUS}" != "401" ]]; then
+  printf 'error: new client token unexpectedly remained valid after disable\n' >&2
+  exit 1
+fi
+jq -e '.error.message == "invalid router api key"' new-client-disabled-models.json >/dev/null
+capture_management_report client-tokens-enable-dry-run.json client-tokens enable "${NEW_CLIENT_TOKEN_ID}" --dry-run --output json
+jq -e --arg token_id "${NEW_CLIENT_TOKEN_ID}" '
+  .status == "dry_run"
+  and .reason_code == "client_token_enable_plan"
+  and .side_effect_class == "offline_readonly"
+  and .effect_vector.writes_management_store == false
+  and .effect_vector.mutates_runtime == false
+  and .token_id == $token_id
+  and .mutating_enable_sent == false
+  and .next_action.requires_confirmation == true
+' client-tokens-enable-dry-run.json >/dev/null
+capture_management_report client-tokens-enable-apply.json client-tokens enable "${NEW_CLIENT_TOKEN_ID}" --yes --output json
+jq -e --arg token_id "${NEW_CLIENT_TOKEN_ID}" '
+  .status == "ok"
+  and .reason_code == "client_token_enable_applied"
+  and .side_effect_class == "management_write"
+  and .effect_vector.writes_management_store == true
+  and .effect_vector.mutates_runtime == true
+  and .token_id == $token_id
+  and .mutating_enable_sent == true
+  and .token.enabled == true
+  and .next_action.requires_confirmation == false
+' client-tokens-enable-apply.json >/dev/null
+NEW_CLIENT_MODELS_AFTER_ENABLE=$(curl -fsS "http://127.0.0.1:${SERVICE_PORT}/v1/models" \
+  -H "Authorization: Bearer ${NEW_CLIENT_TOKEN}") || {
+  printf 'error: new client token did not work after enable\n' >&2
+  exit 1
+}
+printf '%s\n' "${NEW_CLIENT_MODELS_AFTER_ENABLE}" \
+  | jq -e '.data | map(.id) | index("gpt-example") != null' >/dev/null
 capture_management_report models-list.json models list --client-token-ref local-client --output json
 jq -e '.status == "ok" and .reason_code == "model_routes_available" and .side_effect_class and (.next_action.safe_argv | type == "array")' models-list.json >/dev/null
 capture_management_report models-explain.json models explain --model gpt-example --client-token-ref local-client --endpoint-family chat_completions --output json

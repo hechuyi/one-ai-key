@@ -279,6 +279,67 @@ Model publication is an explicit public-route workflow. `/v1/models` is the
 compiled local public catalog from active runtime state; it is not a live
 aggregation of upstream `/v1/models`.
 
+Client-token maintenance is also explicit. Client tokens are the API keys used
+by normal `/v1` clients; the management token is only for operator commands.
+When a writable client-token store is configured, create or change client
+tokens through the management CLI:
+
+```bash
+export ONE_AI_KEY_MANAGEMENT_TOKEN=<management-token>
+export ONE_AI_KEY_NEW_CLIENT_TOKEN=<new-client-token>
+
+one-ai-key client-tokens create --name <client-name> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --token-env ONE_AI_KEY_NEW_CLIENT_TOKEN \
+  --allowed-model <public-model-id> \
+  --unrestricted-channels --dry-run
+
+one-ai-key client-tokens create --name <client-name> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --token-env ONE_AI_KEY_NEW_CLIENT_TOKEN \
+  --allowed-model <public-model-id> \
+  --unrestricted-channels --yes
+
+one-ai-key client-tokens scope-update <client-token-id> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --unrestricted-models --unrestricted-channels --dry-run
+
+one-ai-key client-tokens scope-update <client-token-id> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --unrestricted-models --unrestricted-channels --yes
+
+one-ai-key client-tokens disable <client-token-id> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --dry-run
+
+one-ai-key client-tokens disable <client-token-id> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --yes
+
+one-ai-key client-tokens enable <client-token-id> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --dry-run
+
+one-ai-key client-tokens enable <client-token-id> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --yes
+```
+
+`create` reads raw token material only from `--token-env`, and only on confirmed
+apply. Dry-run does not read the env value, does not send the management
+mutation, and reports a redacted plan. Scope updates leave omitted dimensions
+unchanged; `--unrestricted-models` and `--unrestricted-channels` are explicit
+scope choices. Model publication does not automatically widen client-token
+scope.
+
 The operator path is plan, stage, reload, then verify:
 
 ```bash

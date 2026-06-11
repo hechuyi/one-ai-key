@@ -124,6 +124,95 @@ The offline `check-config` visibility preview, authenticated `/v1/models`, and
 the `models explain` / `route explain` views should agree for the same generated
 config, public model id, and client-token reference.
 
+## Client Token Workflow
+
+Client tokens are the bearer tokens used by normal OpenAI-compatible `/v1`
+clients. They are not management tokens. The management token authorizes
+operator commands that create, disable, enable, or rescope client tokens.
+
+When a writable client-token store is configured, create a client token from an
+environment variable rather than from a positional argument:
+
+```bash
+export ONE_AI_KEY_MANAGEMENT_TOKEN=<management-token>
+export ONE_AI_KEY_NEW_CLIENT_TOKEN=<new-client-token>
+
+one-ai-key client-tokens create --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --name <client-name> \
+  --token-env ONE_AI_KEY_NEW_CLIENT_TOKEN \
+  --allowed-model <public-model-id> \
+  --unrestricted-channels \
+  --dry-run
+
+one-ai-key client-tokens create --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --name <client-name> \
+  --token-env ONE_AI_KEY_NEW_CLIENT_TOKEN \
+  --allowed-model <public-model-id> \
+  --unrestricted-channels \
+  --yes
+```
+
+Dry-run is an offline plan for this command: it validates command shape and
+redacted scope intent, but it does not read `ONE_AI_KEY_NEW_CLIENT_TOKEN`, build
+an operator client, or send a management request. Confirmed create reads the
+env value, writes the management store, and mutates active runtime state when
+the running service supports writable client-token state.
+
+Use `client-tokens list` to get the stable non-secret token id, then update
+scope or enabled state explicitly:
+
+```bash
+one-ai-key client-tokens list --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN
+
+one-ai-key client-tokens scope-update <client-token-id> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --unrestricted-models --unrestricted-channels \
+  --dry-run
+
+one-ai-key client-tokens scope-update <client-token-id> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --unrestricted-models --unrestricted-channels \
+  --yes
+
+one-ai-key client-tokens disable <client-token-id> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --dry-run
+
+one-ai-key client-tokens disable <client-token-id> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --yes
+
+one-ai-key client-tokens enable <client-token-id> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --dry-run
+
+one-ai-key client-tokens enable <client-token-id> \
+  --management-url <management-origin> \
+  --management-token-env ONE_AI_KEY_MANAGEMENT_TOKEN \
+  --yes
+```
+
+For `scope-update`, omitted scope dimensions are unchanged. Passing
+`--unrestricted-models` or `--unrestricted-channels` is an explicit request to
+clear that dimension, not a fallback caused by an empty value. Empty
+`--allowed-model` or `--allowed-channel` values are rejected instead of becoming
+unrestricted.
+
+Client-token scope is not repaired automatically by model publication. If a new
+public route is staged and reloaded but a client still cannot see it, inspect
+`models explain` for that client-token reference, then run an explicit
+`client-tokens scope-update` if the intended policy is to expose the model.
+Verify the result with authenticated `GET /v1/models` using the client token
+that the target client will use.
+
 ## Model Publication Workflow
 
 Model publication is an explicit local public-route workflow. It stages a

@@ -636,6 +636,63 @@ fn release_smoke_expected_management_reports_cover_every_captured_report() {
 }
 
 #[test]
+fn release_smoke_script_covers_client_token_lifecycle_workflow() {
+    let path = "scripts/release-smoke.sh";
+    let script = read_repo_file(path);
+
+    for required in [
+        "NEW_CLIENT_TOKEN",
+        "ONE_AI_KEY_NEW_CLIENT_TOKEN",
+        "client-tokens-create-dry-run.json",
+        "client-tokens-create-apply.json",
+        "client-tokens-scope-update-dry-run.json",
+        "client-tokens-scope-update-apply.json",
+        "client-tokens-disable-dry-run.json",
+        "client-tokens-disable-apply.json",
+        "client-tokens-enable-dry-run.json",
+        "client-tokens-enable-apply.json",
+        "client-tokens create --name release-smoke-client-extra --token-env ONE_AI_KEY_NEW_CLIENT_TOKEN --allowed-model gpt-example --unrestricted-channels --dry-run --output json",
+        "client-tokens create --name release-smoke-client-extra --token-env ONE_AI_KEY_NEW_CLIENT_TOKEN --allowed-model gpt-example --unrestricted-channels --yes --output json",
+        "NEW_CLIENT_TOKEN_ID",
+        r#".raw_token_read == false"#,
+        r#".raw_token_read == true"#,
+        r#".mutating_create_sent == false"#,
+        r#".mutating_create_sent == true"#,
+        r#".reason_code == "client_token_create_plan""#,
+        r#".reason_code == "client_token_create_applied""#,
+        r#".token.scope_summary.allowed_model_group_count == 1"#,
+        "client-tokens scope-update \"${NEW_CLIENT_TOKEN_ID}\" --unrestricted-models --unrestricted-channels --dry-run --output json",
+        "client-tokens scope-update \"${NEW_CLIENT_TOKEN_ID}\" --unrestricted-models --unrestricted-channels --yes --output json",
+        r#".reason_code == "client_token_scope_update_plan""#,
+        r#".reason_code == "client_token_scope_update_applied""#,
+        r#".unrestricted_model_groups == true"#,
+        r#".unrestricted_channels == true"#,
+        r#".mutating_scope_update_sent == false"#,
+        r#".mutating_scope_update_sent == true"#,
+        "client-tokens disable \"${NEW_CLIENT_TOKEN_ID}\" --dry-run --output json",
+        "client-tokens disable \"${NEW_CLIENT_TOKEN_ID}\" --yes --output json",
+        r#".reason_code == "client_token_disable_plan""#,
+        r#".reason_code == "client_token_disable_applied""#,
+        r#".mutating_disable_sent == false"#,
+        r#".mutating_disable_sent == true"#,
+        "client-tokens enable \"${NEW_CLIENT_TOKEN_ID}\" --dry-run --output json",
+        "client-tokens enable \"${NEW_CLIENT_TOKEN_ID}\" --yes --output json",
+        r#".reason_code == "client_token_enable_plan""#,
+        r#".reason_code == "client_token_enable_applied""#,
+        r#".mutating_enable_sent == false"#,
+        r#".mutating_enable_sent == true"#,
+        "new client token unexpectedly remained valid after disable",
+        "new client token did not work after enable",
+        "release-smoke-new-client-token",
+    ] {
+        assert!(
+            script.contains(required),
+            "{path} must cover client-token lifecycle release-smoke token `{required}`"
+        );
+    }
+}
+
+#[test]
 fn release_smoke_script_covers_local_admission_and_upstream_503_failure_evidence() {
     let path = "scripts/release-smoke.sh";
     let script = read_repo_file(path);
