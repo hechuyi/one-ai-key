@@ -1224,6 +1224,54 @@ fn operator_confidence_local_release_ready_record_is_public_and_bounded() {
 }
 
 #[test]
+fn operator_confidence_published_release_record_is_public_and_bounded() {
+    let path = "docs/release-records/v0.2-published-release-complete.md";
+    assert!(Path::new(path).is_file(), "{path} must exist");
+
+    let record = read_repo_file(path);
+    for required in [
+        "Stop node: `v0.2_published_release_complete`",
+        &format!("Cargo package version: `{}`", env!("CARGO_PKG_VERSION")),
+        "Git tag: `v0.2.0`",
+        "Release URL: `https://github.com/hechuyi/one-ai-key/releases/tag/v0.2.0`",
+        "`one-ai-key-0.2.0-x86_64-unknown-linux-gnu.tar.gz`",
+        "`one-ai-key-0.2.0-x86_64-unknown-linux-gnu.tar.gz.sha256`",
+        "`89d224eaae876c488e1517db87dfa9014faf7e25104fd640b1b87552832c568c`",
+        "GitHub release publication: `pass`",
+        "uploaded asset download: `pass`",
+        "uploaded checksum verification: `pass`",
+        "uploaded archive shape check: `pass`",
+        "deployment pin smoke: `not_run_by_design`",
+        "Deployment pin verification remains a separate operator-run stop node.",
+    ] {
+        assert!(
+            record.contains(required),
+            "{path} must contain bounded published-release record token `{required}`"
+        );
+    }
+
+    for forbidden in [
+        "sk-",
+        "github_pat_",
+        "ghp_",
+        "/Users/",
+        "rtoc-gateway",
+        "hhhl",
+        "dc.",
+        "chat/room",
+        "Telegram",
+        "Discord",
+        "raw command log",
+        "deployment transcript",
+    ] {
+        assert!(
+            !record.contains(forbidden),
+            "{path} must not contain private or over-specific release evidence `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn release_build_docs_protect_persistent_docker_build_caches() {
     let path = "docs/release-build.md";
     let docs = read_repo_file(path);
