@@ -1509,6 +1509,53 @@ fn operator_confidence_published_release_record_is_public_and_bounded() {
 }
 
 #[test]
+fn operator_confidence_deployment_pin_record_is_public_and_bounded() {
+    let path = "docs/release-records/v0.2-deployment-pin-verified.md";
+    assert!(Path::new(path).is_file(), "{path} must exist");
+
+    let record = read_repo_file(path);
+    for required in [
+        "Stop node: `v0.2_deployment_pin_verified`",
+        &format!("Cargo package version: `{}`", env!("CARGO_PKG_VERSION")),
+        "Git tag: `v0.2.1`",
+        "`one-ai-key-0.2.1-x86_64-unknown-linux-gnu.tar.gz`",
+        "`8411d6ccbaaeb8bf14f1283a059197fcbe9cd9c3364d91b3f1bf2dd980df5ab9`",
+        "NixOS release pin consumed the GitHub release artifact by URL and hash.",
+        "service unit used the pinned release package",
+        "public `/v1/models` smoke: `pass`",
+        "public `/v1/responses` smoke: `pass`",
+        "operator key helper status command: `pass`",
+        "No server-side source build was performed.",
+    ] {
+        assert!(
+            record.contains(required),
+            "{path} must contain bounded deployment-pin record token `{required}`"
+        );
+    }
+
+    for forbidden in [
+        "sk-",
+        "github_pat_",
+        "ghp_",
+        "/Users/",
+        "rtoc-gateway",
+        "ai.rtoc",
+        "hhhl",
+        "dc.",
+        "chat/room",
+        "Telegram",
+        "Discord",
+        "raw command log",
+        "deployment transcript",
+    ] {
+        assert!(
+            !record.contains(forbidden),
+            "{path} must not contain private or over-specific deployment evidence `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn release_build_docs_protect_persistent_docker_build_caches() {
     let path = "docs/release-build.md";
     let docs = read_repo_file(path);
