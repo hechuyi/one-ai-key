@@ -162,6 +162,7 @@ fn local_ci_docker_wrapper_runs_same_amd64_nix_container_and_persistent_caches()
         "gcc",
         "pkg-config",
         "openssl",
+        "git",
     ] {
         assert!(
             script.contains(package),

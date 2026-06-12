@@ -261,6 +261,7 @@ mod tests {
     use super::*;
     use crate::registry_store::RegistryStoreHandle;
     use crate::{credential_repository::FileCredentialRepository, registry::RegistryRepository};
+    use serde_json::{json, Value};
     use std::{
         env, fs,
         path::{Path, PathBuf},
@@ -289,6 +290,8 @@ listen: 127.0.0.1:4101
 client_tokens:
   - name: local-client
     token: secret-client-token
+    allowed_model_groups:
+      - coding
 management:
   admin_token: secret-management-token
 default_routing_profile: default-routing
@@ -322,11 +325,235 @@ upstreams:
     models:
       - public_model: gpt-example
         upstream_model: provider/gpt-example
+  relay-backup:
+    template: generic_relay_cn
+    api_base: https://relay-backup.example/v1
+    credential_set: relay_backup_credentials
+    keys_file: {}
+    models:
+      - public_model: gpt-example
+        upstream_model: backup/gpt-example
 "#,
+            serde_yaml::to_string(&keys_file.to_string_lossy().to_string())
+                .unwrap()
+                .trim(),
             serde_yaml::to_string(&keys_file.to_string_lossy().to_string())
                 .unwrap()
                 .trim()
         )
+    }
+
+    fn representative_document(config: &Path) -> RegistryDocument {
+        let mut document = ConfigSource::yaml_file(config)
+            .load_registry_document()
+            .unwrap();
+        let route = document.model_routes.get_mut("gpt-example").unwrap();
+        route
+            .targets
+            .sort_by(|left, right| left.channel.cmp(&right.channel));
+        for target in &mut route.targets {
+            match target.channel.as_str() {
+                "relay" => {
+                    target.priority = 10;
+                    target.weight = 8;
+                }
+                "relay-backup" => {
+                    target.priority = 20;
+                    target.weight = 2;
+                }
+                other => panic!("unexpected representative route target {other}"),
+            }
+        }
+        document
+    }
+
+    fn resolved_config_parity_projection(config: &ResolvedConfig) -> Value {
+        let mut client_tokens: Vec<_> = config
+            .client_tokens
+            .iter()
+            .map(|token| {
+                json!({
+                    "id": token.id,
+                    "name": token.name,
+                    "enabled": token.enabled,
+                    "allowed_model_groups": token.allowed_model_groups,
+                    "allowed_channels": token.allowed_channels,
+                })
+            })
+            .collect();
+        client_tokens.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+
+        let mut management_principals: Vec<_> = config
+            .management_principals
+            .iter()
+            .map(|principal| {
+                json!({
+                    "id": principal.id,
+                    "name": principal.name,
+                    "role": format!("{:?}", principal.role),
+                    "enabled": principal.enabled,
+                })
+            })
+            .collect();
+        management_principals.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+
+        let mut model_groups: Vec<_> = config
+            .model_groups
+            .iter()
+            .map(|(id, group)| {
+                json!({
+                    "id": id,
+                    "resolved_id": group.id,
+                    "models": group.models,
+                })
+            })
+            .collect();
+        model_groups.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+
+        let mut policy_profiles: Vec<_> = config
+            .policy_profiles
+            .iter()
+            .map(|(id, profile)| {
+                json!({
+                    "id": id,
+                    "resolved_id": profile.id,
+                    "error_rules": serde_json::to_value(&profile.error_rules).unwrap(),
+                    "probe_result_policy": format!("{:?}", profile.probe_result_policy),
+                })
+            })
+            .collect();
+        policy_profiles.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+
+        let mut routing_profiles: Vec<_> = config
+            .routing_profiles
+            .iter()
+            .map(|(id, profile)| {
+                json!({
+                    "id": id,
+                    "resolved_id": profile.id,
+                    "key_selection": format!("{:?}", profile.key_selection),
+                    "default_credential_cooldown_seconds": profile.default_credential_cooldown.as_secs(),
+                    "same_request_credential_retry_enabled": profile.same_request_credential_retry_enabled,
+                    "max_same_request_retries": profile.max_same_request_retries,
+                    "route_target_retry_enabled": profile.route_target_retry_enabled,
+                })
+            })
+            .collect();
+        routing_profiles.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+
+        let mut pools: Vec<_> = config
+            .pools
+            .iter()
+            .map(|(id, pool)| {
+                json!({
+                    "id": id,
+                    "config_generation": pool.config_generation,
+                    "configured_enabled": pool.configured_enabled,
+                    "provider_id": pool.provider_id,
+                    "account_id": pool.account_id,
+                    "provider_enabled": pool.provider_enabled,
+                    "account_configured_enabled": pool.account_configured_enabled,
+                    "account_enabled": pool.account_enabled,
+                    "error_policy_sources": format!("{:?}", pool.error_policy_sources),
+                    "probe_result_policy": format!("{:?}", pool.probe_result_policy),
+                    "routing_profile_id": pool.routing_profile_id,
+                    "routing_policy": format!("{:?}", pool.routing_policy),
+                    "routing_policy_sources": format!("{:?}", pool.routing_policy_sources),
+                    "credential_set_id": pool.credential_set_id.0,
+                    "provider_kind": format!("{:?}", pool.provider_kind),
+                    "endpoint_capabilities": serde_json::to_value(pool.endpoint_capabilities.to_config()).unwrap(),
+                    "auth_header": pool.auth_header,
+                    "auth_prefix": pool.auth_prefix,
+                    "error_classifier": format!("{:?}", pool.error_classifier.snapshot()),
+                    "key_pool": {
+                        "name": pool.key_pool.name,
+                        "credential_namespace": pool.key_pool.credential_namespace,
+                        "credential_count": pool.key_pool.credentials.len(),
+                    },
+                    "key_import_report": {
+                        "physical_line_count": pool.key_import_report.physical_line_count,
+                        "non_empty_count": pool.key_import_report.non_empty_count,
+                        "unique_count": pool.key_import_report.unique_count,
+                        "duplicate_occurrence_count": pool.key_import_report.duplicate_occurrence_count,
+                        "ignored_empty_count": pool.key_import_report.ignored_empty_count,
+                        "invalid_line_count": pool.key_import_report.invalid_line_count,
+                    },
+                })
+            })
+            .collect();
+        pools.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+
+        let mut model_routes: Vec<_> = config
+            .model_routes
+            .iter()
+            .map(|(id, route)| {
+                let targets: Vec<_> = route
+                    .targets
+                    .iter()
+                    .map(|target| {
+                        json!({
+                            "channel_id": target.channel_id.0,
+                            "provider_kind": format!("{:?}", target.provider_kind),
+                            "upstream_model": target.upstream_model,
+                            "priority": target.priority,
+                            "weight": target.weight,
+                            "enabled": target.enabled,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "id": id,
+                    "public_model": route.public_model,
+                    "strategy": route.strategy.as_str(),
+                    "targets": targets,
+                })
+            })
+            .collect();
+        model_routes.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+
+        json!({
+            "listen": config.listen.to_string(),
+            "limits": {
+                "max_request_body_bytes": config.max_request_body_bytes,
+                "max_model_catalog_body_bytes": config.max_model_catalog_body_bytes,
+                "max_error_body_bytes": config.max_error_body_bytes,
+            },
+            "timeout_profile_seconds": {
+                "connect": config.timeout_profile.connect.as_secs(),
+                "non_streaming_total": config.timeout_profile.non_streaming_total.as_secs(),
+                "streaming_idle": config.timeout_profile.streaming_idle.as_secs(),
+            },
+            "routing": {
+                "max_route_candidates": config.routing.max_route_candidates,
+                "max_model_catalog_channels": config.routing.max_model_catalog_channels,
+                "telemetry_buffer_capacity": config.routing.telemetry_buffer_capacity,
+            },
+            "response_filter": {
+                "effective": config.response_filter.is_effective(),
+                "redaction_decision": format!("{:?}", config.response_filter.inspect_text("unsafe-marker")),
+                "unchanged_decision": format!("{:?}", config.response_filter.inspect_text("ordinary response")),
+                "event_window_capacity": config.response_filter_event_window_capacity,
+                "alert_window_seconds": config.response_filter_alert_window.as_secs(),
+            },
+            "management_event_window_capacity": config.management_event_window_capacity,
+            "credential_store_path_configured": config.credential_store_path.is_some(),
+            "default_pool": config.default_pool,
+            "client_tokens": client_tokens,
+            "management_principals": management_principals,
+            "policy_profiles": policy_profiles,
+            "routing_profiles": routing_profiles,
+            "pools": pools,
+            "model_groups": model_groups,
+            "model_routes": model_routes,
+            "model_visibility_preview": Diagnostics::model_visibility_preview(config)
+                .into_iter()
+                .map(|projection| json!({
+                    "client_token_ref": projection.client_token_ref,
+                    "visible_models": projection.visible_models,
+                    "reason_code": projection.reason_code,
+                }))
+                .collect::<Vec<_>>(),
+        })
     }
 
     #[test]
@@ -359,9 +586,7 @@ upstreams:
         fs::create_dir_all(&root).unwrap();
         fs::write(&keys, "synthetic-upstream-key\n").unwrap();
         let config = write_config(&root, &representative_config(&keys));
-        let document = ConfigSource::yaml_file(&config)
-            .load_registry_document()
-            .unwrap();
+        let document = representative_document(&config);
         let repository = FileCredentialRepository::new();
 
         let compiled =
@@ -371,16 +596,45 @@ upstreams:
             .resolve_with_credential_repository_and_store_path(&repository, None)
             .unwrap();
 
-        assert_eq!(compiled.model_routes.len(), resolved.model_routes.len());
-        assert_eq!(compiled.pools.len(), resolved.pools.len());
+        let compiled_projection = resolved_config_parity_projection(&compiled);
+        let resolved_projection = resolved_config_parity_projection(&resolved);
+        assert_eq!(compiled_projection, resolved_projection);
         assert_eq!(
-            compiled.response_filter_event_window_capacity,
-            resolved.response_filter_event_window_capacity
+            compiled_projection["model_routes"][0]["targets"][0]["channel_id"],
+            "relay"
         );
         assert_eq!(
-            compiled.pools.get("relay").unwrap().config_generation,
-            resolved.pools.get("relay").unwrap().config_generation
+            compiled_projection["model_routes"][0]["targets"][0]["priority"],
+            10
         );
+        assert_eq!(
+            compiled_projection["model_routes"][0]["targets"][1]["channel_id"],
+            "relay-backup"
+        );
+        assert_eq!(
+            compiled_projection["model_routes"][0]["targets"][1]["weight"],
+            2
+        );
+        assert_eq!(compiled_projection["model_groups"][0]["id"], "coding");
+        assert_eq!(
+            compiled_projection["model_visibility_preview"][0]["visible_models"],
+            json!(["gpt-example"])
+        );
+        assert!(compiled_projection["response_filter"]["redaction_decision"]
+            .as_str()
+            .unwrap()
+            .contains("sample"));
+        assert!(compiled_projection["pools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pool| pool["id"] == "relay-backup"
+                && pool["endpoint_capabilities"]["models"] == "local_projection"));
+        assert!(compiled_projection["policy_profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|profile| profile["id"] == "generic-relay-cn"));
     }
 
     #[test]

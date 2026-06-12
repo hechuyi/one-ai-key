@@ -35,4 +35,5 @@ docker run --rm \
     nixpkgs#gcc \
     nixpkgs#pkg-config \
     nixpkgs#openssl \
+    nixpkgs#git \
     --command bash -lc '/work/scripts/local-ci.sh'
