@@ -70,8 +70,9 @@ one-ai-key serve --config config/local.yaml
 
 `check-config` is offline. It parses local YAML, expands `upstreams`, validates
 local references, counts local credential lines, and reports redacted model
-visibility. It does not open SQLite stores, probe upstreams, or call upstream
-catalogs.
+visibility from the same compiled control-plane projection used by runtime
+catalog assembly. It does not open SQLite stores, probe upstreams, or call
+upstream catalogs.
 
 Configure clients with the OpenAI-compatible base URL and a client token:
 
@@ -637,6 +638,8 @@ ONE_AI_KEY_MANAGEMENT_URL=<management-origin> \
 ONE_AI_KEY_CLIENT_TOKEN_ENV=ONE_AI_KEY_CLIENT_TOKEN \
 ONE_AI_KEY_MANAGEMENT_TOKEN_ENV=ONE_AI_KEY_MANAGEMENT_TOKEN \
 ONE_AI_KEY_PUBLIC_MODEL=<public-model-id> \
+ONE_AI_KEY_RELEASE_IDENTITY=<release-tag-or-version> \
+ONE_AI_KEY_CHECKSUM_IDENTITY=<checksum-identity> \
 scripts/production-smoke.sh --allow-production
 ```
 
@@ -644,4 +647,6 @@ The script refuses to run without `--allow-production`, reads token values only
 through the named environment variables, writes redacted JSON to a temporary
 directory unless `ONE_AI_KEY_OUTPUT_DIR` points outside the repository, and does
 not store raw request bodies, raw response bodies, complete URLs, or token
-values.
+values. `ONE_AI_KEY_RELEASE_IDENTITY` and `ONE_AI_KEY_CHECKSUM_IDENTITY` are
+optional short non-secret traceability fields; invalid or secret-like identity
+values are rejected instead of being recorded.

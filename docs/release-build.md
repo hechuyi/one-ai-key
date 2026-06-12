@@ -40,6 +40,12 @@ output and may be deleted when needed.
 the intended x86_64 Linux Nix environment or when a developer wants CI output
 without creating repository-local build artifacts.
 
+`scripts/local-ci.sh` is the source-tree verification gate. It rejects
+repository-local `target/`, runs staged denylist self-tests and public-plan
+hygiene checks, runs `git diff --check`, then runs `cargo fmt -- --check`,
+`cargo check --locked`, `cargo clippy --locked -- -D warnings`, and
+`cargo test --locked`.
+
 `scripts/build-release-x86_64-linux.sh` is the container entrypoint, not the
 host entrypoint. It rejects non-Linux hosts, non-`x86_64` machines, and
 environments without Nix, Cargo, or rustc from the active Nix shell. The default
@@ -169,7 +175,9 @@ deployment URLs, raw tokens, or a deployment host.
     default remote targets in local CI or release scripts. When using the
     repository harness, provide `ONE_AI_KEY_PUBLIC_BASE_URL`,
     `ONE_AI_KEY_MANAGEMENT_URL`, `ONE_AI_KEY_CLIENT_TOKEN_ENV`,
-    `ONE_AI_KEY_MANAGEMENT_TOKEN_ENV`, and `ONE_AI_KEY_PUBLIC_MODEL`, then run
+    `ONE_AI_KEY_MANAGEMENT_TOKEN_ENV`, and `ONE_AI_KEY_PUBLIC_MODEL`; optionally
+    provide short non-secret `ONE_AI_KEY_RELEASE_IDENTITY` and
+    `ONE_AI_KEY_CHECKSUM_IDENTITY` values for traceability, then run
     `scripts/production-smoke.sh --allow-production`; the script writes only
     redacted JSON and is not a release or CI gate.
 13. Deployment records must contain only redacted status, reason codes, route

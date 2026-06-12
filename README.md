@@ -100,9 +100,9 @@ one-ai-key check-config --config config/local.yaml --output json
 ```
 
 `check-config` parses YAML, expands `upstreams`, validates local references,
-counts local credential lines, and reports a redacted model visibility preview.
-It does not open SQLite stores, start the HTTP listener, probe upstreams, or call
-upstream `/v1/models`.
+counts local credential lines, and reports a redacted model visibility preview
+from the compiled control-plane projection. It does not open SQLite stores,
+start the HTTP listener, probe upstreams, or call upstream `/v1/models`.
 
 Example `config/local.yaml`:
 
