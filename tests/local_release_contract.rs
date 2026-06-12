@@ -1757,7 +1757,7 @@ fn operator_confidence_local_release_ready_record_is_public_and_bounded() {
     let record = read_repo_file(path);
     for required in [
         "Stop node: `v0.2_local_release_ready`",
-        &format!("Cargo package version: `{}`", env!("CARGO_PKG_VERSION")),
+        "Cargo package version: `0.2.1`",
         "M1-M4 operator confidence baseline",
         "local CI: `pass`",
         "release artifact build: `pass`",
@@ -1808,7 +1808,7 @@ fn operator_confidence_published_release_record_is_public_and_bounded() {
     let record = read_repo_file(path);
     for required in [
         "Stop node: `v0.2_published_release_complete`",
-        &format!("Cargo package version: `{}`", env!("CARGO_PKG_VERSION")),
+        "Cargo package version: `0.2.1`",
         "Git tag: `v0.2.1`",
         "Release URL: `https://github.com/hechuyi/one-ai-key/releases/tag/v0.2.1`",
         "`one-ai-key-0.2.1-x86_64-unknown-linux-gnu.tar.gz`",
@@ -1856,7 +1856,7 @@ fn operator_confidence_deployment_pin_record_is_public_and_bounded() {
     let record = read_repo_file(path);
     for required in [
         "Stop node: `v0.2_deployment_pin_verified`",
-        &format!("Cargo package version: `{}`", env!("CARGO_PKG_VERSION")),
+        "Cargo package version: `0.2.1`",
         "Git tag: `v0.2.1`",
         "`one-ai-key-0.2.1-x86_64-unknown-linux-gnu.tar.gz`",
         "`8411d6ccbaaeb8bf14f1283a059197fcbe9cd9c3364d91b3f1bf2dd980df5ab9`",
