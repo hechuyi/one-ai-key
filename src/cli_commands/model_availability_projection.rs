@@ -493,6 +493,16 @@ fn sanitize_availability_evidence(evidence: Option<&Value>) -> Value {
             Value::Array(reason_codes),
         );
     }
+    if let Some(primary_reason) = evidence
+        .get("admission_primary_reason_code")
+        .and_then(Value::as_str)
+        .filter(|value| is_safe_reason_code(value))
+    {
+        sanitized.insert(
+            "admission_primary_reason_code".to_string(),
+            Value::from(primary_reason),
+        );
+    }
     Value::Object(sanitized)
 }
 

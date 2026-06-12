@@ -23,7 +23,7 @@ use crate::{
     },
     response_filter::{ResponseFilterDecision, ResponseFilterMatch},
     route_plan::{
-        plan_route, preview_route, route_preview_reason_is_hard_blocker,
+        plan_route, preview_route, route_admission_summary, route_preview_reason_is_hard_blocker,
         route_preview_reason_is_soft_suppression, ChannelRouteState, RouteCandidate, RoutePlan,
         RoutePlanInput, RoutePreview, RoutePreviewInput, RoutePreviewReason,
     },
@@ -591,6 +591,7 @@ fn record_route_admission_denied(
     denial: RouteAdmissionDenial<'_>,
 ) {
     let (hard_reason_codes, soft_reason_codes) = admission_reason_codes(preview);
+    let admission_summary = route_admission_summary(preview);
     record_routing_telemetry(
         state,
         RoutingTelemetry::RouteAdmissionDenied {
@@ -602,6 +603,8 @@ fn record_route_admission_denied(
             route_kind: denial.route_kind.to_string(),
             reason_code: denial.reason_code.to_string(),
             blocking_domain: denial.blocking_domain.to_string(),
+            admission_status: admission_summary.status.as_str().to_string(),
+            admission_primary_reason_code: admission_summary.primary_reason_code.to_string(),
             client_visible_status: denial.client_visible_status.as_u16(),
             upstream_status: None,
             candidate_count: preview.candidates.len(),
@@ -642,6 +645,10 @@ fn record_single_route_admission_denied(
     public_model: Option<&str>,
     hard_reason_codes: &[&str],
 ) {
+    let admission_primary_reason_code = hard_reason_codes
+        .first()
+        .copied()
+        .unwrap_or(denial.reason_code);
     record_routing_telemetry(
         state,
         RoutingTelemetry::RouteAdmissionDenied {
@@ -653,6 +660,8 @@ fn record_single_route_admission_denied(
             route_kind: denial.route_kind.to_string(),
             reason_code: denial.reason_code.to_string(),
             blocking_domain: denial.blocking_domain.to_string(),
+            admission_status: "unavailable".to_string(),
+            admission_primary_reason_code: admission_primary_reason_code.to_string(),
             client_visible_status: denial.client_visible_status.as_u16(),
             upstream_status: None,
             candidate_count: 1,

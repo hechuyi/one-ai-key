@@ -687,6 +687,8 @@ pub struct EndpointFamilyAvailabilityEvidence {
     pub preview_candidate_count: usize,
     pub selected_target_present: bool,
     pub candidate_limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_primary_reason_code: Option<&'static str>,
     pub candidate_reason_codes: Vec<&'static str>,
 }
 
@@ -1219,6 +1221,9 @@ fn endpoint_family_availability_evidence(
             .and_then(|preview| preview.selected_target_index)
             .is_some(),
         candidate_limit: input.candidate_limit,
+        admission_primary_reason_code: preview
+            .map(route_admission_summary)
+            .map(|summary| summary.primary_reason_code),
         candidate_reason_codes: preview
             .map(endpoint_family_candidate_reason_codes)
             .unwrap_or_default(),

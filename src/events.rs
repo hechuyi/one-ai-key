@@ -159,6 +159,8 @@ pub enum RoutingTelemetry {
         route_kind: String,
         reason_code: String,
         blocking_domain: String,
+        admission_status: String,
+        admission_primary_reason_code: String,
         client_visible_status: u16,
         upstream_status: Option<u16>,
         candidate_count: usize,
@@ -1728,6 +1730,8 @@ mod tests {
             route_kind: "explicit_model_route".to_string(),
             reason_code: "no_route_candidate".to_string(),
             blocking_domain: "route".to_string(),
+            admission_status: "unavailable".to_string(),
+            admission_primary_reason_code: "client_channel_scope".to_string(),
             client_visible_status: 503,
             upstream_status: None,
             candidate_count: 3,
@@ -1754,6 +1758,11 @@ mod tests {
         assert_eq!(value["client_token_ref"], "local-client");
         assert_eq!(value["reason_code"], "no_route_candidate");
         assert_eq!(value["blocking_domain"], "route");
+        assert_eq!(value["admission_status"], "unavailable");
+        assert_eq!(
+            value["admission_primary_reason_code"],
+            "client_channel_scope"
+        );
         assert_eq!(value["client_visible_status"], 503);
         assert!(value["upstream_status"].is_null());
         assert_eq!(value["candidate_count"], 3);

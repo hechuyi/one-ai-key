@@ -410,6 +410,8 @@ fn project_route_admission_denied_event(event: &RoutingTelemetry) -> Option<Valu
         route_kind,
         reason_code,
         blocking_domain,
+        admission_status,
+        admission_primary_reason_code,
         client_visible_status,
         candidate_count,
         included_count,
@@ -425,6 +427,7 @@ fn project_route_admission_denied_event(event: &RoutingTelemetry) -> Option<Valu
         return None;
     };
     let reason_code = stable_admission_reason_code(reason_code);
+    let admission_primary_reason_code = stable_admission_reason_code(admission_primary_reason_code);
     let contract = diagnostic_contract_for(reason_code);
     let client_visible_status = local_client_visible_status(*client_visible_status);
     Some(json!({
@@ -447,8 +450,8 @@ fn project_route_admission_denied_event(event: &RoutingTelemetry) -> Option<Valu
         "blocking_domain": safe_management_code(blocking_domain),
         "admission": {
             "registry_generation": registry_generation,
-            "status": "unavailable",
-            "primary_reason_code": reason_code,
+            "status": safe_management_code(admission_status),
+            "primary_reason_code": admission_primary_reason_code,
             "candidate_count": candidate_count,
             "included_count": included_count,
             "blocked_count": blocked_count,
@@ -634,6 +637,21 @@ fn stable_admission_reason_code(value: &str) -> &'static str {
         "no_route_candidate" => "no_route_candidate",
         "unsupported_endpoint_family" => "unsupported_endpoint_family",
         "credential_unavailable" => "credential_unavailable",
+        "available" => "available",
+        "target_disabled" => "target_disabled",
+        "client_channel_scope" => "client_channel_scope",
+        "channel_disabled" => "channel_disabled",
+        "channel_cooling_down" => "channel_cooling_down",
+        "provider_cooling_down" => "provider_cooling_down",
+        "credential_cooling_down" => "credential_cooling_down",
+        "no_available_credentials" => "no_available_credentials",
+        "runtime_unavailable" => "runtime_unavailable",
+        "channel_degraded" => "channel_degraded",
+        "degraded_last_resort" => "degraded_last_resort",
+        "provider_cooling_down_last_resort" => "provider_cooling_down_last_resort",
+        "credential_cooling_down_last_resort" => "credential_cooling_down_last_resort",
+        "unknown_channel" => "unknown_channel",
+        "candidate_limit" => "candidate_limit",
         _ => "no_route_candidate",
     }
 }
@@ -733,6 +751,8 @@ fn sanitize_routing_telemetry(event: RoutingTelemetry) -> Value {
             route_kind,
             reason_code,
             blocking_domain,
+            admission_status,
+            admission_primary_reason_code,
             client_visible_status,
             candidate_count,
             included_count,
@@ -753,6 +773,8 @@ fn sanitize_routing_telemetry(event: RoutingTelemetry) -> Value {
             "route_kind": safe_management_id(&route_kind),
             "reason_code": safe_management_id(&reason_code),
             "blocking_domain": safe_management_id(&blocking_domain),
+            "admission_status": safe_management_id(&admission_status),
+            "admission_primary_reason_code": safe_management_id(&admission_primary_reason_code),
             "client_visible_status": client_visible_status,
             "upstream_status": Value::Null,
             "candidate_count": candidate_count,
@@ -2113,6 +2135,8 @@ mod tests {
                     route_kind: "explicit_model_route".to_string(),
                     reason_code: "no_route_candidate".to_string(),
                     blocking_domain: "route".to_string(),
+                    admission_status: "unavailable".to_string(),
+                    admission_primary_reason_code: "channel_disabled".to_string(),
                     client_visible_status: 503,
                     upstream_status: None,
                     candidate_count: 2,
@@ -2152,7 +2176,7 @@ mod tests {
         assert_eq!(local["admission"]["status"], "unavailable");
         assert_eq!(
             local["admission"]["primary_reason_code"],
-            "no_route_candidate"
+            "channel_disabled"
         );
         assert_eq!(local["admission"]["included_count"], 0);
         assert_eq!(
@@ -2196,6 +2220,8 @@ mod tests {
                     route_kind: "explicit_model_route".to_string(),
                     reason_code: "no_route_candidate".to_string(),
                     blocking_domain: "route".to_string(),
+                    admission_status: "unavailable".to_string(),
+                    admission_primary_reason_code: "channel_cooling_down".to_string(),
                     client_visible_status: 503,
                     upstream_status: None,
                     candidate_count: 1,

@@ -1318,6 +1318,7 @@ mod tests {
             "evidence": {
                 "route_target_count": 2,
                 "endpoint_family_target_count": 1,
+                "admission_primary_reason_code": "no_available_credentials",
                 "candidate_reason_codes": ["no_available_credentials", "token_hash_SHOULD_NOT_RENDER"],
                 "raw_secret": "SHOULD_NOT_RENDER"
             },
@@ -1358,6 +1359,10 @@ mod tests {
         assert_eq!(
             report["evidence"]["candidate_reason_codes"],
             serde_json::json!(["no_available_credentials"])
+        );
+        assert_eq!(
+            report["evidence"]["admission_primary_reason_code"],
+            "no_available_credentials"
         );
         assert_eq!(report["next_action"]["template_id"], "no_action_required");
         assert_eq!(report["next_action"]["safe_argv"], serde_json::json!([]));
