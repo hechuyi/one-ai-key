@@ -29,6 +29,9 @@ docker run --rm \
     nixpkgs#rustc \
     nixpkgs#rustfmt \
     nixpkgs#clippy \
+    nixpkgs#bash \
+    nixpkgs#curl \
+    nixpkgs#jq \
     nixpkgs#gcc \
     nixpkgs#pkg-config \
     nixpkgs#openssl \

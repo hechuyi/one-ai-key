@@ -264,43 +264,8 @@ mod tests {
     use std::{
         env, fs,
         path::{Path, PathBuf},
-        sync::{Mutex, OnceLock},
         time::{SystemTime, UNIX_EPOCH},
     };
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn env_lock() -> &'static Mutex<()> {
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct EnvRestore {
-        credential_store: Option<std::ffi::OsString>,
-    }
-
-    impl EnvRestore {
-        fn capture() -> Self {
-            Self {
-                credential_store: env::var_os("KEY_POOL_ROUTER_SQLITE_CREDENTIAL_STORE"),
-            }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            restore_env_var(
-                "KEY_POOL_ROUTER_SQLITE_CREDENTIAL_STORE",
-                self.credential_store.take(),
-            );
-        }
-    }
-
-    fn restore_env_var(name: &str, value: Option<std::ffi::OsString>) {
-        match value {
-            Some(value) => env::set_var(name, value),
-            None => env::remove_var(name),
-        }
-    }
 
     fn unique_temp_root() -> PathBuf {
         let suffix = SystemTime::now()
@@ -389,9 +354,6 @@ upstreams:
 
     #[test]
     fn config_compiler_matches_registry_document_resolver() {
-        let _guard = env_lock().lock().unwrap();
-        let _restore = EnvRestore::capture();
-        env::remove_var("KEY_POOL_ROUTER_SQLITE_CREDENTIAL_STORE");
         let root = unique_temp_root();
         let keys = root.join("relay.keys");
         fs::create_dir_all(&root).unwrap();
@@ -459,9 +421,6 @@ upstreams:
 
     #[test]
     fn runtime_assembler_covers_startup_and_replacement_boundary() {
-        let _guard = env_lock().lock().unwrap();
-        let _restore = EnvRestore::capture();
-        env::remove_var("KEY_POOL_ROUTER_SQLITE_CREDENTIAL_STORE");
         let root = unique_temp_root();
         let keys = root.join("relay.keys");
         fs::create_dir_all(&root).unwrap();
