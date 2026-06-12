@@ -208,6 +208,13 @@ pub fn classify_action(action: &CliAction) -> CommandEffect {
         CliAction::FailuresTail(_)
         | CliAction::FailuresExplain(_)
         | CliAction::ResponseFilterEvents(_) => runtime_readonly_store_reads_effect(),
+        CliAction::ResponseFilterCheck(_) => CommandEffect {
+            side_effect_class: SideEffectClass::OfflineReadonly,
+            effect_vector: EffectVector {
+                reads_local_files: true,
+                ..EffectVector::default()
+            },
+        },
         CliAction::Doctor(options) => {
             let mut effect = runtime_readonly_effect();
             if options.include_alerts || options.include_events {
@@ -1482,6 +1489,36 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn classifies_response_filter_check_as_offline_readonly_local_file_read() {
+        let action = CliAction::ResponseFilterCheck(
+            crate::cli_commands::response_filter_check::ResponseFilterCheckOptions {
+                config_path: std::path::PathBuf::from("config/local.yaml"),
+                samples_path: std::path::PathBuf::from("samples/response-filter.yaml"),
+                output: crate::cli_report::OutputFormat::Json,
+            },
+        );
+
+        let effect = super::classify_action(&action);
+
+        assert_eq!(
+            effect.side_effect_class,
+            super::SideEffectClass::OfflineReadonly
+        );
+        assert_eq!(
+            effect.effect_vector,
+            super::EffectVector {
+                reads_local_files: true,
+                reads_management_runtime: false,
+                reads_management_store: false,
+                writes_local_files: false,
+                writes_management_store: false,
+                calls_upstream: false,
+                mutates_runtime: false,
+            }
+        );
     }
 
     #[test]

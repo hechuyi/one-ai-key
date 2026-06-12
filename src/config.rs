@@ -1906,6 +1906,10 @@ impl RoutingConfig {
 }
 
 impl ResponseFilterConfig {
+    pub(crate) fn resolve_for_offline_check(self) -> anyhow::Result<ResolvedResponseFilterConfig> {
+        self.resolve()
+    }
+
     fn resolve(self) -> anyhow::Result<ResolvedResponseFilterConfig> {
         let mut rule_ids = HashSet::new();
         let mut rules = Vec::new();

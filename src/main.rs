@@ -193,6 +193,11 @@ async fn main() -> anyhow::Result<()> {
             println!("{report}");
             Ok(())
         }
+        cli::CliAction::ResponseFilterCheck(options) => {
+            let report = cli_commands::response_filter_check::run(options)?;
+            println!("{report}");
+            Ok(())
+        }
         cli::CliAction::Doctor(options) => {
             let report = cli_commands::doctor::run(options).await?;
             println!("{report}");

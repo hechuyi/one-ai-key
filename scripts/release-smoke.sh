@@ -173,6 +173,8 @@ UPSTREAM_TOKEN="release-smoke-upstream-token"
 REPLACEMENT_TOKEN="release-smoke-replacement-token"
 INVALID_CLIENT_TOKEN="release-smoke-invalid-client-token"
 NEW_CLIENT_TOKEN="release-smoke-new-client-token"
+RESPONSE_FILTER_REDACT_MARKER="RELEASE_SMOKE_REDACT_ME"
+RESPONSE_FILTER_REJECT_MARKER="RELEASE_SMOKE_REJECT_ME"
 SERVICE_PORT=$(python3 - <<'PY'
 import socket
 with socket.socket() as sock:
@@ -314,6 +316,32 @@ text = text.replace("https://relay.example/v1", mock_upstream_url)
 path.write_text(text)
 PY
 printf '%s\n' "${UPSTREAM_TOKEN}" > data/relay.keys
+cat >> config/local.yaml <<YAML
+response_filter:
+  enabled: true
+  replacement: "[release-smoke-filtered]"
+  rules:
+    - id: release-smoke-redact
+      kind: literal
+      action: redact
+      value: "${RESPONSE_FILTER_REDACT_MARKER}"
+    - id: release-smoke-reject
+      kind: literal
+      action: reject
+      value: "${RESPONSE_FILTER_REJECT_MARKER}"
+YAML
+cat > response-filter-samples.yaml <<YAML
+- id: release-smoke-redaction
+  content_kind: plain
+  body: "local sample ${RESPONSE_FILTER_REDACT_MARKER}"
+  expect_outcome: redacted
+  expect_rule_ids: ["release-smoke-redact"]
+- id: release-smoke-rejection
+  content_kind: plain
+  body: "local sample ${RESPONSE_FILTER_REJECT_MARKER}"
+  expect_outcome: rejected
+  expect_rule_ids: ["release-smoke-reject"]
+YAML
 
 "${BIN}" --config config/local.yaml check-config --output json \
   | tee check-config.json \
@@ -426,6 +454,7 @@ EXPECTED_MANAGEMENT_REPORTS=(
   "keys-restore-apply.json"
   "keys-stats-after-restore.json"
   "failures-tail.json"
+  "response-filter-check.json"
   "response-filter-events.json"
   "reload-status.json"
   "reload-diff.json"
@@ -599,6 +628,8 @@ assert_no_management_report_leaks() {
     "${RAW_BODY_TEXT}"
     "${UPSTREAM_503_MARKER}"
     "${LOCAL_ADMISSION_MARKER}"
+    "${RESPONSE_FILTER_REDACT_MARKER}"
+    "${RESPONSE_FILTER_REJECT_MARKER}"
   )
   local report
   local forbidden
@@ -1032,6 +1063,20 @@ jq -e '
   and .data.failure_count == 0
   and (.data.failures | length == 0)
 ' failures-tail.json >/dev/null
+capture_management_report response-filter-check.json --config config/local.yaml response-filters check --samples response-filter-samples.yaml --output json
+jq -e '
+  .status == "ok"
+  and .reason_code == "response_filter_samples_passed"
+  and .side_effect_class == "offline_readonly"
+  and .effect_vector.reads_local_files == true
+  and .effect_vector.calls_upstream == false
+  and .effect_vector.writes_management_store == false
+  and .data.sample_count == 2
+  and .data.failed_count == 0
+  and (.data.samples | length == 2)
+  and (.data.samples[] | select(.sample_id == "release-smoke-redaction") | .actual_outcome == "redacted" and (.matched_rule_ids | index("release-smoke-redact") != null))
+  and (.data.samples[] | select(.sample_id == "release-smoke-rejection") | .actual_outcome == "rejected" and (.matched_rule_ids | index("release-smoke-reject") != null))
+' response-filter-check.json >/dev/null
 capture_management_report response-filter-events.json response-filters events --last 20 --output json
 jq -e '
   .status == "ok"

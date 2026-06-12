@@ -29,6 +29,7 @@ pub enum CliAction {
     FailuresTail(crate::cli_commands::failures::FailureTailOptions),
     FailuresExplain(crate::cli_commands::failures::FailureExplainOptions),
     ResponseFilterEvents(crate::cli_commands::response_filter_events::ResponseFilterEventsOptions),
+    ResponseFilterCheck(crate::cli_commands::response_filter_check::ResponseFilterCheckOptions),
     Doctor(crate::cli_commands::doctor::DoctorOptions),
 }
 
@@ -198,6 +199,7 @@ enum FailuresCommand {
 #[derive(Debug, Subcommand)]
 enum ResponseFiltersCommand {
     Events(ResponseFilterEventsArgs),
+    Check(ResponseFilterCheckArgs),
 }
 
 #[derive(Debug, Args)]
@@ -627,6 +629,17 @@ struct ResponseFilterEventsArgs {
 
 #[derive(Debug, Args)]
 #[command(
+    long_about = "Validate configured response-filter rules against local samples. Side-effect class: offline_readonly. Reads local files: yes. Writes local files: no. Calls upstreams: no. Mutates management state or active runtime: no."
+)]
+struct ResponseFilterCheckArgs {
+    #[arg(long)]
+    samples: PathBuf,
+    #[arg(long, value_enum, default_value_t = crate::cli_report::OutputFormat::Table)]
+    output: crate::cli_report::OutputFormat,
+}
+
+#[derive(Debug, Args)]
+#[command(
     about = "Read-only runtime doctor",
     long_about = "Read-only runtime doctor. Side-effect class: runtime_readonly. Writes local files: no. Calls upstreams: no. Mutates management state or active runtime: no."
 )]
@@ -676,6 +689,7 @@ where
 {
     let cli = Cli::try_parse_from(args)?;
     let operator_connection_options = cli.operator_connection_options();
+    let config_path = PathBuf::from(cli.config.clone());
     Ok(match cli.command {
         Some(CliCommand::Serve) | None => CliAction::Serve {
             config_path: cli.config,
@@ -1033,6 +1047,15 @@ where
                 public_model: args.public_model,
                 channel_id: args.channel_id,
                 action: args.action,
+                output: args.output,
+            },
+        ),
+        Some(CliCommand::ResponseFilters {
+            command: ResponseFiltersCommand::Check(args),
+        }) => CliAction::ResponseFilterCheck(
+            crate::cli_commands::response_filter_check::ResponseFilterCheckOptions {
+                config_path,
+                samples_path: args.samples,
                 output: args.output,
             },
         ),
@@ -2788,6 +2811,33 @@ mod tests {
                     public_model: Some("gpt-example".to_string()),
                     channel_id: Some("relay-a".to_string()),
                     action: Some("reject".to_string()),
+                    output: crate::cli_report::OutputFormat::Json,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn response_filters_check_parse_uses_config_and_local_samples() {
+        let action = parse_action_from([
+            "one-ai-key",
+            "--config",
+            "config/local.yaml",
+            "response-filters",
+            "check",
+            "--samples",
+            "samples/response-filter.yaml",
+            "--output",
+            "json",
+        ])
+        .expect("response filter check should parse");
+
+        assert_eq!(
+            action,
+            CliAction::ResponseFilterCheck(
+                crate::cli_commands::response_filter_check::ResponseFilterCheckOptions {
+                    config_path: PathBuf::from("config/local.yaml"),
+                    samples_path: PathBuf::from("samples/response-filter.yaml"),
                     output: crate::cli_report::OutputFormat::Json,
                 }
             )
