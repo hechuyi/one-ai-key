@@ -447,6 +447,8 @@ fn project_route_admission_denied_event(event: &RoutingTelemetry) -> Option<Valu
         "blocking_domain": safe_management_code(blocking_domain),
         "admission": {
             "registry_generation": registry_generation,
+            "status": "unavailable",
+            "primary_reason_code": reason_code,
             "candidate_count": candidate_count,
             "included_count": included_count,
             "blocked_count": blocked_count,
@@ -2147,6 +2149,11 @@ mod tests {
         assert_eq!(local["client_visible_status"], "local_503");
         assert!(local["upstream_status"].is_null());
         assert_eq!(local["admission"]["candidate_count"], 2);
+        assert_eq!(local["admission"]["status"], "unavailable");
+        assert_eq!(
+            local["admission"]["primary_reason_code"],
+            "no_route_candidate"
+        );
         assert_eq!(local["admission"]["included_count"], 0);
         assert_eq!(
             local["admission"]["hard_reason_codes"]

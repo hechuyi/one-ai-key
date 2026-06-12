@@ -605,6 +605,16 @@ fn projected_admission(value: Option<&Value>) -> Value {
 
     serde_json::json!({
         "registry_generation": object.get("registry_generation").and_then(Value::as_u64),
+        "status": object
+            .get("status")
+            .and_then(Value::as_str)
+            .and_then(sanitize_local_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+        "primary_reason_code": object
+            .get("primary_reason_code")
+            .and_then(Value::as_str)
+            .and_then(sanitize_local_string)
+            .unwrap_or_else(|| "unknown".to_string()),
         "candidate_count": candidate_count,
         "included_count": included_count,
         "blocked_count": blocked_count,
@@ -1363,6 +1373,8 @@ mod tests {
                     "blocking_domain": "route",
                     "admission": {
                         "registry_generation": 9,
+                        "status": "unavailable",
+                        "primary_reason_code": "no_route_candidate",
                         "candidate_count": 3,
                         "included_count": 0,
                         "blocked_count": 3,
@@ -1445,6 +1457,11 @@ mod tests {
         assert_eq!(local_failure["client_visible_status"], "local_503");
         assert!(local_failure["upstream_status"].is_null());
         assert_eq!(local_failure["admission"]["candidate_count"], 3);
+        assert_eq!(local_failure["admission"]["status"], "unavailable");
+        assert_eq!(
+            local_failure["admission"]["primary_reason_code"],
+            "no_route_candidate"
+        );
         assert_eq!(local_failure["admission"]["included_count"], 0);
         assert_eq!(
             local_failure["admission"]["hard_reason_codes"][0],

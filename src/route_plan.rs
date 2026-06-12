@@ -149,6 +149,7 @@ pub struct RouteAdmissionSelectedTarget {
 pub struct RouteAdmissionSummary {
     pub status: RouteAdmissionStatus,
     pub reason_code: &'static str,
+    pub primary_reason_code: &'static str,
     pub selected_target: Option<RouteAdmissionSelectedTarget>,
     pub candidate_count: usize,
     pub included_count: usize,
@@ -333,6 +334,7 @@ pub fn route_admission_summary(preview: &RoutePreview) -> RouteAdmissionSummary 
     RouteAdmissionSummary {
         status,
         reason_code,
+        primary_reason_code: reason_code,
         selected_target,
         candidate_count,
         included_count,

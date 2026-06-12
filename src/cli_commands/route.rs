@@ -264,6 +264,7 @@ fn sanitize_admission_summary(summary: Option<&Value>) -> Value {
         return serde_json::json!({
             "status": "unknown",
             "reason_code": "admission_summary_missing",
+            "primary_reason_code": "admission_summary_missing",
             "selected_target": Value::Null,
             "candidate_count": Value::Null,
             "included_count": Value::Null,
@@ -278,6 +279,7 @@ fn sanitize_admission_summary(summary: Option<&Value>) -> Value {
     serde_json::json!({
         "status": safe_admission_code(summary.get("status")),
         "reason_code": safe_admission_code(summary.get("reason_code")),
+        "primary_reason_code": safe_admission_code(summary.get("primary_reason_code")),
         "selected_target": sanitize_target(summary.get("selected_target")),
         "candidate_count": summary.get("candidate_count").and_then(Value::as_u64),
         "included_count": summary.get("included_count").and_then(Value::as_u64),
@@ -622,6 +624,11 @@ fn append_admission_summary_table_fields(output: &mut String, admission_summary:
         "admission.reason_code",
         admission_summary.get("reason_code"),
     );
+    crate::cli_report::push_table_field(
+        output,
+        "admission.primary_reason_code",
+        admission_summary.get("primary_reason_code"),
+    );
     let selected = admission_summary.get("selected_target");
     let selected_channel = selected
         .and_then(|target| target.get("channel_id"))
@@ -880,6 +887,7 @@ mod tests {
             "admission_summary": {
                 "status": "last_resort",
                 "reason_code": "provider_cooling_down_last_resort",
+                "primary_reason_code": "provider_cooling_down_last_resort",
                 "selected_target": {"channel_id": "relay-a", "plan_position": 0},
                 "candidate_count": 3,
                 "included_count": 1,
@@ -913,6 +921,10 @@ mod tests {
             "provider_cooling_down_last_resort"
         );
         assert_eq!(
+            report["admission_summary"]["primary_reason_code"],
+            "provider_cooling_down_last_resort"
+        );
+        assert_eq!(
             report["admission_summary"]["selected_target"]["channel_id"],
             "relay-a"
         );
@@ -935,6 +947,8 @@ mod tests {
         assert!(rendered_table.contains("reason_code: provider_cooling_down_last_resort"));
         assert!(rendered_table.contains("admission.status: last_resort"));
         assert!(rendered_table.contains("admission.reason_code: provider_cooling_down_last_resort"));
+        assert!(rendered_table
+            .contains("admission.primary_reason_code: provider_cooling_down_last_resort"));
         assert!(rendered_table.contains("admission.selected_target: relay-a"));
         assert!(rendered_table.contains("admission.selected_plan_position: 0"));
         assert!(rendered_table.contains("admission.candidate_count: 3"));

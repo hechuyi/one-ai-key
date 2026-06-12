@@ -406,6 +406,7 @@ fn routing_preview_selected_target_from_route_summary(
 pub struct RoutingPreviewAdmissionSummary {
     pub status: &'static str,
     pub reason_code: &'static str,
+    pub primary_reason_code: &'static str,
     pub selected_target: Option<RoutingPreviewSelectedTarget>,
     pub candidate_count: usize,
     pub included_count: usize,
@@ -421,6 +422,7 @@ impl RoutingPreviewAdmissionSummary {
         Self {
             status: summary.status.as_str(),
             reason_code: summary.reason_code,
+            primary_reason_code: summary.primary_reason_code,
             selected_target: routing_preview_selected_target_from_route_summary(
                 &summary.selected_target,
             ),
@@ -1760,6 +1762,7 @@ mod tests {
         RouteAdmissionSummary {
             status,
             reason_code,
+            primary_reason_code: reason_code,
             selected_target,
             candidate_count,
             included_count,
@@ -1790,6 +1793,7 @@ mod tests {
         let summary = &value["admission_summary"];
         assert_eq!(summary["status"], "available");
         assert_eq!(summary["reason_code"], "available");
+        assert_eq!(summary["primary_reason_code"], "available");
         assert_eq!(summary["selected_target"]["channel_id"], "ch1");
         assert_eq!(summary["selected_target"]["plan_position"], 0);
         assert_eq!(summary["candidate_count"], 1);
@@ -1828,6 +1832,7 @@ mod tests {
         let summary = &value["admission_summary"];
         assert_eq!(summary["status"], "unavailable");
         assert_eq!(summary["reason_code"], "channel_cooling_down");
+        assert_eq!(summary["primary_reason_code"], "channel_cooling_down");
         assert!(summary["selected_target"].is_null());
         assert_eq!(summary["candidate_count"], 1);
         assert_eq!(summary["included_count"], 0);
