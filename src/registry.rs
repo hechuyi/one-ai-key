@@ -1,13 +1,9 @@
-use std::{collections::HashMap, fs, net::SocketAddr, path::PathBuf};
-
-use anyhow::Context;
-use serde::Deserialize;
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use crate::config::{
-    reject_unknown_top_level_config_fields, AccountConfig, AppConfig, ClientTokenConfig,
-    CredentialSetConfig, ManagementConfig, ModelGroupConfig, ModelRouteConfig, PolicyProfileConfig,
-    PoolConfig, ProviderConfig, ResolvedConfig, ResponseFilterConfig, RoutingConfig,
-    RoutingProfileConfig, TimeoutConfig,
+    AccountConfig, AppConfig, ClientTokenConfig, CredentialSetConfig, ManagementConfig,
+    ModelGroupConfig, ModelRouteConfig, PolicyProfileConfig, PoolConfig, ProviderConfig,
+    ResolvedConfig, ResponseFilterConfig, RoutingConfig, RoutingProfileConfig, TimeoutConfig,
 };
 use crate::credential_repository::{
     CredentialRepository, FileCredentialRepository, SqliteCredentialRepository,
@@ -30,30 +26,8 @@ impl YamlRegistryRepository {
 
 impl RegistryRepository for YamlRegistryRepository {
     fn load_registry(&self) -> anyhow::Result<RegistryDocument> {
-        let raw = fs::read_to_string(&self.path)
-            .with_context(|| format!("read registry config {}", self.path.display()))?;
-        let raw = crate::upstream_templates::expand_raw_yaml(&raw)
-            .with_context(|| format!("expand upstream templates {}", self.path.display()))?;
-        reject_unknown_top_level_config_fields(&raw, &["model_groups", "response_filter"])
-            .with_context(|| format!("validate registry config YAML {}", self.path.display()))?;
-        let mut cfg: RegistryYamlDocument = serde_yaml::from_str(&raw)
-            .with_context(|| format!("parse registry config YAML {}", self.path.display()))?;
-        cfg.app.apply_compatibility_defaults();
-        let mut document = cfg.app.into_registry_document();
-        document.model_groups = cfg.model_groups;
-        document.response_filter = cfg.response_filter;
-        Ok(document)
+        crate::control_plane::ConfigSource::yaml_file(self.path.clone()).load_registry_document()
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct RegistryYamlDocument {
-    #[serde(flatten)]
-    app: AppConfig,
-    #[serde(default)]
-    model_groups: HashMap<String, ModelGroupConfig>,
-    #[serde(default)]
-    response_filter: ResponseFilterConfig,
 }
 
 #[derive(Clone)]

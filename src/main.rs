@@ -8,6 +8,7 @@ mod client_token_store;
 mod config;
 mod config_diagnostics;
 mod confirmation_gate;
+mod control_plane;
 mod credential_probe;
 mod credential_repository;
 mod credentials;
@@ -65,7 +66,6 @@ use axum::{
 };
 #[cfg(test)]
 use config::AppConfig;
-use registry::{RegistryRepository, YamlRegistryRepository};
 use registry_store::{RegistryStoreHandle, SqliteRegistryStore};
 use state::AppState;
 use std::net::SocketAddr;
@@ -207,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(config_path: String) -> anyhow::Result<()> {
-    let registry = YamlRegistryRepository::new(config_path).load_registry()?;
+    let registry = control_plane::ConfigSource::yaml_file(config_path).load_registry_document()?;
     let registry_startup = match std::env::var_os("KEY_POOL_ROUTER_SQLITE_REGISTRY_STORE") {
         Some(path) => SqliteRegistryStore::load_or_bootstrap_startup_document(path, registry)?,
         None => registry_store::RegistryStartupDocument {
@@ -216,9 +216,14 @@ async fn serve(config_path: String) -> anyhow::Result<()> {
         },
     };
     let registry_document = registry_startup.document;
-    let config = registry_document.clone().resolve()?;
+    let credential_source =
+        control_plane::CredentialRepositorySelection::from_process_environment()?;
+    let config = control_plane::ConfigCompiler::compile_with_credential_selection(
+        registry_document.clone(),
+        &credential_source,
+    )?;
     let listen = config.listen;
-    let state = AppState::new_with_registry_store_and_validation_bootstrap(
+    let state = control_plane::RuntimeAssembler::assemble_startup(
         config,
         registry_startup.store,
         Some(registry_document),
@@ -2467,6 +2472,44 @@ pools:
                 !source.contains("endpoint_capabilities"),
                 "{file} must not read static endpoint capabilities on the request path"
             );
+        }
+    }
+
+    #[test]
+    fn hot_path_forbidden_dependency_matrix_stays_control_plane_free() {
+        let files = ["src/proxy.rs", "src/model_catalog.rs", "src/route_plan.rs"];
+        let forbidden = [
+            "ConfigSource",
+            "ConfigCompiler",
+            "RuntimeAssembler",
+            "YamlRegistryRepository",
+            "RegistryRepository",
+            "RegistryStoreHandle",
+            "CredentialStoreHandle",
+            "ClientTokenStoreHandle",
+            "Sqlite",
+            "rusqlite",
+            "serde_yaml",
+            "std::fs",
+            "fs::",
+            "File::",
+            "env::var",
+            "std::env",
+            "KEY_POOL_ROUTER_",
+            "FailureWindow",
+            "failure_window",
+            "model_discovery",
+            "live catalog",
+        ];
+
+        for file in files {
+            let source = production_source(file);
+            for token in forbidden {
+                assert!(
+                    !source.contains(token),
+                    "{file} request hot path must not depend on {token}"
+                );
+            }
         }
     }
 

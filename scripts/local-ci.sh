@@ -30,6 +30,7 @@ ensure_no_repository_target_dir() {
 ensure_no_repository_target_dir
 scripts/check-staged-denylist.sh --self-test
 scripts/check-staged-denylist.sh --check-public-plans
+git diff --check
 cargo fmt -- --check
 cargo check --locked
 cargo clippy --locked -- -D warnings

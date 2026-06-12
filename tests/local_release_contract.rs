@@ -105,6 +105,7 @@ fn local_ci_script_exists_is_executable_and_runs_required_cargo_commands_in_orde
     }
 
     let required_commands = [
+        "git diff --check",
         "cargo fmt -- --check",
         "cargo check --locked",
         "cargo clippy --locked -- -D warnings",
@@ -1222,6 +1223,8 @@ fn production_smoke_script_is_guarded_parameterized_and_redacted() {
         "ONE_AI_KEY_CLIENT_TOKEN_ENV",
         "ONE_AI_KEY_MANAGEMENT_TOKEN_ENV",
         "ONE_AI_KEY_PUBLIC_MODEL",
+        "ONE_AI_KEY_RELEASE_IDENTITY",
+        "ONE_AI_KEY_CHECKSUM_IDENTITY",
         "ONE_AI_KEY_OUTPUT_DIR",
         "mktemp -d",
         "curl",
@@ -1339,6 +1342,8 @@ fn production_smoke_passes_against_local_mock_and_keeps_artifacts_redacted() {
         .env("ONE_AI_KEY_TEST_CLIENT_TOKEN", client_token)
         .env("ONE_AI_KEY_TEST_MANAGEMENT_TOKEN", management_token)
         .env("ONE_AI_KEY_PUBLIC_MODEL", public_model)
+        .env("ONE_AI_KEY_RELEASE_IDENTITY", "one-ai-key-v0.3.0")
+        .env("ONE_AI_KEY_CHECKSUM_IDENTITY", "sha256:0123456789abcdef")
         .env("ONE_AI_KEY_OUTPUT_DIR", &output_dir)
         .env("ONE_AI_KEY_SMOKE_CONNECT_TIMEOUT_SECONDS", "1")
         .env("ONE_AI_KEY_SMOKE_MAX_TIME_SECONDS", "2")
@@ -1373,6 +1378,8 @@ fn production_smoke_passes_against_local_mock_and_keeps_artifacts_redacted() {
     assert_eq!(summary["status"], "ok");
     assert_eq!(summary["reason_code"], "production_smoke_ok");
     assert_eq!(summary["model"], public_model);
+    assert_eq!(summary["release_identity"], "one-ai-key-v0.3.0");
+    assert_eq!(summary["checksum_identity"], "sha256:0123456789abcdef");
     assert_eq!(
         summary["token_sources"]["client_token_env"],
         "ONE_AI_KEY_TEST_CLIENT_TOKEN"

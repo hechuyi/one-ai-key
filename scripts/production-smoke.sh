@@ -79,6 +79,27 @@ safe_reason_code() {
   fi
 }
 
+safe_optional_identity() {
+  local name="$1"
+  local value="${!name:-}"
+  if [[ -z "${value}" ]]; then
+    printf ''
+    return
+  fi
+  local lower
+  lower=$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')
+  if [[ ! "${value}" =~ ^[A-Za-z0-9_.:@+-]{1,128}$ ]] \
+    || [[ "${lower}" == *"sk-"* ]] \
+    || [[ "${lower}" == *"://"* ]] \
+    || [[ "${lower}" == *"http"* ]] \
+    || [[ "${lower}" == *"www."* ]] \
+    || [[ "${lower}" == *"token"* ]] \
+    || [[ "${lower}" == *"secret"* ]]; then
+    fail_json "invalid_identity_value" "${name} must be a short non-secret release/checksum identity"
+  fi
+  printf '%s' "${value}"
+}
+
 require_env_value() {
   local name="$1"
   if [[ -z "${!name:-}" ]]; then
@@ -113,6 +134,8 @@ MANAGEMENT_TOKEN="${!MANAGEMENT_TOKEN_ENV_NAME}"
 PUBLIC_MODEL="${ONE_AI_KEY_PUBLIC_MODEL}"
 PUBLIC_BASE_URL="${ONE_AI_KEY_PUBLIC_BASE_URL%/}"
 MANAGEMENT_URL="${ONE_AI_KEY_MANAGEMENT_URL%/}"
+RELEASE_IDENTITY=$(safe_optional_identity ONE_AI_KEY_RELEASE_IDENTITY)
+CHECKSUM_IDENTITY=$(safe_optional_identity ONE_AI_KEY_CHECKSUM_IDENTITY)
 
 case "${PUBLIC_BASE_URL}" in
   */v1) ;;
@@ -334,12 +357,16 @@ if ! ( jq -s \
   --arg status "${OVERALL_STATUS}" \
   --arg reason_code "${OVERALL_REASON}" \
   --arg model "${PUBLIC_MODEL}" \
+  --arg release_identity "${RELEASE_IDENTITY}" \
+  --arg checksum_identity "${CHECKSUM_IDENTITY}" \
   --arg client_token_env "${CLIENT_TOKEN_ENV_NAME}" \
   --arg management_token_env "${MANAGEMENT_TOKEN_ENV_NAME}" \
   '{
     status: $status,
     reason_code: $reason_code,
     model: $model,
+    release_identity: (if $release_identity == "" then null else $release_identity end),
+    checksum_identity: (if $checksum_identity == "" then null else $checksum_identity end),
     token_sources: {
       client_token_env: $client_token_env,
       management_token_env: $management_token_env

@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use crate::{
     client_token_store::ClientTokenStoreHandle,
+    control_plane::RuntimeAssembler,
     credential_repository::CredentialStoreHandle,
     credentials::short_hash,
     events::{
@@ -1499,11 +1500,9 @@ async fn apply_runtime_reload(
             message: err.to_string(),
             stale_history_id: None,
         })?;
-    state
-        .rebuild_runtime_from_resolved_config(config, staged_registry_version)
-        .map_err(|err| {
-            ManagementServiceError::Persistence(format!("runtime reload failed: {err}"))
-        })?;
+    RuntimeAssembler::replace_runtime(state, config, staged_registry_version).map_err(|err| {
+        ManagementServiceError::Persistence(format!("runtime reload failed: {err}"))
+    })?;
     let sample = collect_runtime_reload_sample(state);
     Ok(runtime_reload_response(RuntimeReloadResponseParts {
         active_registry_generation: sample.active_registry_generation,

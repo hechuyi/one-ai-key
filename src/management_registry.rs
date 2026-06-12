@@ -6,13 +6,14 @@ use crate::{
         AccountConfig, ModelRouteConfig, PolicyProfileConfig, PoolConfig, ProviderConfig,
         ResolvedConfig, RoutingProfileConfig,
     },
+    control_plane::{ConfigCompiler, RegistryOverlay},
     events::{ManagementAuditEvent, ManagementEventActor},
     management_errors::{registry_store_error, ManagementServiceError},
     registry::RegistryDocument,
     registry_store::{
-        overlay_registry_resources, AccountRegistryCommand, ChannelRegistryCommand,
-        ModelRouteRegistryCommand, PolicyProfileRegistryCommand, ProviderRegistryCommand,
-        RegistryCommand, RegistryStoreCommit, RegistryStoreError, RoutingProfileRegistryCommand,
+        AccountRegistryCommand, ChannelRegistryCommand, ModelRouteRegistryCommand,
+        PolicyProfileRegistryCommand, ProviderRegistryCommand, RegistryCommand,
+        RegistryStoreCommit, RegistryStoreError, RoutingProfileRegistryCommand,
     },
     state::AppState,
 };
@@ -86,9 +87,10 @@ pub fn resolve_staged_registry_document(
     validation_bootstrap: RegistryDocument,
     staged_registry_document: RegistryDocument,
 ) -> Result<ResolvedConfig, RegistryStoreError> {
-    overlay_registry_resources(validation_bootstrap, staged_registry_document)
-        .resolve()
-        .map_err(|err| RegistryStoreError::Validation(format!("registry validation failed: {err}")))
+    ConfigCompiler::compile_with_process_credential_source(
+        RegistryOverlay::overlay_staged_resources(validation_bootstrap, staged_registry_document),
+    )
+    .map_err(|err| RegistryStoreError::Validation(format!("registry validation failed: {err}")))
 }
 
 pub async fn apply_staged_registry_command(

@@ -1,4 +1,5 @@
 use crate::{
+    control_plane::{ConfigCompiler, Diagnostics, ModelVisibilityProjection},
     credential_repository::{
         CredentialRepository, CredentialSetId, CredentialSetSource, ImportedCredential, KeyImport,
         KeyImportReport,
@@ -189,15 +190,14 @@ pub fn check_config(options: CheckConfigOptions) -> CheckConfigReport {
         }
     };
 
-    let model_visibility_preview = model_visibility_preview(&document);
     let repository = DiagnosticCredentialRepository;
-    match document
-        .clone()
-        .resolve_with_credential_repository_and_store_path(&repository, None)
-    {
+    match ConfigCompiler::compile_with_credential_repository(document.clone(), &repository, None) {
         Ok(resolved) => {
             let warnings =
                 merge_warnings(deprecated.warnings, endpoint_capability_warnings(&resolved));
+            let model_visibility_preview = model_visibility_preview_from_projection(
+                Diagnostics::model_visibility_preview(&resolved),
+            );
             CheckConfigReport {
                 diagnostics_schema_version: 1,
                 status: DiagnosticStatus::Ok,
@@ -229,60 +229,23 @@ pub fn check_config(options: CheckConfigOptions) -> CheckConfigReport {
                     vec![redacted_error_summary(&message)],
                 ),
                 config_path,
-                model_visibility_preview,
+                model_visibility_preview: Vec::new(),
             }
         }
     }
 }
 
-fn model_visibility_preview(document: &RegistryDocument) -> Vec<ModelVisibilityPreview> {
-    document
-        .client_tokens
-        .iter()
-        .map(|client_token| {
-            let visible_models = if client_token.enabled {
-                visible_models_for_client(document, client_token)
-            } else {
-                Vec::new()
-            };
-            let reason_code = if !client_token.enabled {
-                "client_token_disabled"
-            } else if !visible_models.is_empty() {
-                "models_visible"
-            } else if document.model_routes.is_empty() {
-                "model_route_missing"
-            } else if !client_token.allowed_model_groups.is_empty() {
-                "client_scope_empty"
-            } else {
-                "target_channel_disabled"
-            };
-            ModelVisibilityPreview {
-                client_token_ref: client_token.name.clone(),
-                visible_models,
-                reason_code: reason_code.to_string(),
-            }
+fn model_visibility_preview_from_projection(
+    projections: Vec<ModelVisibilityProjection>,
+) -> Vec<ModelVisibilityPreview> {
+    projections
+        .into_iter()
+        .map(|projection| ModelVisibilityPreview {
+            client_token_ref: projection.client_token_ref,
+            visible_models: projection.visible_models,
+            reason_code: projection.reason_code,
         })
         .collect()
-}
-
-fn visible_models_for_client(
-    document: &RegistryDocument,
-    client_token: &crate::config::ClientTokenConfig,
-) -> Vec<String> {
-    let mut visible = BTreeSet::new();
-    for (public_model, route) in &document.model_routes {
-        if !client_model_allowed(document, &client_token.allowed_model_groups, public_model) {
-            continue;
-        }
-        if route
-            .targets
-            .iter()
-            .any(|target| route_target_visible(document, target, &client_token.allowed_channels))
-        {
-            visible.insert(public_model.clone());
-        }
-    }
-    visible.into_iter().collect()
 }
 
 fn endpoint_capability_warnings(config: &crate::config::ResolvedConfig) -> Vec<String> {
@@ -366,44 +329,6 @@ fn warning_atom(value: &str) -> String {
         rendered.push_str("...");
     }
     rendered
-}
-
-fn client_model_allowed(
-    document: &RegistryDocument,
-    allowed_model_groups: &[String],
-    model: &str,
-) -> bool {
-    if allowed_model_groups.is_empty() {
-        return true;
-    }
-    allowed_model_groups.iter().any(|allowed| {
-        allowed == model
-            || document
-                .model_groups
-                .get(allowed)
-                .is_some_and(|group| group.models.iter().any(|member| member == model))
-    })
-}
-
-fn route_target_visible(
-    document: &RegistryDocument,
-    target: &crate::config::ModelRouteTargetConfig,
-    allowed_channels: &[String],
-) -> bool {
-    if !target.enabled {
-        return false;
-    }
-    if !allowed_channels.is_empty()
-        && !allowed_channels
-            .iter()
-            .any(|allowed| allowed == &target.channel)
-    {
-        return false;
-    }
-    document
-        .pools
-        .get(&target.channel)
-        .is_some_and(|pool| pool.enabled)
 }
 
 fn render_visibility_preview(previews: &[ModelVisibilityPreview]) -> String {
@@ -924,6 +849,38 @@ model_routes:
         assert!(rendered.contains("local-client"));
         assert!(rendered.contains("gpt-example"));
         assert!(!rendered.contains("secret-client-token"));
+    }
+
+    #[test]
+    fn check_config_visibility_preview_uses_compiled_model_catalog_capability() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::capture();
+        env::remove_var("KEY_POOL_ROUTER_SQLITE_CREDENTIAL_STORE");
+        env::remove_var("KEY_POOL_ROUTER_SQLITE_REGISTRY_STORE");
+        let root = unique_temp_root();
+        let keys = root.join("relay.keys");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&keys, "synthetic-upstream-key\n").unwrap();
+        let config_body =
+            embedding_route_on_chat_only_pool_config(&keys, "https://relay.example/v1").replace(
+                "provider_kind: openai_compatible",
+                "provider_kind: generic_http",
+            );
+        let config = write_config(&root, &config_body);
+
+        let report = check_config(CheckConfigOptions {
+            config_path: config,
+        });
+
+        assert_eq!(report.status, DiagnosticStatus::Ok);
+        assert_eq!(
+            report.model_visibility_preview[0].visible_models,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            report.model_visibility_preview[0].reason_code,
+            "target_channel_disabled"
+        );
     }
 
     #[test]

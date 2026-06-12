@@ -141,19 +141,19 @@ fn evaluate_sample(
             (ResponseFilterOutcome::Rejected, matches)
         }
     };
-    let matched_rule_ids = matches
-        .iter()
-        .filter_map(|matched| safe_local_code(&matched.rule_id))
-        .collect::<Vec<_>>();
-    let expected_rule_ids = sample
-        .expect_rule_ids
-        .iter()
-        .filter_map(|rule_id| safe_local_code(rule_id))
-        .collect::<Vec<_>>();
-    let rule_ids_match = expected_rule_ids.is_empty()
+    let sanitized_matched_rule_ids =
+        sanitize_rule_ids(matches.iter().map(|matched| &matched.rule_id));
+    let sanitized_expected_rule_ids = sanitize_rule_ids(sample.expect_rule_ids.iter());
+    let matched_rule_ids = sanitized_matched_rule_ids.clone().unwrap_or_default();
+    let expected_rule_ids = sanitized_expected_rule_ids.clone().unwrap_or_default();
+    let rule_ids_match = sample.expect_rule_ids.is_empty()
         || sorted_values(&matched_rule_ids) == sorted_values(&expected_rule_ids);
     let outcome_matches = actual_outcome == sample.expect_outcome;
-    let reason_code = if outcome_matches && rule_ids_match {
+    let reason_code = if sanitized_expected_rule_ids.is_err() {
+        "sample_expected_rule_id_invalid"
+    } else if sanitized_matched_rule_ids.is_err() {
+        "sample_matched_rule_id_invalid"
+    } else if outcome_matches && rule_ids_match {
         "sample_expectation_met"
     } else if !outcome_matches {
         "sample_outcome_mismatch"
@@ -169,6 +169,15 @@ fn evaluate_sample(
         "matched_rule_ids": matched_rule_ids,
         "reason_code": reason_code,
     })
+}
+
+fn sanitize_rule_ids<'a>(
+    rule_ids: impl IntoIterator<Item = &'a String>,
+) -> Result<Vec<String>, ()> {
+    rule_ids
+        .into_iter()
+        .map(|rule_id| safe_local_code(rule_id).ok_or(()))
+        .collect()
 }
 
 fn response_filter_check_error_report(reason_code: &str) -> Value {
@@ -494,6 +503,31 @@ response_filter:
         );
         assert!(!rendered.contains("PRIVATE_MISMATCH_BODY"));
         assert!(!rendered.contains("private.example"));
+        assert!(!rendered.contains("REQUIRED_OK"));
+    }
+
+    #[test]
+    fn response_filter_check_invalid_expected_rule_id_fails_closed_without_leaking_value() {
+        let rendered = run_json(
+            &sample_config(),
+            r#"
+- id: unsafe-expected-rule
+  content_kind: plain
+  body: "hello REQUIRED_OK"
+  expect_outcome: unchanged
+  expect_rule_ids: ["secret-token-rule"]
+"#,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["reason_code"], "response_filter_sample_mismatch");
+        assert_eq!(
+            report["data"]["samples"][0]["reason_code"],
+            "sample_expected_rule_id_invalid"
+        );
+        assert_eq!(report["data"]["samples"][0]["matched_rule_ids"], json!([]));
+        assert!(!rendered.contains("secret-token-rule"));
         assert!(!rendered.contains("REQUIRED_OK"));
     }
 }
