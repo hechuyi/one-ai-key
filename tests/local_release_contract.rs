@@ -967,7 +967,7 @@ fn release_smoke_script_covers_local_model_publication_workflow() {
         "--endpoint-family chat_completions",
         "--apply --dry-run",
         "--apply --expected-staged-registry-version",
-        r#".credential_set_ref == "relay-credentials""#,
+        r#".credential_set_ref == "relay_credentials""#,
         r#".staged_registry_version == $pre_onboard_staged_registry_version"#,
         "reload apply --yes --expected-staged-registry-version",
         r#".planning_only_no_visibility_change == true"#,

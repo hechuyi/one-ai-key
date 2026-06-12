@@ -1083,7 +1083,7 @@ jq -e --arg published_public_model "${PUBLISHED_PUBLIC_MODEL}" --arg published_u
   and .reason_code == "models_onboard_apply_projected"
   and .public_model == $published_public_model
   and .upstream_model == $published_upstream_model
-  and .credential_set_ref == "relay-credentials"
+  and .credential_set_ref == "relay_credentials"
   and .planning_only_no_visibility_change == true
   and .client_visibility_changed == false
   and .live_discovery_called == false
