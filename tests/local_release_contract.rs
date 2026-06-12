@@ -1,7 +1,11 @@
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn read_repo_file(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("failed to read {path}: {error}"))
@@ -1271,6 +1275,304 @@ fn production_smoke_script_is_guarded_parameterized_and_redacted() {
             "{path} must not contain production mutation or private-default token `{forbidden}`"
         );
     }
+}
+
+#[test]
+fn production_smoke_passes_against_local_mock_and_keeps_artifacts_redacted() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|error| panic!("failed to bind local production-smoke mock: {error}"));
+    listener
+        .set_nonblocking(true)
+        .unwrap_or_else(|error| panic!("failed to set mock listener nonblocking: {error}"));
+    let port = listener
+        .local_addr()
+        .unwrap_or_else(|error| panic!("failed to read local mock address: {error}"))
+        .port();
+    let (done_tx, done_rx) = mpsc::channel();
+    let client_token = "production-smoke-client-token-fixture";
+    let management_token = "production-smoke-management-token-fixture";
+    let public_model = "production-smoke-contract-model";
+    let mock_thread = thread::spawn(move || {
+        let mut accepted = 0usize;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while accepted < 5 {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accepted += 1;
+                    handle_production_smoke_mock_connection(
+                        stream,
+                        client_token,
+                        management_token,
+                        public_model,
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    break;
+                }
+                Err(error) => panic!("mock accept failed: {error}"),
+            }
+        }
+        let _ = done_tx.send(accepted);
+    });
+
+    let output_dir = unique_temp_dir("production-smoke-positive");
+    let public_base_url = format!("http://127.0.0.1:{port}/v1");
+    let management_url = format!("http://127.0.0.1:{port}");
+    let output = Command::new("scripts/production-smoke.sh")
+        .arg("--allow-production")
+        .env("ONE_AI_KEY_PUBLIC_BASE_URL", &public_base_url)
+        .env("ONE_AI_KEY_MANAGEMENT_URL", &management_url)
+        .env(
+            "ONE_AI_KEY_CLIENT_TOKEN_ENV",
+            "ONE_AI_KEY_TEST_CLIENT_TOKEN",
+        )
+        .env(
+            "ONE_AI_KEY_MANAGEMENT_TOKEN_ENV",
+            "ONE_AI_KEY_TEST_MANAGEMENT_TOKEN",
+        )
+        .env("ONE_AI_KEY_TEST_CLIENT_TOKEN", client_token)
+        .env("ONE_AI_KEY_TEST_MANAGEMENT_TOKEN", management_token)
+        .env("ONE_AI_KEY_PUBLIC_MODEL", public_model)
+        .env("ONE_AI_KEY_OUTPUT_DIR", &output_dir)
+        .env("ONE_AI_KEY_SMOKE_CONNECT_TIMEOUT_SECONDS", "1")
+        .env("ONE_AI_KEY_SMOKE_MAX_TIME_SECONDS", "2")
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("failed to run production smoke positive contract: {error}")
+        });
+
+    assert!(
+        output.status.success(),
+        "production smoke should pass against local mock, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let accepted = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|error| panic!("mock server did not finish within bounded wait: {error}"));
+    assert_eq!(
+        accepted, 5,
+        "mock server should observe exactly five checks"
+    );
+    mock_thread
+        .join()
+        .unwrap_or_else(|_| panic!("mock server thread panicked"));
+
+    let summary_path = output_dir.join("summary.json");
+    let summary: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&summary_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", summary_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("summary must be JSON: {error}"));
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["reason_code"], "production_smoke_ok");
+    assert_eq!(summary["model"], public_model);
+    assert_eq!(
+        summary["token_sources"]["client_token_env"],
+        "ONE_AI_KEY_TEST_CLIENT_TOKEN"
+    );
+    assert_eq!(
+        summary["token_sources"]["management_token_env"],
+        "ONE_AI_KEY_TEST_MANAGEMENT_TOKEN"
+    );
+    let checks = summary["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("summary checks must be an array"));
+    assert_eq!(checks.len(), 5);
+    let expected_checks = [
+        ("public_liveness", "public_liveness_ok"),
+        ("management_serving", "management_serving_ok"),
+        ("management_resilience", "resilient"),
+        ("client_models", "client_model_visible"),
+        ("client_completion", "client_completion_ok"),
+    ];
+    for (check_name, reason_code) in expected_checks {
+        let check = checks
+            .iter()
+            .find(|check| check["check"] == check_name)
+            .unwrap_or_else(|| panic!("summary missing check {check_name}"));
+        assert_eq!(check["ok"], true, "check {check_name} should pass");
+        assert_eq!(check["http_status"], 200, "check {check_name} HTTP");
+        assert_eq!(check["reason_code"], reason_code);
+        let artifact = output_dir.join(format!("{check_name}.json"));
+        assert!(artifact.is_file(), "{} must exist", artifact.display());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_redacted_production_smoke_text(
+        "stdout",
+        &stdout,
+        &[
+            client_token,
+            management_token,
+            &public_base_url,
+            &management_url,
+            "Return the word ok.",
+            "mock-response-poison",
+            "assistant-visible-ok",
+        ],
+    );
+    assert_redacted_production_smoke_text(
+        "stderr",
+        &stderr,
+        &[
+            client_token,
+            management_token,
+            &public_base_url,
+            &management_url,
+            "Return the word ok.",
+            "mock-response-poison",
+            "assistant-visible-ok",
+        ],
+    );
+    for entry in fs::read_dir(&output_dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", output_dir.display()))
+    {
+        let entry =
+            entry.unwrap_or_else(|error| panic!("failed to read output dir entry: {error}"));
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_redacted_production_smoke_text(
+            &path.display().to_string(),
+            &contents,
+            &[
+                client_token,
+                management_token,
+                &public_base_url,
+                &management_url,
+                "Return the word ok.",
+                "mock-response-poison",
+                "assistant-visible-ok",
+            ],
+        );
+    }
+    let _ = fs::remove_dir_all(output_dir);
+}
+
+fn handle_production_smoke_mock_connection(
+    mut stream: TcpStream,
+    client_token: &str,
+    management_token: &str,
+    public_model: &str,
+) {
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .unwrap_or_else(|error| panic!("failed to clone mock stream: {error}")),
+    );
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .unwrap_or_else(|error| panic!("failed to read mock request line: {error}"));
+    let mut authorization = String::new();
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .unwrap_or_else(|error| panic!("failed to read mock header: {error}"));
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("content-length:") {
+            content_length = value
+                .trim()
+                .parse::<usize>()
+                .unwrap_or_else(|error| panic!("invalid content-length in mock request: {error}"));
+        }
+        if lower.starts_with("authorization:") {
+            authorization = trimmed.to_string();
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader
+            .read_exact(&mut body)
+            .unwrap_or_else(|error| panic!("failed to read mock request body: {error}"));
+    }
+    let body = String::from_utf8_lossy(&body);
+    let parts = request_line.split_whitespace().collect::<Vec<_>>();
+    let method = parts.first().copied().unwrap_or_default();
+    let path = parts.get(1).copied().unwrap_or_default();
+
+    let authorized_client = authorization == format!("Authorization: Bearer {client_token}");
+    let authorized_management =
+        authorization == format!("Authorization: Bearer {management_token}");
+    let (status, response) = match (method, path) {
+        ("GET", "/health") => (
+            200,
+            r#"{"status":"ok","poison":"mock-response-poison-health"}"#.to_string(),
+        ),
+        ("GET", "/management/health/serving") if authorized_management => (
+            200,
+            r#"{"status":"serving","serving":true,"poison":"mock-response-poison-serving"}"#
+                .to_string(),
+        ),
+        ("GET", "/management/health/resilience") if authorized_management => (
+            200,
+            r#"{"status":"resilient","poison":"mock-response-poison-resilience"}"#.to_string(),
+        ),
+        ("GET", "/v1/models") if authorized_client => (
+            200,
+            format!(
+                r#"{{"object":"list","data":[{{"id":"{public_model}","object":"model"}}],"poison":"mock-response-poison-models"}}"#
+            ),
+        ),
+        ("POST", "/v1/chat/completions")
+            if authorized_client && body.contains(public_model) && body.contains("Return the word ok.") =>
+        {
+            (
+                200,
+                r#"{"choices":[{"message":{"role":"assistant","content":"assistant-visible-ok"}}],"poison":"mock-response-poison-completion"}"#.to_string(),
+            )
+        }
+        _ => (
+            401,
+            r#"{"error":{"code":"unauthorized","message":"mock unauthorized"}}"#.to_string(),
+        ),
+    };
+    write_mock_response(&mut stream, status, &response);
+}
+
+fn write_mock_response(stream: &mut TcpStream, status: u16, body: &str) {
+    let reason = if status == 200 { "OK" } else { "Unauthorized" };
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .unwrap_or_else(|error| panic!("failed to write mock response: {error}"));
+}
+
+fn assert_redacted_production_smoke_text(label: &str, text: &str, forbidden: &[&str]) {
+    for forbidden in forbidden {
+        assert!(
+            !text.contains(forbidden),
+            "{label} leaked forbidden production-smoke text `{forbidden}`"
+        );
+    }
+    assert!(
+        !text.contains("/health")
+            && !text.contains("/management/health/serving")
+            && !text.contains("/management/health/resilience")
+            && !text.contains("/v1/models")
+            && !text.contains("/v1/chat/completions"),
+        "{label} leaked complete production-smoke endpoint path"
+    );
 }
 
 #[test]
