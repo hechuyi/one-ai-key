@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PATH_DENY_REGEX='^(dist|target|config|data|db|logs|keys|key-pool-router)/|(^|/)AGENTS\.md$|(^|/)docker-compose\.override\.yml$|(^|/)\.env($|\.)|(^|/)scripts/one_ai_key_(keys|upload_key)\.py$|(^|/)tests/test_one_ai_key_upload_key\.py$|(\.sqlite3?|\.db|\.db-[^/]*|\.wal|\.shm|\.keys|\.key|\.pem|\.log|\.pid|\.tmp)$|(^|/)[^/]*(key|keys|secret|secrets|token|tokens)[^/]*\.txt$'
+PATH_DENY_REGEX='(^|/)(dist|target|config|data|db|logs|keys|key-pool-router|__pycache__|\.pytest_cache|\.ruff_cache|\.mypy_cache|coverage|htmlcov)/|(^|/)agents\.md$|(^|/)docker-compose\.override\.yml$|(^|/)\.env($|\.|[^/]*)|(^|/)scripts/one_ai_key_(keys|upload_key)\.py$|(^|/)tests/test_one_ai_key_upload_key\.py$|(\.sqlite3?|\.db|\.db-[^/]*|\.wal|\.shm|\.keys|\.key|\.pem|\.log|\.pid|\.tmp|\.pyc|\.pyo)$|(^|/)[^/]*(api[-_]?keys?|key|keys|secret|secrets|token|tokens)[^/]*\.(txt|json|yaml|yml|toml|env|md)$'
 INTERNAL_TRACE_REGEX='(For agentic workers|[Aa]gentic workers?|[Ss]ubagents?|[Ss]uperpowers:|plan-status|implementation workers?|main controller|子代理|主控|多轮[[:space:]]*质询|相互[[:space:]]*质询|内部审议|内部审查)'
 SECRET_MATERIAL_REGEX='(sk-[A-Za-z0-9_-]{20,}|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9_]{20,}|-----BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)'
 PROMO_INJECTION_REGEX='(邀请码|拉群|备用网址|欢迎加入|购买套餐|低价[[:space:]]*API|公益.*换[[:space:]]*key)'
@@ -11,7 +11,9 @@ PUBLIC_PLAN_DENY_REGEX="(${CONTENT_DENY_REGEX}|[Ss]top[ -][Cc]ard|Task [0-9]+ ch
 
 is_denied_path() {
   local path=$1
-  [[ "${path}" =~ ${PATH_DENY_REGEX} ]]
+  local normalized_path
+  normalized_path=$(printf '%s' "${path}" | tr '[:upper:]' '[:lower:]')
+  [[ "${normalized_path}" =~ ${PATH_DENY_REGEX} ]]
 }
 
 is_denied_added_line() {
@@ -58,6 +60,9 @@ run_self_test() {
   local failed=0
 
   is_denied_path "target/debug/app" || failed=1
+  is_denied_path "Target/debug/app" || failed=1
+  is_denied_path "nested/__pycache__/cache.pyc" || failed=1
+  is_denied_path "runtime/API_KEYS.JSON" || failed=1
   is_denied_path "AGENTS.md" || failed=1
   is_denied_path "keys/local.keys" || failed=1
   is_denied_path "scripts/one_ai_key_upload_key.py" || failed=1

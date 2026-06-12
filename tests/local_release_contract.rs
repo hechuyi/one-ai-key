@@ -1,9 +1,35 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn read_repo_file(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("failed to read {path}: {error}"))
+}
+
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|error| panic!("system clock before UNIX_EPOCH: {error}"))
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "one-ai-key-{prefix}-{}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&path)
+        .unwrap_or_else(|error| panic!("failed to create temp dir {}: {error}", path.display()));
+    path
+}
+
+fn write_temp_file(root: &Path, relative_path: &str, contents: &str) {
+    let path = root.join(relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|error| {
+            panic!("failed to create temp parent {}: {error}", parent.display())
+        });
+    }
+    fs::write(&path, contents)
+        .unwrap_or_else(|error| panic!("failed to write temp file {}: {error}", path.display()));
 }
 
 fn parse_cargo_pkgid_version(package_id: &str) -> &str {
@@ -513,6 +539,71 @@ fn staged_denylist_has_public_plan_hygiene_contract() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn staged_denylist_rejects_case_variant_and_nested_generated_paths() {
+    let repo = unique_temp_dir("staged-denylist-fixtures");
+    let script_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-staged-denylist.sh");
+
+    let init = Command::new("git")
+        .arg("init")
+        .current_dir(&repo)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to initialize temp git repo: {error}"));
+    assert!(
+        init.status.success(),
+        "git init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    for (path, contents) in [
+        ("Target/debug/app.o", "build artifact\n"),
+        ("nested/__pycache__/cache.pyc", "python cache\n"),
+        ("runtime/API_KEYS.JSON", "{}\n"),
+    ] {
+        write_temp_file(&repo, path, contents);
+    }
+
+    let add = Command::new("git")
+        .arg("add")
+        .arg(".")
+        .current_dir(&repo)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to stage temp fixture files: {error}"));
+    assert!(
+        add.status.success(),
+        "git add failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&add.stdout),
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let output = Command::new("bash")
+        .arg(&script_path)
+        .current_dir(&repo)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run staged denylist: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _ = fs::remove_dir_all(&repo);
+
+    assert!(
+        !output.status.success(),
+        "staged denylist must reject generated/cache/secret-like staged paths: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr
+    );
+    for denied_path in [
+        "path:Target/debug/app.o",
+        "path:nested/__pycache__/cache.pyc",
+        "path:runtime/API_KEYS.JSON",
+    ] {
+        assert!(
+            stderr.contains(denied_path),
+            "staged denylist stderr must include `{denied_path}`; stderr={stderr}"
+        );
+    }
 }
 
 #[test]
