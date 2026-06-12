@@ -1896,6 +1896,87 @@ fn operator_confidence_deployment_pin_record_is_public_and_bounded() {
 }
 
 #[test]
+fn v03_local_release_ready_record_is_public_and_bounded() {
+    let path = "docs/release-records/v0.3-local-release-ready.md";
+    assert!(Path::new(path).is_file(), "{path} must exist");
+
+    let record = read_repo_file(path);
+    for required in [
+        "Stop node: `v0.3_local_release_ready`",
+        "Cargo package version: `0.3.0`",
+        "post-v0.2 operator evidence and control-plane compiler boundary",
+        "local CI: `pass`",
+        "release artifact build: `pass`",
+        "artifact shape check: `pass`",
+        "release smoke: `pass`",
+        "staged denylist: `pass`",
+        "GitHub release publication: `not_run_by_design`",
+        "deployment pin smoke: `not_run_by_design`",
+        "request forwarding remains on compiled in-memory state",
+        "No live upstream model catalog aggregation",
+    ] {
+        assert!(
+            record.contains(required),
+            "{path} must contain bounded v0.3 release-ready token `{required}`"
+        );
+    }
+
+    assert_public_release_record_is_bounded(path, &record);
+}
+
+#[test]
+fn v03_published_release_record_is_public_and_bounded() {
+    let path = "docs/release-records/v0.3-published-release-complete.md";
+    assert!(Path::new(path).is_file(), "{path} must exist");
+
+    let record = read_repo_file(path);
+    for required in [
+        "Stop node: `v0.3_published_release_complete`",
+        "Cargo package version: `0.3.0`",
+        "Git tag: `v0.3.0`",
+        "Release URL: `https://github.com/hechuyi/one-ai-key/releases/tag/v0.3.0`",
+        "`one-ai-key-0.3.0-x86_64-unknown-linux-gnu.tar.gz`",
+        "`one-ai-key-0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256`",
+        "`440064013588f9610ea094317da85149008a4f3a3887b513c6af1f770d635f1e`",
+        "GitHub release publication: `pass`",
+        "uploaded asset download: `pass`",
+        "uploaded checksum verification: `pass`",
+        "uploaded archive shape check: `pass`",
+        "deployment pin smoke: `not_run_by_design`",
+    ] {
+        assert!(
+            record.contains(required),
+            "{path} must contain bounded v0.3 published-release token `{required}`"
+        );
+    }
+
+    assert_public_release_record_is_bounded(path, &record);
+}
+
+fn assert_public_release_record_is_bounded(path: &str, record: &str) {
+    for forbidden in [
+        "sk-",
+        "github_pat_",
+        "ghp_",
+        "/Users/",
+        "rtoc-gateway",
+        "ai.rtoc",
+        "hhhl",
+        "dc.",
+        "chat/room",
+        "Telegram",
+        "Discord",
+        "raw command log",
+        "deployment transcript",
+    ] {
+        assert!(
+            !record.contains(forbidden),
+            "{path} must not contain private or over-specific release evidence `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn release_build_docs_protect_persistent_docker_build_caches() {
     let path = "docs/release-build.md";
     let docs = read_repo_file(path);
