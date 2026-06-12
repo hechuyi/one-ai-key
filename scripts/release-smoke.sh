@@ -819,6 +819,10 @@ jq -e '
   and .data.route_impact.status == "available"
   and .data.route_impact.model == "gpt-example"
   and (.data.route_impact.requested_credential_set.candidate_presence as $presence | ["selected_candidate", "candidate_not_selected", "not_candidate", "unknown"] | index($presence) != null)
+  and (.data.replacement_workflow.operator_maintenance_priority as $priority | ["active_capacity_missing", "selected_capacity_low", "fallback_capacity_low", "inventory_only", "route_impact_unknown"] | index($priority) != null)
+  and (.data.replacement_workflow.blocking_reason_code as $blocker | ["no_available_credentials", "credential_set_exhausted", "route_not_candidate", "route_preview_unavailable", "none"] | index($blocker) != null)
+  and (.data.replacement_workflow.next_action.template_id | type == "string")
+  and ((.data.replacement_workflow.next_action.safe_argv | type) == "array" or .data.replacement_workflow.next_action.safe_argv == null)
   and (.data.safe_next_actions | type == "array" and length > 0)
   and (.next_action.safe_argv | type == "array")
 ' keys-replacement-plan.json >/dev/null

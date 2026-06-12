@@ -29,6 +29,7 @@ mod management_events;
 mod management_operations;
 mod management_profiles;
 mod management_registry;
+mod management_replacement_workflow;
 mod management_requests;
 mod management_resource_lookup;
 mod management_resources;

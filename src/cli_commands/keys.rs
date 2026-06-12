@@ -1889,6 +1889,15 @@ pub fn render_keys_replacement_plan_report(
         .unwrap_or(Value::Null);
     let replacement_need = replacement_need_summary(set.as_ref());
     let route_impact = route_impact_summary(options, route);
+    let replacement_workflow = crate::management_replacement_workflow::project_replacement_workflow(
+        crate::management_replacement_workflow::ReplacementWorkflowInput {
+            credential_set_id: &options.credential_set_id,
+            include_credential_refs: options.include_credential_refs,
+            capacity_summary: &capacity_summary,
+            replacement_need: &replacement_need,
+            route_impact: &route_impact,
+        },
+    );
     let status = if set_found { "ok" } else { "blocked" };
     let reason_code = if set_found {
         "keys_replacement_plan_projected"
@@ -1903,6 +1912,7 @@ pub fn render_keys_replacement_plan_report(
         "capacity_summary": capacity_summary,
         "replacement_need": replacement_need,
         "route_impact": route_impact,
+        "replacement_workflow": replacement_workflow,
         "credential_set": set,
         "safe_next_actions": replacement_plan_safe_next_actions(options, route.is_some()),
     });
@@ -1944,7 +1954,8 @@ fn replacement_need_summary(set: Option<&Value>) -> Value {
     let required_action = operations
         .and_then(|operations| operations.get("required_action"))
         .and_then(Value::as_str)
-        .and_then(safe_local_id);
+        .and_then(safe_local_id)
+        .filter(|required_action| *required_action != "none");
     if operations_needs_input || required_action.is_some() {
         return serde_json::json!({
             "status": "replacement_recommended",
@@ -2985,6 +2996,9 @@ fn render_keys_replacement_plan_table(report: &Value) -> String {
         "route_impact.client_token_ref",
         "route_impact.reason_code",
         "route_impact.requested_credential_set.candidate_presence",
+        "replacement_workflow.operator_maintenance_priority",
+        "replacement_workflow.blocking_reason_code",
+        "replacement_workflow.next_action.template_id",
     ] {
         push_nested_table_field(&mut output, field, report);
     }
@@ -4825,6 +4839,22 @@ mod tests {
             "shared-credentials"
         );
         assert_eq!(
+            report["data"]["replacement_workflow"]["operator_maintenance_priority"],
+            "active_capacity_missing"
+        );
+        assert_eq!(
+            report["data"]["replacement_workflow"]["blocking_reason_code"],
+            "no_available_credentials"
+        );
+        assert_eq!(
+            report["data"]["replacement_workflow"]["next_action"]["template_id"],
+            "keys_import_dry_run"
+        );
+        assert_eq!(
+            report["data"]["replacement_workflow"]["next_action"]["side_effect_class"],
+            "local_preview"
+        );
+        assert_eq!(
             report["data"]["safe_next_actions"][0]["safe_argv"][0],
             "one-ai-key"
         );
@@ -4861,6 +4891,11 @@ mod tests {
         assert!(table_rendered.contains(
             "route_impact.requested_credential_set.candidate_presence: selected_candidate"
         ));
+        assert!(table_rendered.contains(
+            "replacement_workflow.operator_maintenance_priority: active_capacity_missing"
+        ));
+        assert!(table_rendered
+            .contains("replacement_workflow.blocking_reason_code: no_available_credentials"));
         assert!(!table_rendered.contains("RAW_KEY_SECRET"));
         assert!(!table_rendered.contains("RAW_ROUTE_KEY_SECRET"));
         assert!(!table_rendered.contains("CLIENT_SECRET"));
@@ -4906,6 +4941,84 @@ mod tests {
         assert_eq!(
             report["data"]["route_impact"]["status"],
             "unavailable_without_model_context"
+        );
+        assert_eq!(
+            report["data"]["replacement_workflow"]["operator_maintenance_priority"],
+            "inventory_only"
+        );
+        assert_eq!(
+            report["data"]["replacement_workflow"]["blocking_reason_code"],
+            "none"
+        );
+        assert_eq!(
+            report["data"]["replacement_workflow"]["next_action"]["template_id"],
+            "keys_stats"
+        );
+    }
+
+    #[test]
+    fn keys_replacement_plan_required_action_none_keeps_replacement_not_required() {
+        let options = super::KeysReplacementPlanOptions {
+            connection: crate::cli::OperatorConnectionOptions {
+                management_url: Some("https://router.example".to_string()),
+                deprecated_base_url: None,
+                management_token_env: Some("ONE_AI_KEY_MANAGEMENT_TOKEN".to_string()),
+                management_token_stdin: false,
+                timeout_seconds: 10,
+            },
+            credential_set_id: "shared-credentials".to_string(),
+            model: None,
+            client_token_ref: None,
+            include_credential_refs: false,
+            credential_ref_limit: 20,
+            output: crate::cli_report::OutputFormat::Json,
+        };
+
+        let rendered = super::render_keys_replacement_plan_report(
+            &options,
+            &json!({
+                "credential_sets": [{
+                    "id": "shared-credentials",
+                    "credentials": {
+                        "total": 2,
+                        "available": 2,
+                        "cooling_down": 0,
+                        "expired": 0,
+                        "quota_exhausted": 0,
+                        "disabled": 0
+                    }
+                }]
+            }),
+            Some(&json!({
+                "credential_set_id": "shared-credentials",
+                "needs_operator_input": false,
+                "required_action": "none",
+                "credentials": {
+                    "total": 2,
+                    "available": 2,
+                    "cooling_down": 0,
+                    "expired": 0,
+                    "quota_exhausted": 0,
+                    "disabled": 0
+                }
+            })),
+            None,
+            None,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(report["data"]["replacement_need"]["status"], "not_required");
+        assert_eq!(
+            report["data"]["replacement_need"]["reason_code"],
+            "sufficient_available_capacity"
+        );
+        assert_eq!(
+            report["data"]["replacement_workflow"]["operator_maintenance_priority"],
+            "inventory_only"
+        );
+        assert_eq!(
+            report["data"]["replacement_workflow"]["blocking_reason_code"],
+            "none"
         );
     }
 
@@ -5210,6 +5323,18 @@ mod tests {
         assert_eq!(
             report["data"]["route_impact"]["requested_credential_set"]["candidate_presence"],
             "unknown"
+        );
+        assert_eq!(
+            report["data"]["replacement_workflow"]["operator_maintenance_priority"],
+            "route_impact_unknown"
+        );
+        assert_eq!(
+            report["data"]["replacement_workflow"]["blocking_reason_code"],
+            "route_preview_unavailable"
+        );
+        assert_eq!(
+            report["data"]["replacement_workflow"]["next_action"]["template_id"],
+            "route_explain"
         );
         assert_eq!(
             paths,
