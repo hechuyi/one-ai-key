@@ -440,7 +440,7 @@ pub fn response_filter_contamination_alerts_for_state(
             public_model: None,
             candidate_count: None,
             suppressed_count: None,
-            rule_id: Some(bucket.rule_id),
+            rule_id: safe_alert_id(&bucket.rule_id),
             redact_count: Some(bucket.redact_count),
             reject_count: Some(bucket.reject_count),
             window_seconds: Some(window_seconds),
@@ -454,6 +454,35 @@ pub fn response_filter_contamination_alerts_for_state(
             credentials: RuntimeCredentialCounts::default(),
         })
         .collect()
+}
+
+fn safe_alert_id(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.starts_with('/')
+        || value.starts_with("~/")
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.contains("://")
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("sk-")
+        || lower.contains("secret")
+        || lower.contains("authorization")
+        || lower.contains("bearer")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+    {
+        return None;
+    }
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+        .then(|| value.to_string())
 }
 
 fn response_filter_alert_action_class(action: &str) -> Option<&'static str> {

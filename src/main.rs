@@ -23374,6 +23374,46 @@ pools:
     }
 
     #[tokio::test]
+    async fn management_alerts_null_unsafe_response_filter_rule_ids() {
+        let state = test_state_with_keys(["upstream-key-a", "upstream-key-b"]);
+        let now = current_test_unix_seconds();
+        for index in 1..=3 {
+            state
+                .response_filter_events
+                .lock()
+                .expect("response filter events mutex poisoned")
+                .push_at_unix_seconds(
+                    response_filter_event_input(
+                        &format!("req_filter_{index}"),
+                        "test",
+                        "https://example.invalid/filter-marker",
+                        "reject",
+                        "rejected",
+                    ),
+                    now,
+                );
+        }
+
+        let alerts = management_response_json(&app(state), "/management/alerts").await;
+        let alert_text = alerts.to_string();
+        let contamination_alert = alerts["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|alert| alert["kind"] == "response_filter_contamination")
+            .expect("response filter contamination alert is projected");
+
+        assert!(contamination_alert["rule_id"].is_null());
+        assert!(!alert_text.contains("example.invalid"));
+        assert!(!alert_text.contains("filter-marker"));
+        assert_eq!(
+            contamination_alert["channel_ids"],
+            serde_json::json!(["test"])
+        );
+        assert_eq!(contamination_alert["reject_count"], 3);
+    }
+
+    #[tokio::test]
     async fn management_alerts_response_filter_contamination_decays_outside_window() {
         let state = test_state_with_keys(["upstream-key-a", "upstream-key-b"]);
         *state
@@ -35087,6 +35127,251 @@ model_routes:
         let serialized_filter_events = serde_json::to_string(&filter_events).unwrap();
         assert!(!serialized_filter_events.contains("blocked-marker"));
         assert!(!serialized_filter_events.contains("rate_limit_cooldown"));
+    }
+
+    #[tokio::test]
+    async fn response_filter_rejects_promotional_url_inside_upstream_error_json_without_leak() {
+        let marker_url = "https://example.invalid/filter-marker";
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "rate_limit_cooldown",
+                            "message": marker_url
+                        },
+                        "message": marker_url,
+                        "code": "rate_limit_cooldown"
+                    })),
+                )
+            }),
+        );
+        let api_base = spawn_upstream(upstream).await;
+        let state = test_state_with_response_filter(
+            &api_base,
+            crate::config::ResponseFilterConfig {
+                enabled: true,
+                replacement: Some("[filtered]".to_string()),
+                event_window_capacity: None,
+                alert_window_seconds: None,
+                rules: vec![crate::config::ResponseFilterRuleConfig {
+                    id: "error-url-marker".to_string(),
+                    enabled: true,
+                    kind: crate::config::ResponseFilterRuleKindConfig::Literal,
+                    action: crate::config::ResponseFilterActionConfig::Reject,
+                    case_sensitive: false,
+                    value: Some(marker_url.to_string()),
+                    pattern: None,
+                }],
+            },
+        );
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "response_filter_rejected");
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body_text.contains("example.invalid"));
+        assert!(!body_text.contains("filter-marker"));
+        assert!(!body_text.contains("rate_limit_cooldown"));
+
+        let filter_events =
+            management_response_json(&app(state.clone()), "/management/response-filter-events")
+                .await;
+        let events = filter_events["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["rule_id"], "error-url-marker");
+        assert_eq!(events[0]["action"], "reject");
+        assert_eq!(events[0]["content_kind"], "json");
+        assert_eq!(events[0]["outcome"], "rejected");
+        assert_eq!(events[0]["body_committed"], false);
+
+        let telemetry =
+            management_response_json(&app(state.clone()), "/management/routing-telemetry").await;
+        let rendered = format!(
+            "{}{}",
+            serde_json::to_string(&filter_events).unwrap(),
+            serde_json::to_string(&telemetry).unwrap()
+        );
+        assert!(!rendered.contains("example.invalid"));
+        assert!(!rendered.contains("filter-marker"));
+        assert!(!rendered.contains("rate_limit_cooldown"));
+    }
+
+    #[tokio::test]
+    async fn response_filter_does_not_handle_retryable_primary_error_body_before_route_fallback() {
+        let marker_url = "https://example.invalid/filter-marker";
+        let primary_hits = Arc::new(AtomicU64::new(0));
+        let primary_hits_for_handler = primary_hits.clone();
+        let primary = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let primary_hits = primary_hits_for_handler.clone();
+                async move {
+                    primary_hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "upstream_unavailable",
+                                "message": marker_url
+                            }
+                        })),
+                    )
+                }
+            }),
+        );
+        let fallback_hits = Arc::new(AtomicU64::new(0));
+        let fallback_hits_for_handler = fallback_hits.clone();
+        let fallback = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let fallback_hits = fallback_hits_for_handler.clone();
+                async move {
+                    fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "fixture",
+                        "object": "chat.completion",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "fallback-clean"}}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let primary_base = spawn_upstream(primary).await;
+        let fallback_base = spawn_upstream(fallback).await;
+
+        let mut pools = HashMap::new();
+        let mut credential_sets = HashMap::new();
+        for (name, api_base, key) in [
+            ("filter_error_primary", primary_base, "primary-key"),
+            ("filter_error_fallback", fallback_base, "fallback-key"),
+        ] {
+            let credential_set = format!("{name}-credentials");
+            credential_sets.insert(
+                credential_set.clone(),
+                CredentialSetConfig {
+                    keys_file: temp_keys_file(&format!("{key}\n")),
+                },
+            );
+            pools.insert(name.to_string(), openai_pool(api_base, credential_set));
+        }
+        let mut document = AppConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_tokens: vec![ClientTokenConfig {
+                name: "test-client".to_string(),
+                token: fixture_client_token(),
+                enabled: true,
+                allowed_model_groups: Vec::new(),
+                allowed_channels: Vec::new(),
+            }],
+            management: Some(ManagementConfig {
+                admin_token: fixture_admin_token(),
+                ip_allowlist: None,
+                principals: Vec::new(),
+                event_log_path: None,
+                event_window_capacity: None,
+            }),
+            max_request_body_bytes: 1024 * 1024,
+            max_model_catalog_body_bytes: 512 * 1024,
+            max_error_body_bytes: 1024,
+            timeouts: TimeoutConfig::default(),
+            routing: crate::config::RoutingConfig::default(),
+            default_pool: Some("filter_error_primary".to_string()),
+            providers: HashMap::new(),
+            accounts: HashMap::new(),
+            credential_sets,
+            model_routes: HashMap::from([priority_route(
+                "gpt-filter-error-fallback",
+                ["filter_error_primary", "filter_error_fallback"],
+            )]),
+            policy_profiles: HashMap::new(),
+            default_routing_profile: Some("default-routing".to_string()),
+            routing_profiles: std::collections::HashMap::from([(
+                "default-routing".to_string(),
+                crate::config::RoutingProfileConfig {
+                    key_selection: crate::config::KeySelectionStrategyConfig::StickyUntilFailure,
+                    default_credential_cooldown_seconds: 20,
+                    same_request_credential_retry:
+                        crate::config::SameRequestCredentialRetryConfig {
+                            enabled: false,
+                            max_retries: 0,
+                        },
+                    route_target_retry: crate::config::RouteTargetRetryConfig { enabled: true },
+                },
+            )]),
+            pools,
+        }
+        .into_registry_document();
+        document.response_filter = crate::config::ResponseFilterConfig {
+            enabled: true,
+            replacement: Some("[filtered]".to_string()),
+            event_window_capacity: None,
+            alert_window_seconds: None,
+            rules: vec![crate::config::ResponseFilterRuleConfig {
+                id: "primary-error-url".to_string(),
+                enabled: true,
+                kind: crate::config::ResponseFilterRuleKindConfig::Literal,
+                action: crate::config::ResponseFilterActionConfig::Reject,
+                case_sensitive: false,
+                value: Some(marker_url.to_string()),
+                pattern: None,
+            }],
+        };
+        let state = AppState::new(document.resolve().unwrap()).unwrap();
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, client_bearer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-filter-error-fallback","messages":[{"role":"user","content":"ok"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_text.contains("fallback-clean"));
+        assert!(!body_text.contains("example.invalid"));
+        assert!(!body_text.contains("filter-marker"));
+
+        let filter_events =
+            management_response_json(&app(state.clone()), "/management/response-filter-events")
+                .await;
+        assert!(filter_events["events"].as_array().unwrap().is_empty());
+
+        let telemetry =
+            management_response_json(&app(state.clone()), "/management/routing-telemetry").await;
+        let rendered = serde_json::to_string(&telemetry).unwrap();
+        assert!(!rendered.contains("example.invalid"));
+        assert!(!rendered.contains("filter-marker"));
     }
 
     #[tokio::test]
