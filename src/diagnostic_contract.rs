@@ -18,6 +18,7 @@ enum SafeAction {
     None,
     ModelsExplain,
     ModelsExplainWithClientTokenRef,
+    ModelsExplainWithSupportedEndpointFamily,
     RouteExplain,
     FailuresTail,
     FailuresExplainRequest,
@@ -137,6 +138,11 @@ const CONTRACTS: &[ContractEntry] = &[
         action: SafeAction::RouteExplain,
     },
     ContractEntry {
+        reason_code: "candidate_limit",
+        blocking_domain: "route",
+        action: SafeAction::RouteExplain,
+    },
+    ContractEntry {
         reason_code: "runtime_unavailable",
         blocking_domain: "runtime",
         action: SafeAction::ReloadStatus,
@@ -169,7 +175,7 @@ const CONTRACTS: &[ContractEntry] = &[
     ContractEntry {
         reason_code: "unsupported_endpoint_family",
         blocking_domain: "endpoint_family",
-        action: SafeAction::ModelsExplain,
+        action: SafeAction::ModelsExplainWithSupportedEndpointFamily,
     },
     ContractEntry {
         reason_code: "endpoint_family_unsupported",
@@ -247,6 +253,7 @@ pub const STAGE2_REASON_CODES: &[&str] = &[
     "channel_degraded",
     "credential_unavailable",
     "unknown_channel",
+    "candidate_limit",
     "runtime_unavailable",
     "provider_cooling_down",
     "credential_cooling_down",
@@ -369,6 +376,24 @@ fn action_spec(action: SafeAction) -> ActionSpec {
                 "<public-model>",
                 "--client-token-ref",
                 "<client-token-ref>",
+            ],
+        },
+        SafeAction::ModelsExplainWithSupportedEndpointFamily => ActionSpec {
+            summary:
+                "Use a supported endpoint family value for the read-only availability projection.",
+            template_id: "use_supported_endpoint_family",
+            safe_argv: &[
+                "one-ai-key",
+                "models",
+                "explain",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>",
+                "--model",
+                "<public-model>",
+                "--endpoint-family",
+                "chat_completions",
             ],
         },
         SafeAction::RouteExplain => ActionSpec {
@@ -769,6 +794,40 @@ mod tests {
             assert!(
                 is_valid_safe_next_action(&contract.next_action),
                 "{reason_code} should map to a safe read-only next action"
+            );
+        }
+    }
+
+    #[test]
+    fn every_route_admission_reason_has_exactly_one_safe_readonly_contract() {
+        use crate::route_plan::RoutePreviewReason;
+
+        for reason in [
+            RoutePreviewReason::TargetDisabled,
+            RoutePreviewReason::ClientChannelScope,
+            RoutePreviewReason::ChannelDisabled,
+            RoutePreviewReason::ChannelCoolingDown,
+            RoutePreviewReason::ProviderCoolingDown,
+            RoutePreviewReason::CredentialCoolingDown,
+            RoutePreviewReason::NoAvailableCredentials,
+            RoutePreviewReason::RuntimeUnavailable,
+            RoutePreviewReason::ChannelDegraded,
+            RoutePreviewReason::DegradedLastResort,
+            RoutePreviewReason::ProviderCoolingDownLastResort,
+            RoutePreviewReason::CredentialCoolingDownLastResort,
+            RoutePreviewReason::UnknownChannel,
+            RoutePreviewReason::CandidateLimit,
+        ] {
+            let reason_code = reason.as_str();
+            assert_eq!(
+                contract_count_for_reason(reason_code),
+                1,
+                "{reason_code} route admission reason should map to exactly one diagnostic contract"
+            );
+            let contract = contract_for_reason(reason_code).unwrap();
+            assert!(
+                is_valid_safe_next_action(&contract.next_action),
+                "{reason_code} route admission reason should map to a safe read-only next action"
             );
         }
     }

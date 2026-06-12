@@ -515,6 +515,7 @@ fn projected_failure_event(event: &Value) -> Option<Value> {
     if !event.is_object() {
         return None;
     }
+    let reason_code = projected_string(event, "reason_code", "unknown_failure_class");
     Some(serde_json::json!({
         "source": projected_string(event, "source", "unknown"),
         "event_kind": projected_string(event, "event_kind", "unknown"),
@@ -533,13 +534,13 @@ fn projected_failure_event(event: &Value) -> Option<Value> {
         "client_visible_status": projected_string(event, "client_visible_status", "unknown"),
         "upstream_status": projected_nullable_status(event, "upstream_status"),
         "final_outcome": projected_string(event, "final_outcome", "unknown"),
-        "reason_code": projected_string(event, "reason_code", "unknown_failure_class"),
+        "reason_code": reason_code,
         "blocking_domain": projected_string(event, "blocking_domain", "unknown"),
         "directive": projected_nullable_string(event, "directive"),
         "attempt": event.get("attempt").and_then(Value::as_u64),
         "content_kind": projected_nullable_string(event, "content_kind"),
         "admission": projected_admission(event.get("admission")),
-        "next_action": projected_next_action(event.get("next_action")),
+        "next_action": projected_next_action(event.get("next_action"), &reason_code),
     }))
 }
 
@@ -626,11 +627,8 @@ fn projected_reason_code_array(value: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
-fn projected_next_action(value: Option<&Value>) -> Value {
-    value
-        .filter(|next_action| safe_next_action_shape(next_action))
-        .cloned()
-        .unwrap_or(Value::Null)
+fn projected_next_action(_value: Option<&Value>, reason_code: &str) -> Value {
+    diagnostic_contract_for(reason_code).next_action
 }
 
 fn safe_next_action_shape(value: &Value) -> bool {
@@ -1757,6 +1755,70 @@ mod tests {
                 "requires_confirmation": false
             })
         ));
+    }
+
+    #[test]
+    fn failures_rejects_projected_next_action_not_in_diagnostic_allowlist() {
+        let injected_next_action = serde_json::json!({
+            "summary": "Looks read-only but is not a registered diagnostic contract.",
+            "template_id": "unknown_explain",
+            "safe_argv": [
+                "one-ai-key",
+                "doctor",
+                "--management-url",
+                "<url>",
+                "--management-token-env",
+                "<env>"
+            ],
+            "side_effect_class": "runtime_readonly",
+            "requires_confirmation": false
+        });
+        let mut failure = projected_failure(
+            "routing_telemetry",
+            "no_route_candidate",
+            "req_unknown_next_action",
+            "route_planning",
+            "gpt-example",
+            None,
+            "no_route_candidate",
+            "returned_local_error",
+            "not_applicable",
+            None,
+            "local_503",
+            "client_visible_failure",
+            "no_route_candidate",
+            None,
+            None,
+        );
+        failure["next_action"] = injected_next_action;
+        let routing = serde_json::json!({
+            "buffered_events": 1,
+            "capacity": 1024,
+            "dropped_events": 0,
+            "offset": 0,
+            "limit": 50,
+            "failure_events": [failure],
+            "events": []
+        });
+
+        let rendered = render_explain_report(
+            &routing,
+            &serde_json::json!({"buffered_events": 0, "offset": 0, "limit": 50, "failure_events": [], "events": []}),
+            "req_unknown_next_action",
+            &FailureFilters::default(),
+            crate::cli_report::OutputFormat::Json,
+        );
+        let report: Value = serde_json::from_str(&rendered).unwrap();
+        let contract =
+            crate::diagnostic_contract::contract_for_reason("no_route_candidate").unwrap();
+
+        assert_eq!(report["next_action"], contract.next_action);
+        assert_eq!(
+            report["data"]["evidence"][0]["next_action"],
+            contract.next_action
+        );
+        assert!(!rendered.contains("unknown_explain"));
+        assert!(!rendered.contains("Looks read-only"));
     }
 
     #[test]

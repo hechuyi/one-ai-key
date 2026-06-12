@@ -712,10 +712,10 @@ pub struct EndpointFamilyAvailabilityRecentFailureHint {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct EndpointFamilyAvailabilityNextStep {
-    pub summary: &'static str,
-    pub template_id: &'static str,
-    pub safe_argv: Vec<&'static str>,
-    pub side_effect_class: &'static str,
+    pub summary: String,
+    pub template_id: String,
+    pub safe_argv: Vec<String>,
+    pub side_effect_class: String,
     pub requires_confirmation: bool,
 }
 
@@ -1242,99 +1242,44 @@ fn endpoint_family_candidate_reason_codes(preview: &RoutePreview) -> Vec<&'stati
 }
 
 fn endpoint_family_next_step(reason_code: &str) -> EndpointFamilyAvailabilityNextStep {
-    match reason_code {
-        "available" => EndpointFamilyAvailabilityNextStep {
-            summary: "The requested model is available for this client-token reference and endpoint family.",
-            template_id: "no_action_required",
-            safe_argv: Vec::new(),
-            side_effect_class: "runtime_readonly",
-            requires_confirmation: false,
-        },
-        "token_missing" => EndpointFamilyAvailabilityNextStep {
-            summary: "Rerun models explain with an explicit client-token reference.",
-            template_id: "models_explain_with_client_token_ref",
-            safe_argv: vec![
-                "one-ai-key",
-                "models",
-                "explain",
-                "--management-url",
-                "<url>",
-                "--management-token-env",
-                "<env>",
-                "--model",
-                "<public-model>",
-                "--client-token-ref",
-                "<client-token-ref>",
-            ],
-            side_effect_class: "runtime_readonly",
-            requires_confirmation: false,
-        },
-        "token_unknown" | "token_disabled" => EndpointFamilyAvailabilityNextStep {
-            summary: "Inspect the read-only runtime doctor projection before rerunning models explain.",
-            template_id: "doctor",
-            safe_argv: vec![
-                "one-ai-key",
-                "doctor",
-                "--management-url",
-                "<url>",
-                "--management-token-env",
-                "<env>",
-            ],
-            side_effect_class: "runtime_readonly",
-            requires_confirmation: false,
-        },
-        "unsupported_endpoint_family" => EndpointFamilyAvailabilityNextStep {
-            summary: "Use a supported endpoint family value for the read-only availability projection.",
-            template_id: "use_supported_endpoint_family",
-            safe_argv: vec![
-                "one-ai-key",
-                "models",
-                "explain",
-                "--management-url",
-                "<url>",
-                "--management-token-env",
-                "<env>",
-                "--model",
-                "<public-model>",
-                "--endpoint-family",
-                "chat_completions",
-            ],
-            side_effect_class: "runtime_readonly",
-            requires_confirmation: false,
-        },
-        "model_missing" => EndpointFamilyAvailabilityNextStep {
-            summary: "Inspect the runtime model projection for this public model.",
-            template_id: "models_explain",
-            safe_argv: vec![
-                "one-ai-key",
-                "models",
-                "explain",
-                "--management-url",
-                "<url>",
-                "--management-token-env",
-                "<env>",
-                "--model",
-                "<public-model>",
-            ],
-            side_effect_class: "runtime_readonly",
-            requires_confirmation: false,
-        },
-        _ => EndpointFamilyAvailabilityNextStep {
-            summary: "Inspect runtime route target and endpoint-capability projection details.",
-            template_id: "route_explain",
-            safe_argv: vec![
-                "one-ai-key",
-                "route",
-                "explain",
-                "--management-url",
-                "<url>",
-                "--management-token-env",
-                "<env>",
-                "<public-model>",
-            ],
-            side_effect_class: "runtime_readonly",
-            requires_confirmation: false,
-        },
+    let contract = crate::diagnostic_contract::contract_for_reason(reason_code)
+        .unwrap_or_else(crate::diagnostic_contract::fallback_contract);
+    endpoint_family_next_step_from_contract(&contract.next_action)
+}
+
+fn endpoint_family_next_step_from_contract(
+    next_action: &serde_json::Value,
+) -> EndpointFamilyAvailabilityNextStep {
+    EndpointFamilyAvailabilityNextStep {
+        summary: next_action
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Inspect the read-only runtime doctor projection.")
+            .to_string(),
+        template_id: next_action
+            .get("template_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("doctor")
+            .to_string(),
+        safe_argv: next_action
+            .get("safe_argv")
+            .and_then(serde_json::Value::as_array)
+            .map(|argv| {
+                argv.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        side_effect_class: next_action
+            .get("side_effect_class")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("runtime_readonly")
+            .to_string(),
+        requires_confirmation: next_action
+            .get("requires_confirmation")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -2167,7 +2112,7 @@ mod tests {
         assert_eq!(missing_value["evidence"]["client_token_known"], false);
         assert_eq!(
             missing_value["next_step"]["template_id"],
-            "models_explain_with_client_token_ref"
+            "models_explain_visibility"
         );
         assert_eq!(
             missing_value["next_step"]["side_effect_class"],
@@ -2425,6 +2370,185 @@ mod tests {
             model_missing_value["next_step"]["template_id"],
             "models_explain"
         );
+    }
+
+    #[test]
+    fn endpoint_family_reason_codes_align_next_steps_with_diagnostic_contract() {
+        let clients = vec![client("disabled", false), client("client-a", true)];
+        let route = route();
+
+        let cases = [
+            endpoint_family_availability_explain_from_parts(
+                EndpointFamilyAvailabilityExplainInput {
+                    client_tokens: &clients,
+                    client_token_ref: None,
+                    endpoint_family: "chat_completions",
+                    public_model: "gpt-public",
+                    registry_generation: 7,
+                    model_allowed: true,
+                    model_visible: true,
+                    route_kind: "explicit_model_route",
+                    route: Some(&route),
+                    channel_states: &HashMap::new(),
+                    endpoint_capabilities: &HashMap::new(),
+                    candidate_limit: 16,
+                },
+            ),
+            endpoint_family_availability_explain_from_parts(
+                EndpointFamilyAvailabilityExplainInput {
+                    client_tokens: &clients,
+                    client_token_ref: Some("unknown"),
+                    endpoint_family: "chat_completions",
+                    public_model: "gpt-public",
+                    registry_generation: 7,
+                    model_allowed: true,
+                    model_visible: true,
+                    route_kind: "explicit_model_route",
+                    route: Some(&route),
+                    channel_states: &HashMap::new(),
+                    endpoint_capabilities: &HashMap::new(),
+                    candidate_limit: 16,
+                },
+            ),
+            endpoint_family_availability_explain_from_parts(
+                EndpointFamilyAvailabilityExplainInput {
+                    client_tokens: &clients,
+                    client_token_ref: Some("disabled"),
+                    endpoint_family: "chat_completions",
+                    public_model: "gpt-public",
+                    registry_generation: 7,
+                    model_allowed: true,
+                    model_visible: true,
+                    route_kind: "explicit_model_route",
+                    route: Some(&route),
+                    channel_states: &HashMap::new(),
+                    endpoint_capabilities: &HashMap::new(),
+                    candidate_limit: 16,
+                },
+            ),
+            endpoint_family_availability_explain_from_parts(
+                EndpointFamilyAvailabilityExplainInput {
+                    client_tokens: &clients,
+                    client_token_ref: Some("client-a"),
+                    endpoint_family: "invalid_family",
+                    public_model: "gpt-public",
+                    registry_generation: 7,
+                    model_allowed: true,
+                    model_visible: true,
+                    route_kind: "explicit_model_route",
+                    route: Some(&route),
+                    channel_states: &HashMap::new(),
+                    endpoint_capabilities: &HashMap::new(),
+                    candidate_limit: 16,
+                },
+            ),
+            endpoint_family_availability_explain_from_parts(
+                EndpointFamilyAvailabilityExplainInput {
+                    client_tokens: &clients,
+                    client_token_ref: Some("client-a"),
+                    endpoint_family: "chat_completions",
+                    public_model: "missing-model",
+                    registry_generation: 7,
+                    model_allowed: true,
+                    model_visible: false,
+                    route_kind: "explicit_model_route",
+                    route: Some(&route),
+                    channel_states: &HashMap::new(),
+                    endpoint_capabilities: &HashMap::new(),
+                    candidate_limit: 16,
+                },
+            ),
+            endpoint_family_availability_explain_from_parts(
+                EndpointFamilyAvailabilityExplainInput {
+                    client_tokens: &clients,
+                    client_token_ref: Some("client-a"),
+                    endpoint_family: "chat_completions",
+                    public_model: "gpt-public",
+                    registry_generation: 7,
+                    model_allowed: true,
+                    model_visible: true,
+                    route_kind: "no_route",
+                    route: None,
+                    channel_states: &HashMap::new(),
+                    endpoint_capabilities: &HashMap::new(),
+                    candidate_limit: 16,
+                },
+            ),
+            endpoint_family_availability_explain_from_parts(
+                EndpointFamilyAvailabilityExplainInput {
+                    client_tokens: &clients,
+                    client_token_ref: Some("client-a"),
+                    endpoint_family: "embeddings",
+                    public_model: "gpt-public",
+                    registry_generation: 7,
+                    model_allowed: true,
+                    model_visible: true,
+                    route_kind: "explicit_model_route",
+                    route: Some(&route),
+                    channel_states: &HashMap::from([(
+                        ChannelId("ch1".to_string()),
+                        ChannelRouteState::Available,
+                    )]),
+                    endpoint_capabilities: &capabilities(EndpointSupport::Supported),
+                    candidate_limit: 16,
+                },
+            ),
+            endpoint_family_availability_explain_from_parts(
+                EndpointFamilyAvailabilityExplainInput {
+                    client_tokens: &clients,
+                    client_token_ref: Some("client-a"),
+                    endpoint_family: "chat_completions",
+                    public_model: "gpt-public",
+                    registry_generation: 7,
+                    model_allowed: true,
+                    model_visible: true,
+                    route_kind: "explicit_model_route",
+                    route: Some(&route),
+                    channel_states: &HashMap::from([(
+                        ChannelId("ch1".to_string()),
+                        ChannelRouteState::NoAvailableCredentials,
+                    )]),
+                    endpoint_capabilities: &capabilities(EndpointSupport::Supported),
+                    candidate_limit: 16,
+                },
+            ),
+            endpoint_family_availability_explain_from_parts(
+                EndpointFamilyAvailabilityExplainInput {
+                    client_tokens: &clients,
+                    client_token_ref: Some("client-a"),
+                    endpoint_family: "chat_completions",
+                    public_model: "gpt-public",
+                    registry_generation: 7,
+                    model_allowed: true,
+                    model_visible: true,
+                    route_kind: "explicit_model_route",
+                    route: Some(&route),
+                    channel_states: &HashMap::from([(
+                        ChannelId("ch1".to_string()),
+                        ChannelRouteState::Available,
+                    )]),
+                    endpoint_capabilities: &capabilities(EndpointSupport::Supported),
+                    candidate_limit: 16,
+                },
+            ),
+        ];
+
+        for explain in cases {
+            let value = serde_json::to_value(&explain).unwrap();
+            let contract =
+                crate::diagnostic_contract::contract_for_reason(explain.reason_code).unwrap();
+
+            assert_eq!(
+                value["blocking_domain"], contract.blocking_domain,
+                "{} should use the diagnostic contract blocking domain",
+                explain.reason_code
+            );
+            assert_eq!(
+                value["next_step"], contract.next_action,
+                "{} should use the diagnostic contract next action",
+                explain.reason_code
+            );
+        }
     }
 
     #[test]

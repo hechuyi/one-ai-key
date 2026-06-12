@@ -305,7 +305,7 @@ fn is_allowed_management_next_step_action(template_id: &str, argv: &[&str]) -> b
                 "<public-model>"
             ]
         ) | (
-            "models_explain_visibility" | "models_explain_with_client_token_ref",
+            "models_explain_visibility",
             [
                 "one-ai-key",
                 "models",
